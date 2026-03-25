@@ -17,7 +17,7 @@ from hello_agents.tools import (
 )
 
 from ..workspace.manager import WorkspaceManager
-from ..tools import MemoryTool, ExecuteCommandTool, WebSearchTool, WebFetchTool
+from ..tools import MemoryTool, ExecuteCommandTool, WebSearchTool, WebFetchTool, RAGTool
 
 
 class HelloClawAgent:
@@ -80,8 +80,8 @@ class HelloClawAgent:
             enable_smart_compression=False,
             context_window=128000,
             trace_enabled=False,
-            skills_enabled=True,
-            todowrite_enabled=True,
+            skills_enabled=False,
+            todowrite_enabled=False,
             devlog_enabled=False,
             subagent_enabled=True,  # 启用子 Agent 支持
         )
@@ -251,8 +251,11 @@ class HelloClawAgent:
         registry.register_tool(ExecuteCommandTool(
             allowed_directories=[self.workspace_path]  # 限制在工作空间目录
         ))
-        registry.register_tool(WebSearchTool())  # 网页搜索工具（需要配置 BRAVE_API_KEY）
         registry.register_tool(WebFetchTool())   # 网页抓取工具
+
+        # MyClaw自定义工具
+        registry.register_tool(WebSearchTool())  # 网页搜索工具
+        registry.register_tool(RAGTool())  # RAG工具
 
         return registry
 
@@ -523,3 +526,27 @@ class HelloClawAgent:
 
         # 重新读取 name（因为 IDENTITY.md 可能已被重置）
         self.name = self._read_identity_name() or "HelloClaw"
+
+    def shutdown(self):
+        """关闭 Agent 持有的外部连接与可释放资源。"""
+        # 1) 尝试让各工具自行释放资源（如 RAG/Qdrant、HTTP client 等）
+        try:
+            if hasattr(self, "tool_registry") and self.tool_registry:
+                for tool in self.tool_registry.get_all_tools():
+                    for method_name in ("shutdown", "close"):
+                        method = getattr(tool, method_name, None)
+                        if callable(method):
+                            try:
+                                method()
+                            except Exception as e:
+                                print(f"⚠️ 释放工具资源失败 ({tool.name}.{method_name}): {e}")
+                            break
+        except Exception as e:
+            print(f"⚠️ 清理工具资源失败: {e}")
+
+        # 2) 清空工具注册表，避免残留引用
+        try:
+            if hasattr(self, "tool_registry") and self.tool_registry:
+                self.tool_registry.clear()
+        except Exception as e:
+            print(f"⚠️ 清理工具注册表失败: {e}")

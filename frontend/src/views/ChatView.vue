@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, computed, nextTick, onMounted } from 'vue'
-import { Input, Button, message, Tag } from 'ant-design-vue'
-import { SendOutlined, PlusOutlined, StopOutlined, LoadingOutlined } from '@ant-design/icons-vue'
+import { Input, Button, message, Tag, Tooltip } from 'ant-design-vue'
+import { SendOutlined, PlusOutlined, StopOutlined, LoadingOutlined, UploadOutlined } from '@ant-design/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { sessionApi } from '@/api/session'
 import { chatApi } from '@/api/chat'
@@ -56,6 +56,30 @@ const currentSessionId = ref<string | null>(null)
 const messagesContainer = ref<HTMLElement | null>(null)
 const abortController = ref<AbortController | null>(null)
 const initializing = ref(true)
+const fileInputRef = ref<HTMLInputElement | null>(null)
+
+/** 选择本地文件后将文件名引用插入输入框（当前无独立上传接口时由对话携带上下文） */
+const UPLOAD_TOOLTIP =
+  '上传本地文件：点击后选择文件，系统会把文件名插入输入框，你可补充说明再发送；助手可根据文件名与说明调用相应能力处理（例如加入知识库等）。'
+
+const triggerFileSelect = () => {
+  fileInputRef.value?.click()
+}
+
+const onFileInputChange = (e: Event) => {
+  const el = e.target as HTMLInputElement
+  const files = el.files
+  if (!files?.length) return
+  const names = Array.from(files).map((f) => f.name).join('、')
+  const tag = `[附件: ${names}]`
+  if (inputMessage.value.trim()) {
+    inputMessage.value = `${inputMessage.value.trim()}\n${tag}`
+  } else {
+    inputMessage.value = tag
+  }
+  message.success('已将文件引用插入输入框')
+  el.value = ''
+}
 const collapsedTools = ref<Set<number>>(new Set())
 // 默认所有工具都是展开的（用于新建的工具）
 const expandedTools = ref<Set<number>>(new Set())
@@ -746,6 +770,26 @@ const createNewSession = async () => {
     <!-- 输入区域 -->
     <div class="chat-input-wrapper">
       <div class="chat-input">
+        <input
+          ref="fileInputRef"
+          type="file"
+          class="chat-file-input"
+          multiple
+          @change="onFileInputChange"
+        />
+        <Tooltip :title="UPLOAD_TOOLTIP" placement="top">
+          <Button
+            type="text"
+            class="chat-input-attach"
+            :disabled="loading"
+            aria-label="上传文件"
+            @click="triggerFileSelect"
+          >
+            <template #icon>
+              <UploadOutlined />
+            </template>
+          </Button>
+        </Tooltip>
         <!-- 输入框 -->
         <Input.TextArea
           v-model:value="inputMessage"
@@ -1037,6 +1081,35 @@ const createNewSession = async () => {
   align-items: center;
   max-width: 800px;
   margin: 0 auto;
+}
+
+.chat-file-input {
+  display: none;
+}
+
+.chat-input-attach {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+}
+
+.chat-input-attach:hover:not(:disabled) {
+  background: var(--color-primary-light);
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.chat-input-attach:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .chat-input :deep(.ant-input) {

@@ -3,7 +3,7 @@
 import json
 import asyncio
 from datetime import datetime
-from typing import Optional, List, Dict, AsyncGenerator, TYPE_CHECKING, Union
+from typing import Optional, List, Dict, Any, AsyncGenerator, TYPE_CHECKING, Union
 
 from hello_agents.agents.simple_agent import SimpleAgent
 from hello_agents.core.llm import HelloAgentsLLM
@@ -63,6 +63,40 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         # 检查是否支持流式工具调用
         self._supports_streaming_tools = isinstance(llm, EnhancedHelloAgentsLLM)
+
+    def _build_messages(self, input_text: str) -> List[Dict[str, Any]]:
+        """构建消息列表（保留 tool_calls/tool_call_id 元数据）。"""
+        messages: List[Dict[str, Any]] = []
+
+        # 系统提示词
+        if self.system_prompt:
+            messages.append({
+                "role": "system",
+                "content": self.system_prompt
+            })
+
+        # 历史消息：必须保留 metadata，避免丢失工具调用链
+        for msg in self._history:
+            item: Dict[str, Any] = {
+                "role": msg.role,
+                "content": msg.content,
+            }
+            metadata = getattr(msg, "metadata", None) or {}
+            if msg.role == "assistant" and metadata.get("tool_calls"):
+                item["tool_calls"] = metadata["tool_calls"]
+                # function calling 场景下，assistant 携带 tool_calls 时 content 通常为 None
+                if not msg.content:
+                    item["content"] = None
+            elif msg.role == "tool" and metadata.get("tool_call_id"):
+                item["tool_call_id"] = metadata["tool_call_id"]
+            messages.append(item)
+
+        # 当前用户输入
+        messages.append({
+            "role": "user",
+            "content": input_text
+        })
+        return messages
 
     async def arun_stream_with_tools(
         self,

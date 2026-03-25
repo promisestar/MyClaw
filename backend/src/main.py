@@ -50,9 +50,18 @@ async def lifespan(app: FastAPI):
     _agent = HelloClawAgent(workspace_path=workspace_path)
     print("HelloClawAgent initialized")
 
-    yield
-    # 关闭时清理
-    print("HelloClaw Backend shutting down...")
+    try:
+        yield
+    finally:
+        # 关闭时清理
+        print("HelloClaw Backend shutting down...")
+        try:
+            if _agent is not None and hasattr(_agent, "shutdown"):
+                _agent.shutdown()
+        except Exception as e:
+            print(f"⚠️ Agent 资源清理失败: {e}")
+        finally:
+            _agent = None
 
 
 app = FastAPI(
