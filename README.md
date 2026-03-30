@@ -1,6 +1,7 @@
-# HelloClaw
+# MyClaw
 
 **HelloClaw** 是一个基于 Hello-Agents 框架的个性化 AI Agent 应用，实现了 OpenClaw 中的核心功能。
+**MyClaw** 在**HelloClaw**的基础上，扩展了RAG、MCP、Skill等功能，使Agent助手更加智能。
 
 ![](helloclaw.png)
 
@@ -9,6 +10,9 @@
 - **智能对话** - 基于 ReActAgent 的智能对话能力
 - **记忆系统** - 支持长期记忆和每日记忆的自动管理
 - **工具调用** - 内置多种工具（文件操作、代码执行、网页搜索等）
+- **RAG 知识库** - 支持知识库检索增强（用户已入库文档的检索与问答）
+- **领域技能（Skill）** - 支持按需加载领域流程手册（`backend/skills/**/SKILL.md`）
+- **MCP 外部工具集成** - 通过 MCP 协议连接外部服务的工具/资源/提示词模板
 - **会话管理** - 多会话支持，会话历史持久化
 - **身份定制** - 可自定义 Agent 身份和个性
 - **Web 界面** - 现代化的 Vue3 前端界面
@@ -149,13 +153,15 @@ LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
 2. `.env` 环境变量
 3. 代码默认值
 
+> 说明：`~/.helloclaw/config.json` 中除了 `llm` 外，也可配置 `mcp`（用于 MCP 外部工具集成）。
+
 ### 工作空间
 
 工作空间位于 `~/.helloclaw/`，包含：
 
 ```
 ~/.helloclaw/
-├── config.json       # 全局 LLM 配置
+├── config.json       # 全局 LLM / MCP 配置
 └── workspace/        # Agent 工作空间
     ├── IDENTITY.md   # 身份配置
     ├── MEMORY.md     # 长期记忆
@@ -164,6 +170,73 @@ LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
     ├── memory/       # 每日记忆
     └── sessions/     # 会话历史
 ```
+
+---
+
+## RAG（知识库检索增强）
+
+项目内的 `rag` 工具用于对“**用户已入库的知识文档**”进行检索与问答。常用的 `action`：
+
+- `add_document`：将本地文件加入知识库（多格式由系统解析）
+- `add_text`：将文本加入知识库
+- `search`：关键词/语义检索，返回相关片段
+- `ask`：基于检索结果直接回答（适合“根据资料说明…”）
+- `stats`：查看知识库与向量存储状态
+- `clear`：清空知识库（需要 `confirm=true`）
+
+实践建议：当用户上传了 PDF/笔记/长文本且你要“总结、提取、对照说明其内容”时，优先使用 `rag`。
+
+---
+
+## Skill（领域技能/流程手册）
+
+项目内的 `Skill` 工具用于**按需加载领域流程说明**。技能来自 `backend/skills/<skill_name>/SKILL.md`。
+
+Skill 的主要用法：
+
+- `skill`：技能名称（例如 `pdf`）
+- `args`：可选参数，会替换技能文档中的 `$ARGUMENTS` 占位符
+
+实践建议：当任务属于某个领域的特定流程（例如 PDF 处理、表单处理、某类工程约束）时，先 `Skill` 加载对应手册，再按手册执行步骤。
+
+---
+
+## MCP（外部工具集成）
+
+项目提供 `mcp` 工具用于通过 MCP 协议连接外部服务器，调用其提供的工具、读取资源、获取提示词模板。
+
+MCP 工具常用的 `action`：
+
+- `list_tools`：列出 MCP 服务器提供的工具
+- `call_tool`：调用远端工具
+- `list_resources`：列出可用资源
+- `read_resource`：读取资源内容（按 URI）
+- `list_prompts` / `get_prompt`：列出/获取提示词模板
+
+此外，若开启 MCP 的 `auto_expand`，远端工具会被包装成可直接调用的独立工具（工具名通常带 `mcp_` 前缀）。
+
+### MCP 配置示例（全局）
+
+编辑 `~/.helloclaw/config.json` 的 `mcp` 段，例如（连接 GitHub MCP server）：
+
+```json
+{
+  "mcp": {
+    "enabled": true,
+    "builtin_demo": false,
+    "servers": [
+      {
+        "name": "github",
+        "server_command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+        "env_keys": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        "auto_expand": true
+      }
+    ]
+  }
+}
+```
+
+如果你没有配置任何 `mcp.servers`，且 `builtin_demo=true`（默认），系统会注册一个内置演示 MCP server，便于开发/验证工具链路。
 
 ## API 接口
 
@@ -185,7 +258,7 @@ LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
 [MIT License](LICENSE)
 
 ## 致谢
-
+- [HelloClaw](https://github.com/tino-chen/helloclaw) - 智能助手
 - [Hello-Agents](https://github.com/hello-agents/hello-agents) - Agent 框架
 - [FastAPI](https://fastapi.tiangolo.com/) - 后端框架
 - [Vue.js](https://vuejs.org/) - 前端框架
