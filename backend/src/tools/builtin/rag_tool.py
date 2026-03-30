@@ -73,14 +73,21 @@ class RAGTool(Tool):
         qdrant_api_key: str = None,
         collection_name: str = "rag_knowledge_base",
         rag_namespace: str = "default",
-        expandable: bool = False
+        expandable: bool = False,
+        workspace_root: Optional[str] = None,
     ):
         super().__init__(
             name="rag",
             description="RAG工具 - 支持多格式文档检索增强生成，提升智能问答能力",
             expandable=expandable
         )
-        
+        # 与 Read/上传 API 一致：相对路径相对 Agent 工作空间根（非进程 CWD）
+        self._workspace_root = (
+            os.path.normpath(os.path.expanduser(workspace_root))
+            if workspace_root
+            else None
+        )
+
         self.knowledge_base_path = knowledge_base_path
         self.qdrant_url = qdrant_url or os.getenv("QDRANT_URL")
         self.qdrant_api_key = qdrant_api_key or os.getenv("QDRANT_API_KEY")
@@ -116,6 +123,17 @@ class RAGTool(Tool):
             self.initialized = False
             self.init_error = str(e)
             print(f"❌ RAG工具初始化失败: {e}")
+
+    def _resolve_document_path(self, file_path: str) -> str:
+        """将用户给出的路径解析为磁盘绝对路径；相对路径相对工作空间根。"""
+        if not file_path or not str(file_path).strip():
+            return file_path
+        p = str(file_path).strip()
+        if os.path.isabs(p):
+            return os.path.normpath(os.path.expanduser(p))
+        if self._workspace_root:
+            return os.path.normpath(os.path.join(self._workspace_root, p))
+        return os.path.normpath(os.path.expanduser(p))
 
     def _get_pipeline(self, namespace: Optional[str] = None) -> Dict[str, Any]:
         """获取指定命名空间的 RAG 管道，若不存在则自动创建"""
@@ -238,7 +256,7 @@ class RAGTool(Tool):
             ToolParameter(
                 name="file_path",
                 type="string",
-                description="文档文件路径（支持PDF、Word、Excel、PPT、图片、音频等多种格式）",
+                description="文档路径（支持 PDF/Word 等）；相对路径时相对于工作空间根目录（与上传目录 uploads/ 一致），勿用进程当前目录理解",
                 required=False
             ),
             ToolParameter(
@@ -306,14 +324,18 @@ class RAGTool(Tool):
             执行结果
         """
         try:
-            if not file_path or not os.path.exists(file_path):
+            if not file_path:
                 return f"❌ 文件不存在: {file_path}"
-            
+            resolved = self._resolve_document_path(file_path)
+            if not os.path.exists(resolved):
+                return f"❌ 文件不存在: {resolved}"
+            display_name = os.path.basename(resolved)
+
             pipeline = self._get_pipeline(namespace)
             t0 = time.time()
 
             chunks_added = pipeline["add_documents"](
-                file_paths=[file_path],
+                file_paths=[resolved],
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap
             )
@@ -322,10 +344,10 @@ class RAGTool(Tool):
             process_ms = int((t1 - t0) * 1000)
             
             if chunks_added == 0:
-                return f"⚠️ 未能从文件解析内容: {os.path.basename(file_path)}"
+                return f"⚠️ 未能从文件解析内容: {display_name}"
             
             return (
-                f"✅ 文档已添加到知识库: {os.path.basename(file_path)}\n"
+                f"✅ 文档已添加到知识库: {display_name}\n"
                 f"📊 分块数量: {chunks_added}\n"
                 f"⏱️ 处理时间: {process_ms}ms\n"
                 f"📝 命名空间: {pipeline.get('namespace', self.rag_namespace)}"
@@ -528,7 +550,7 @@ class RAGTool(Tool):
                     query=user_question,
                     top_k=limit,
                     enable_mqe=True,
-                    enable_hyde=True
+                    enable_hyde=False
                 )
             else:
                 results = pipeline["search"](
@@ -589,6 +611,7 @@ class RAGTool(Tool):
             # 5. 调用 LLM 生成答案
             llm_start = time.time()
             answer = self.llm.invoke(enhanced_prompt)
+            answer = str(answer)
             llm_time = int((time.time() - llm_start) * 1000)
             
             if not answer or not answer.strip():

@@ -6,6 +6,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { sessionApi } from '@/api/session'
 import { chatApi } from '@/api/chat'
 import { configApi } from '@/api/config'
+import { uploadApi } from '@/api/upload'
 import { renderMarkdown, formatTime } from '@/utils/markdown'
 import { getToolConfig, formatToolArgs, formatToolResult } from '@/utils/toolDisplay'
 import LobsterIcon from '@/assets/lobster.svg'
@@ -57,28 +58,47 @@ const messagesContainer = ref<HTMLElement | null>(null)
 const abortController = ref<AbortController | null>(null)
 const initializing = ref(true)
 const fileInputRef = ref<HTMLInputElement | null>(null)
+const uploading = ref(false)
 
-/** 选择本地文件后将文件名引用插入输入框（当前无独立上传接口时由对话携带上下文） */
+/** 上传到服务端工作空间 uploads 目录，并把相对路径插入输入框供助手处理 */
 const UPLOAD_TOOLTIP =
-  '上传本地文件：点击后选择文件，系统会把文件名插入输入框，你可补充说明再发送；助手可根据文件名与说明调用相应能力处理（例如加入知识库等）。'
+  '上传本地文件：文件会保存到服务端工作空间，并把相对路径插入输入框；你可补充说明再发送，助手可按路径读取或调用 RAG 等能力。'
 
 const triggerFileSelect = () => {
+  if (uploading.value || loading.value) return
   fileInputRef.value?.click()
 }
 
-const onFileInputChange = (e: Event) => {
+const onFileInputChange = async (e: Event) => {
   const el = e.target as HTMLInputElement
   const files = el.files
   if (!files?.length) return
-  const names = Array.from(files).map((f) => f.name).join('、')
-  const tag = `[附件: ${names}]`
-  if (inputMessage.value.trim()) {
-    inputMessage.value = `${inputMessage.value.trim()}\n${tag}`
-  } else {
-    inputMessage.value = tag
+
+  uploading.value = true
+  const lines: string[] = []
+  try {
+    for (const file of Array.from(files)) {
+      try {
+        const res = await uploadApi.uploadFile(file, currentSessionId.value)
+        lines.push(`[附件: ${res.stored_path}（${res.filename}）]`)
+      } catch (err) {
+        const text = err instanceof Error ? err.message : String(err)
+        message.error(`${file.name} 上传失败：${text}`)
+      }
+    }
+    if (lines.length > 0) {
+      const block = lines.join('\n')
+      if (inputMessage.value.trim()) {
+        inputMessage.value = `${inputMessage.value.trim()}\n${block}`
+      } else {
+        inputMessage.value = block
+      }
+      message.success(`已上传 ${lines.length} 个文件，路径已插入输入框`)
+    }
+  } finally {
+    uploading.value = false
+    el.value = ''
   }
-  message.success('已将文件引用插入输入框')
-  el.value = ''
 }
 const collapsedTools = ref<Set<number>>(new Set())
 // 默认所有工具都是展开的（用于新建的工具）
@@ -781,12 +801,13 @@ const createNewSession = async () => {
           <Button
             type="text"
             class="chat-input-attach"
-            :disabled="loading"
+            :disabled="loading || uploading"
             aria-label="上传文件"
             @click="triggerFileSelect"
           >
             <template #icon>
-              <UploadOutlined />
+              <LoadingOutlined v-if="uploading" spin />
+              <UploadOutlined v-else />
             </template>
           </Button>
         </Tooltip>

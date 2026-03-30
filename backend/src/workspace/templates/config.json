@@ -3,5 +3,17 @@
     "model_id": "",
     "api_key": "",
     "base_url": ""
+  },
+  "mcp": {
+    "enabled": true,
+    "builtin_demo": true,
+    "servers": [
+      {
+        "name": "github",
+        "server_command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+        "env_keys": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        "auto_expand": true
+      }
+    ]
   }
 }

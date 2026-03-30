@@ -20,6 +20,21 @@ def _get_markitdown_instance():
         return None
 
 
+# 绝不能当「纯文本」用 open().read() 读的格式（否则会把 ZIP/XML 当 UTF-8 读成乱码入库）
+_NON_PLAIN_TEXT_EXTENSIONS = frozenset({
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".tar", ".gz", ".rar",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg",
+})
+
+
+def _is_plain_text_fallback_safe(path: str) -> bool:
+    """仅对真实文本文件允许 UTF-8 回退读取（.docx 等一律禁止）。"""
+    ext = (os.path.splitext(path)[1] or "").lower()
+    return ext not in _NON_PLAIN_TEXT_EXTENSIONS
+
+
 def _is_markitdown_supported_format(path: str) -> bool:
     """
     Check if the file format is supported by MarkItDown.
@@ -46,6 +61,19 @@ def _is_markitdown_supported_format(path: str) -> bool:
     return ext in supported_formats
 
 
+def _extract_from_converter_result(result: Any) -> str:
+    """MarkItDown 返回 DocumentConverterResult：优先 text_content，空则用 markdown。"""
+    if result is None:
+        return ""
+    t = getattr(result, "text_content", None)
+    if isinstance(t, str) and t.strip():
+        return t
+    md = getattr(result, "markdown", None)
+    if isinstance(md, str) and md.strip():
+        return md
+    return ""
+
+
 def _convert_to_markdown(path: str) -> str:
     """
     Universal document reader using MarkItDown with enhanced PDF processing.
@@ -62,17 +90,27 @@ def _convert_to_markdown(path: str) -> str:
     # 其他格式使用原有MarkItDown
     md_instance = _get_markitdown_instance()
     if md_instance is None:
-        return _fallback_text_reader(path)
+        if _is_plain_text_fallback_safe(path):
+            return _fallback_text_reader(path)
+        print(f"[WARNING] MarkItDown unavailable and file is not plain text: {path}")
+        return ""
     
     try:
         result = md_instance.convert(path)
-        text = getattr(result, "text_content", None)
-        if isinstance(text, str) and text.strip():
+        text = _extract_from_converter_result(result)
+        if text.strip():
             return text
+        print(f"[WARNING] MarkItDown returned empty text for {path}")
         return ""
     except Exception as e:
         print(f"[WARNING] MarkItDown failed for {path}: {e}")
-        return _fallback_text_reader(path)
+        if _is_plain_text_fallback_safe(path):
+            return _fallback_text_reader(path)
+        print(
+            f"[WARNING] Skip plain-text fallback for structured/binary file "
+            f"(use MarkItDown or re-export doc): {path}"
+        )
+        return ""
 
 def _enhanced_pdf_processing(path: str) -> str:
     """
@@ -83,11 +121,12 @@ def _enhanced_pdf_processing(path: str) -> str:
     # 使用原有MarkItDown提取
     md_instance = _get_markitdown_instance()
     if md_instance is None:
-        return _fallback_text_reader(path)
+        print(f"[WARNING] MarkItDown unavailable, cannot parse PDF: {path}")
+        return ""
     
     try:
         result = md_instance.convert(path)
-        raw_text = getattr(result, "text_content", None)
+        raw_text = _extract_from_converter_result(result)
         if not raw_text or not raw_text.strip():
             return ""
         
@@ -98,7 +137,9 @@ def _enhanced_pdf_processing(path: str) -> str:
         
     except Exception as e:
         print(f"[WARNING] Enhanced PDF processing failed for {path}: {e}")
-        return _fallback_text_reader(path)
+        if _is_plain_text_fallback_safe(path):
+            return _fallback_text_reader(path)
+        return ""
 
 def _post_process_pdf_text(text: str) -> str:
     """
@@ -668,6 +709,70 @@ def embed_query(query: str) -> List[float]:
         return [0.0] * dimension
 
 
+def embed_queries(queries: List[str]) -> List[List[float]]:
+    """
+    Batch embed queries to avoid repeated encoder overhead.
+
+    Returns:
+        List of vectors aligned with `queries`.
+    """
+    if not queries:
+        return []
+
+    embedder = get_text_embedder()
+    dimension = get_dimension(384)
+
+    try:
+        vecs = embedder.encode(queries)
+
+        results: List[List[float]] = []
+        # Common cases:
+        # - vecs: List[numpy.ndarray] (each element is a vector)
+        # - vecs: numpy.ndarray shape (n, dim)
+        # - vecs: List[List[float]]
+        if hasattr(vecs, "tolist") and not isinstance(vecs, list):
+            vecs = vecs.tolist()
+
+        if isinstance(vecs, list):
+            # vecs is aligned with queries if it's a list-of-vectors
+            iter_vecs = vecs[: len(queries)]
+        else:
+            # Fallback: treat as a single vector
+            iter_vecs = [vecs]
+
+        for v in iter_vecs:
+            vv = v
+            if hasattr(vv, "tolist"):
+                vv = vv.tolist()
+
+            # If vv is oddly nested (e.g. [[...]]), flatten one level
+            if isinstance(vv, list) and vv and isinstance(vv[0], list) and len(vv) == 1:
+                vv = vv[0]
+            if not isinstance(vv, list):
+                vv = list(vv)
+
+            out = [float(x) for x in vv]
+
+            # Dimension fixup
+            if len(out) != dimension:
+                print(f"[WARNING] Batch向量维度异常: 期望{dimension}, 实际{len(out)}")
+                if len(out) < dimension:
+                    out.extend([0.0] * (dimension - len(out)))
+                else:
+                    out = out[:dimension]
+
+            results.append(out)
+
+        # If backend returned fewer vectors than queries, pad with zero vectors
+        if len(results) < len(queries):
+            results.extend([[0.0] * dimension for _ in range(len(queries) - len(results))])
+
+        return results
+    except Exception as e:
+        print(f"[WARNING] Batch query embedding failed: {e}")
+        return [[0.0] * dimension for _ in range(len(queries))]
+
+
 def search_vectors(
     store = None, 
     query: str = "", 
@@ -793,8 +898,9 @@ def search_vectors_expanded(
 
     # collect hits across expansions
     agg: Dict[str, Dict] = {}
-    for q in expansions:
-        qv = embed_query(q)
+    vectors = embed_queries(expansions)
+    for idx, q in enumerate(expansions):
+        qv = vectors[idx] if idx < len(vectors) else [0.0] * get_dimension(384)
         hits = store.search_similar(query_vector=qv, limit=per, score_threshold=score_threshold, where=where)
         for h in hits:
             mid = h.get("metadata", {}).get("memory_id", h.get("id"))

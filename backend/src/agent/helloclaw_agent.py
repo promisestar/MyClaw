@@ -17,7 +17,7 @@ from hello_agents.tools import (
 )
 
 from ..workspace.manager import WorkspaceManager
-from ..tools import MemoryTool, ExecuteCommandTool, WebSearchTool, WebFetchTool, RAGTool
+from ..tools import MemoryTool, ExecuteCommandTool, WebSearchTool, WebFetchTool, RAGTool, MCPTool
 
 
 class HelloClawAgent:
@@ -80,7 +80,7 @@ class HelloClawAgent:
             enable_smart_compression=False,
             context_window=128000,
             trace_enabled=False,
-            skills_enabled=False,
+            skills_enabled=True,
             todowrite_enabled=False,
             devlog_enabled=False,
             subagent_enabled=True,  # 启用子 Agent 支持
@@ -98,6 +98,8 @@ class HelloClawAgent:
             config=self.config,
             enable_tool_calling=True,
             max_tool_iterations=max_tool_iterations,
+            workspace_root=self.workspace_path,
+            auto_cleanup_temp_files=True,
         )
 
         # 初始化 Memory Flush 管理器
@@ -249,15 +251,64 @@ class HelloClawAgent:
         # HelloClaw 自定义工具
         registry.register_tool(MemoryTool(self.workspace))
         registry.register_tool(ExecuteCommandTool(
-            allowed_directories=[self.workspace_path]  # 限制在工作空间目录
+            allowed_directories=[self.workspace_path],  # 限制在工作空间目录
+            default_workdir=self.workspace_path,  # 与 Read/Write 根目录一致，避免 uvicorn CWD 下找不到脚本
         ))
         registry.register_tool(WebFetchTool())   # 网页抓取工具
 
         # MyClaw自定义工具
         registry.register_tool(WebSearchTool())  # 网页搜索工具
-        registry.register_tool(RAGTool())  # RAG工具
+        registry.register_tool(RAGTool(workspace_root=self.workspace_path))  # RAG：相对路径相对工作空间根
+        self._register_mcp_tools(registry)
 
         return registry
+
+    def _register_mcp_tools(self, registry: ToolRegistry) -> None:
+        """按 ~/.helloclaw/config.json 的 `mcp` 段注册 MCP 工具。
+
+        - servers 非空：为每条配置注册一个 MCPTool（外部命令/鉴权等）
+        - servers 为空且 builtin_demo：注册内置演示 MCPTool()
+        - mcp.enabled=false：不注册任何 MCP
+        """
+        cfg = self.workspace.get_mcp_config()
+        if not cfg.get("enabled", True):
+            print("ℹ️ MCP 已在 config.json 中禁用（mcp.enabled=false）")
+            return
+
+        servers = cfg.get("servers") or []
+        if servers:
+            for item in servers:
+                if not isinstance(item, dict):
+                    print("⚠️ MCP servers 项格式无效（应为对象），已跳过")
+                    continue
+                name = (item.get("name") or "mcp").strip() or "mcp"
+                cmd = item.get("server_command")
+                if not cmd or not isinstance(cmd, list) or not all(
+                    isinstance(x, str) for x in cmd
+                ):
+                    print(f"⚠️ MCP「{name}」缺少有效 server_command（字符串列表），已跳过")
+                    continue
+                try:
+                    registry.register_tool(
+                        MCPTool(
+                            name=name,
+                            server_command=cmd,
+                            server_args=item.get("server_args") or [],
+                            env=item.get("env"),
+                            env_keys=item.get("env_keys"),
+                            auto_expand=item.get("auto_expand", True),
+                        )
+                    )
+                    print(f"✅ MCP 工具已注册: {name}")
+                except Exception as e:
+                    print(f"⚠️ MCP 工具注册失败 ({name}): {e}")
+            return
+
+        if cfg.get("builtin_demo", True):
+            registry.register_tool(MCPTool())
+            print("✅ MCP 工具已注册（内置演示服务器）")
+        else:
+            print("ℹ️ 未配置 mcp.servers 且 builtin_demo=false，未注册 MCP 工具")
 
     def chat(self, message: str, session_id: str = None) -> str:
         """同步聊天"""

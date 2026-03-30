@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import chat, session, config, memory
+from .api import chat, session, config, memory, upload
 from .workspace.manager import WorkspaceManager
 from .agent.helloclaw_agent import HelloClawAgent
 
@@ -92,6 +92,7 @@ app.include_router(chat.router, prefix="/api")
 app.include_router(session.router, prefix="/api")
 app.include_router(config.router, prefix="/api")
 app.include_router(memory.router, prefix="/api")
+app.include_router(upload.router, prefix="/api")
 
 
 @app.get("/api")

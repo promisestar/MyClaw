@@ -5,6 +5,7 @@ from .execute_command import ExecuteCommandTool
 from .web_search import WebSearchTool
 from .web_fetch import WebFetchTool
 from .rag_tool import RAGTool
+from .mcp_tool import MCPTool
 
 __all__ = [
     "MemoryTool",
@@ -12,4 +13,5 @@ __all__ = [
     "WebSearchTool",
     "WebFetchTool",
     "RAGTool",
+    "MCPTool",
 ]

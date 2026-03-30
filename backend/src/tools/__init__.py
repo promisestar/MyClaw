@@ -5,6 +5,7 @@ from .builtin.execute_command import ExecuteCommandTool
 from .builtin.web_search import WebSearchTool
 from .builtin.web_fetch import WebFetchTool
 from .builtin.rag_tool import RAGTool
+from .builtin.mcp_tool import MCPTool
 
 __all__ = [
     "MemoryTool",
@@ -12,4 +13,5 @@ __all__ = [
     "WebSearchTool",
     "WebFetchTool",
     "RAGTool",
+    "MCPTool",
 ]

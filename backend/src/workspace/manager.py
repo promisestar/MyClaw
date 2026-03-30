@@ -5,7 +5,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Set
+from typing import Any, Dict, Optional, List, Set
 
 
 # 配置文件列表
@@ -29,7 +29,10 @@ def get_default_global_config() -> dict:
     if template_path.exists():
         with open(template_path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"llm": {"model_id": "", "base_url": "", "api_key": ""}}
+    return {
+        "llm": {"model_id": "", "base_url": "", "api_key": ""},
+        "mcp": {"enabled": True, "builtin_demo": True, "servers": []},
+    }
 
 
 class WorkspaceManager:
@@ -85,6 +88,55 @@ class WorkspaceManager:
             "base_url": llm_config.get("base_url") or os.getenv("LLM_BASE_URL"),
         }
 
+    def get_mcp_config(self) -> Dict[str, Any]:
+        """读取 MCP 工具相关配置（来自 ~/.helloclaw/config.json 的 `mcp` 段）。
+
+        字段说明：
+        - enabled: 是否注册任何 MCP 工具（默认 True）
+        - builtin_demo: 当 servers 为空时，是否注册内置演示 MCPTool（默认 True）
+        - servers: 外部 MCP 服务列表；非空时按条目各注册一个 MCPTool（此时不再注册内置演示，除非自行再加一条）
+
+        每条 server 支持：
+        - name: 工具注册名（建议唯一，如 github、fs）
+        - server_command: 启动命令列表，如 ["npx","-y","@modelcontextprotocol/server-github"]
+        - server_args: 可选附加参数列表
+        - env: 可选，传给子进程的环境变量字典
+        - env_keys: 可选，从当前进程环境读取的变量名列表
+        - auto_expand: 可选，是否展开远端工具（默认 True）
+        """
+        defaults: Dict[str, Any] = {
+            "enabled": True,
+            "builtin_demo": True,
+            "servers": [],
+        }
+        global_config = self.load_global_config()
+        raw = global_config.get("mcp")
+        if not isinstance(raw, dict):
+            return dict(defaults)
+        merged = {**defaults, **raw}
+        if not isinstance(merged.get("servers"), list):
+            merged["servers"] = []
+        return merged
+
+    def ensure_global_config_exists(self) -> None:
+        """若不存在则创建全局配置文件 ~/.helloclaw/config.json。
+
+        工作区内的 AGENTS.md 等与「全局」config.json 是两套配置：前者在 workspace 目录，
+        后者供 LLM/MCP 等读取；首次初始化工作区时应一并生成，便于用户编辑。
+
+        若文件已存在则不做覆盖，避免丢失用户修改。
+        """
+        config_path = os.path.expanduser("~/.helloclaw/config.json")
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        if os.path.exists(config_path):
+            return
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(get_default_global_config(), f, indent=2, ensure_ascii=False)
+            print(f"📝 已创建全局配置: {config_path}")
+        except OSError as e:
+            print(f"⚠️ 无法写入全局配置 {config_path}: {e}")
+
     # ==================== 入职状态检测 ====================
 
     def is_onboarding_completed(self) -> bool:
@@ -106,6 +158,9 @@ class WorkspaceManager:
 
         如果工作空间不存在，创建默认目录和配置文件
         """
+        # 全局配置（~/.helloclaw/config.json）与 workspace 内 *.md 分开管理；首次一并创建
+        self.ensure_global_config_exists()
+
         # 创建目录
         os.makedirs(self.workspace_path, exist_ok=True)
         os.makedirs(self.memory_path, exist_ok=True)

@@ -2,7 +2,11 @@
 
 import json
 import asyncio
+import os
+import re
 from datetime import datetime
+from pathlib import Path
+from typing import Set, Tuple
 from typing import Optional, List, Dict, Any, AsyncGenerator, TYPE_CHECKING, Union
 
 from hello_agents.agents.simple_agent import SimpleAgent
@@ -39,6 +43,8 @@ class EnhancedSimpleAgent(SimpleAgent):
         tool_registry: Optional['ToolRegistry'] = None,
         enable_tool_calling: bool = True,
         max_tool_iterations: int = 10,
+        workspace_root: Optional[str] = None,
+        auto_cleanup_temp_files: bool = True,
     ):
         """初始化 EnhancedSimpleAgent
 
@@ -50,6 +56,8 @@ class EnhancedSimpleAgent(SimpleAgent):
             tool_registry: 工具注册表（可选）
             enable_tool_calling: 是否启用工具调用
             max_tool_iterations: 最大工具调用迭代次数
+            workspace_root: 工作空间根目录（用于安全清理临时文件）
+            auto_cleanup_temp_files: 是否启用临时文件自动清理兜底
         """
         super().__init__(
             name=name,
@@ -63,6 +71,81 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         # 检查是否支持流式工具调用
         self._supports_streaming_tools = isinstance(llm, EnhancedHelloAgentsLLM)
+        self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
+        self.auto_cleanup_temp_files = auto_cleanup_temp_files
+
+    def _resolve_workspace_file(self, raw_path: str) -> Optional[Path]:
+        """将工具参数中的路径解析为工作空间内绝对路径。"""
+        if not raw_path:
+            return None
+
+        candidate = Path(raw_path)
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+        elif self.workspace_root:
+            resolved = (self.workspace_root / candidate).resolve()
+        else:
+            resolved = (Path.cwd() / candidate).resolve()
+
+        if self.workspace_root:
+            try:
+                resolved.relative_to(self.workspace_root)
+            except ValueError:
+                return None
+        return resolved
+
+    def _is_temp_artifact_path(self, file_path: Path) -> bool:
+        """判断是否是临时产物路径（避免误删业务文件）。"""
+        name = file_path.name.lower()
+        if re.match(r"^(tmp_|temp_|extract_)", name):
+            return True
+        if name.endswith((".tmp", ".temp")):
+            return True
+        if any(part.lower() in ("tmp", "temp", ".tmp") for part in file_path.parts):
+            return True
+        return False
+
+    def _maybe_track_temp_file(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        exec_result: str,
+        existed_before: bool,
+        tracked_files: Set[Path],
+    ) -> None:
+        """在 Write 成功创建临时文件时加入待清理列表。"""
+        if tool_name.lower() != "write":
+            return
+        if exec_result.startswith("❌"):
+            return
+        if existed_before:
+            return
+
+        raw_path = arguments.get("path")
+        if not isinstance(raw_path, str):
+            return
+
+        resolved = self._resolve_workspace_file(raw_path)
+        if not resolved or not resolved.exists() or not resolved.is_file():
+            return
+        if self._is_temp_artifact_path(resolved):
+            tracked_files.add(resolved)
+
+    def _cleanup_tracked_temp_files(self, tracked_files: Set[Path]) -> Tuple[int, List[str]]:
+        """删除本轮跟踪到的临时文件。"""
+        if not self.auto_cleanup_temp_files or not tracked_files:
+            return 0, []
+
+        deleted_count = 0
+        failed: List[str] = []
+        for file_path in sorted(tracked_files):
+            try:
+                if file_path.exists() and file_path.is_file():
+                    file_path.unlink()
+                    deleted_count += 1
+            except Exception as exc:
+                failed.append(f"{file_path}: {exc}")
+        return deleted_count, failed
 
     def _build_messages(self, input_text: str) -> List[Dict[str, Any]]:
         """构建消息列表（保留 tool_calls/tool_call_id 元数据）。"""
@@ -124,6 +207,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         )
 
         print(f"\n🤖 {self.name} 开始处理问题（流式）: {input_text}")
+        tracked_temp_files: Set[Path] = set()
 
         try:
             # 构建消息列表，包括系统提示词、历史消息、用户问题
@@ -253,6 +337,13 @@ class EnhancedSimpleAgent(SimpleAgent):
                         continue
 
                     print(f"🎬 调用工具: {tool_name}({arguments})")
+                    preexisting_file = False
+                    raw_path = arguments.get("path")
+                    if isinstance(raw_path, str):
+                        resolved_before = self._resolve_workspace_file(raw_path)
+                        preexisting_file = bool(
+                            resolved_before and resolved_before.exists() and resolved_before.is_file()
+                        )
 
                     # 发送工具调用开始事件
                     yield StreamEvent.create(
@@ -268,6 +359,13 @@ class EnhancedSimpleAgent(SimpleAgent):
 
                     # 执行工具
                     exec_result = self._execute_tool_call(tool_name, arguments)
+                    self._maybe_track_temp_file(
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        exec_result=exec_result,
+                        existed_before=preexisting_file,
+                        tracked_files=tracked_temp_files,
+                    )
 
                     # 截断显示
                     result_preview = exec_result[:200] + "..." if len(exec_result) > 200 else exec_result
@@ -386,6 +484,14 @@ class EnhancedSimpleAgent(SimpleAgent):
                 self.name,
                 result=""  # 空结果表示失败
             )
+        finally:
+            deleted_count, failed = self._cleanup_tracked_temp_files(tracked_temp_files)
+            if deleted_count:
+                print(f"🧹 已自动清理临时文件: {deleted_count} 个")
+            if failed:
+                print("⚠️ 临时文件清理失败：")
+                for line in failed:
+                    print(f"   - {line}")
 
     async def _stream_without_tools(
         self,
