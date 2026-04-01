@@ -1,9 +1,10 @@
 # MyClaw
 
 **HelloClaw** 是一个基于 Hello-Agents 框架的个性化 AI Agent 应用，实现了 OpenClaw 中的核心功能。
-**MyClaw** 在**HelloClaw**的基础上，扩展了RAG、MCP、Skill等功能，使Agent助手更加智能。
 
-![](helloclaw.png)
+**MyClaw** 在**HelloClaw**的基础上，扩展了RAG、MCP、Skill等功能，使Agent助手更加智能；扩展了向Agent助手上传文件的能力，使其能应对更加多样的任务；还提供了通过Websocket连接Agent助手进行远程实时对话的功能。
+
+![](MyClaw.png)
 
 ## 功能特性
 
@@ -16,6 +17,8 @@
 - **会话管理** - 多会话支持，会话历史持久化
 - **身份定制** - 可自定义 Agent 身份和个性
 - **Web 界面** - 现代化的 Vue3 前端界面
+- **远程实时对话** - 通过 Websocket 连接 Agent 助手进行实时对话
+- **文件上传** - 支持上传文件到 Agent 助手进行处理，如上传到RAG知识库。
 
 ## 技术栈
 
@@ -134,6 +137,36 @@ pnpm dev
 
 4. 访问 http://localhost:5173
 
+### Bridge（WebSocket 对话通道）配置
+
+如需启用“外部软件通过 WebSocket 与 Agent 实时对话”，除了后端服务外，还需启动本仓库的 `bridge` 中继服务。
+
+1. 进入 Bridge 目录：
+```bash
+cd bridge
+```
+
+2. 安装依赖并构建：
+```bash
+npm install
+npm run build
+```
+
+3. 启动 Bridge：
+```bash
+npm start
+```
+
+4. 在 `backend/.env` 中开启外部通道（示例）：
+```env
+EXTERNAL_BRIDGE_ENABLED=true
+EXTERNAL_BRIDGE_URL=ws://127.0.0.1:3001
+# 可选：Bridge 启用 token 时保持一致
+# EXTERNAL_BRIDGE_TOKEN=your-bridge-token
+# 可选：允许全部发送者（或填白名单如 10086,alice）
+EXTERNAL_BRIDGE_ALLOW_FROM=*
+```
+
 ## 配置说明
 
 ### LLM 配置
@@ -170,6 +203,78 @@ LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
     ├── memory/       # 每日记忆
     └── sessions/     # 会话历史
 ```
+
+---
+
+## WebSocket 连接对话（External Bridge）
+
+当前 WebSocket 对话能力采用“外部软件 + Bridge + 后端接收器”的架构：
+
+```mermaid
+flowchart LR
+    Ext["外部软件客户端"]
+    Bridge["Bridge 服务"]
+    Recv["ExternalSoftwareReceiver"]
+    Agent["HelloClawAgent"]
+
+    Ext -->|"message"| Bridge
+    Bridge -->|"message"| Recv
+    Recv -->|"achat"| Agent
+    Agent -->|"reply"| Recv
+    Recv -->|"send"| Bridge
+    Bridge -->|"send"| Ext
+```
+
+关键点：
+
+- 后端在 `lifespan` 启动阶段，根据 `EXTERNAL_BRIDGE_ENABLED` 或 `EXTERNAL_BRIDGE_URL` 自动拉起 `ExternalSoftwareReceiver` 后台任务。
+- 接收器连接 `EXTERNAL_BRIDGE_URL`（默认 `ws://127.0.0.1:3001`），仅处理 `type="message"` 的入站帧。
+- 处理完成后回写 `type="send"`，由 Bridge 转发给外部客户端，实现“实时收发”。
+- 为避免会话串线，HTTP/SSE 与外部通道共用同一把 agent 锁，串行驱动同一个 Agent 实例。
+
+最小入站消息示例（外部软件 -> Bridge -> 后端）：
+
+```json
+{
+  "type": "message",
+  "id": "msg_001",
+  "sender": "demo_chat_1",
+  "pn": "demo_user_1",
+  "content": "你好，请介绍一下你自己",
+  "timestamp": 1710000000,
+  "isGroup": false,
+  "media": []
+}
+```
+
+说明文档：`docs/Bridge实现与功能说明.md`
+
+---
+
+## 文件上传能力
+
+后端提供文件上传接口，文件会保存到工作空间下的 `uploads/<session_id 或 general>/` 目录，便于在对话中引用路径、或配合 RAG 入库。
+
+上传接口：
+
+- 端点：`POST /api/upload/file`
+- 请求类型：`multipart/form-data`
+- 字段：
+  - `file`：必填，上传文件
+  - `session_id`：可选，用于分目录保存
+- 限制：单文件默认上限 `10MB`，可通过 `UPLOAD_MAX_BYTES` 调整
+
+返回示例：
+
+```json
+{
+  "filename": "notes.pdf",
+  "stored_path": "uploads/session_001/notes.pdf",
+  "size": 102400
+}
+```
+
+你可以在对话里把 `stored_path` 提供给 Agent（例如让 Agent 读取或进一步处理该文件）。
 
 ---
 
@@ -251,6 +356,7 @@ MCP 工具常用的 `action`：
 | `/api/config/llm` | GET/PUT | LLM 配置管理 |
 | `/api/memory/files` | GET | 获取记忆文件列表 |
 | `/api/memory/content` | GET | 获取记忆内容 |
+| `/api/upload/file` | POST | 上传文件到工作空间（`multipart/form-data`） |
 
 
 ## 许可证
