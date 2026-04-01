@@ -34,27 +34,33 @@
 ## 项目结构
 
 ```
-helloclaw/
-├── backend/                 # 后端服务
-│   ├── src/
-│   │   ├── agent/          # Agent 封装
-│   │   ├── api/            # FastAPI 路由
-│   │   ├── channels/       # Web/CLI 渠道
-│   │   ├── cli/            # 命令行工具
-│   │   ├── memory/         # 记忆管理
-│   │   ├── tools/          # 内置工具
-│   │   └── workspace/      # 工作空间管理
-│   ├── .env.example        # 环境变量模板
-│   └── pyproject.toml      # Python 依赖配置
-├── frontend/               # 前端服务
-│   ├── src/
-│   │   ├── views/          # 页面组件
-│   │   ├── components/     # 通用组件
-│   │   ├── api/            # API 请求
-│   │   └── assets/         # 静态资源
-│   └── package.json        # 前端依赖配置
-├── tests/                  # 测试脚本
-└── CLAUDE.md              # Claude Code 维护文档
+MyClaw/
+├── README.md                          # 项目总览文档
+├── MyClaw.png                         # 项目展示图片
+├── backend/                           # 后端服务（FastAPI + Agent）
+│   ├── README.md                      # 后端说明
+│   ├── .env.example                   # 环境变量模板
+│   ├── pyproject.toml                 # Python 依赖配置
+│   └── src/
+│       ├── agent/                     # Agent 封装与增强能力
+│       ├── api/                       # HTTP API（chat/session/config/memory/upload）
+│       ├── channels/                  # 外部通道（CLI / External Bridge）
+│       ├── cli/                       # 命令行入口
+│       ├── mcp/                       # MCP 客户端与服务集成
+│       ├── memory/                    # 记忆捕获与落盘
+│       ├── rag/                       # RAG 向量检索流水线
+│       ├── tools/                     # 内置工具集合
+│       ├── workspace/                 # 工作空间管理与模板
+│       └── main.py                    # FastAPI 入口（含外部接收器生命周期）
+├── bridge/                            # WebSocket 中继服务（外部软件对话通道）
+│   ├── src/                           # TypeScript 源码
+│   ├── dist/                          # 构建产物
+│   └── README.md                      # Bridge 使用说明
+├── docs/                              # 设计与实现文档
+│   ├── Bridge实现与功能说明.md
+│   ├── 外部软件消息接入说明（External Bridge）.md
+│   └── ...                            # 其他实现说明文档
+└── frontend/                          # 前端服务（Vue3 + TypeScript）
 ```
 
 ## 快速开始
