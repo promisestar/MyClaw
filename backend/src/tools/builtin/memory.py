@@ -89,15 +89,14 @@ class MemoryTool(Tool):
         )
 
     @tool_action("memory_search", "搜索历史记忆")
-    def _search(self, keyword: str, context_lines: int = 3) -> str:
+    def _search(self, keyword: str, context_lines: int = 3) -> ToolResponse:
         """搜索记忆
 
         Args:
             keyword: 搜索关键词
             context_lines: 上下文行数，默认 3
         """
-        response = self._search_memory(keyword, context_lines)
-        return response.text
+        return self._search_memory(keyword, context_lines)
 
     @tool_action("memory_get", "读取特定记忆文件或行范围")
     def _get_memory(
@@ -106,7 +105,7 @@ class MemoryTool(Tool):
         start_line: int = None,
         end_line: int = None,
         lines: str = None,
-    ) -> str:
+    ) -> ToolResponse:
         """读取记忆文件内容
 
         Args:
@@ -138,10 +137,13 @@ class MemoryTool(Tool):
 
         if content is None:
             available = self._list_memory_files_brief()
-            return f"文件 '{filename}' 不存在。可用文件:\n{available}"
+            return ToolResponse.error(
+                code="NOT_FOUND",
+                message=f"文件 '{filename}' 不存在。可用文件:\n{available}"
+            )
 
         if not content:
-            return f"文件 '{filename}' 为空"
+            return ToolResponse.success(text=f"文件 '{filename}' 为空")
 
         display_name = filename
         if start_line or end_line:
@@ -150,10 +152,10 @@ class MemoryTool(Tool):
                 range_str += f"-{end_line}"
             display_name += f" ({range_str})"
 
-        return f"**{display_name}**:\n```\n{content}\n```"
+        return ToolResponse.success(text=f"**{display_name}**:\n```\n{content}\n```")
 
     @tool_action("memory_add", "添加内容到今日记忆")
-    def _add_daily(self, content: str, category: str = None) -> str:
+    def _add_daily(self, content: str, category: str = None) -> ToolResponse:
         """添加每日记忆
 
         Args:
@@ -163,14 +165,14 @@ class MemoryTool(Tool):
         if category:
             # 使用带分类标签的存储
             self.workspace.append_classified_memory(content, category)
-            return f"已添加到今日记忆 [{category}]: {content[:50]}..."
+            return ToolResponse.success(text=f"已添加到今日记忆 [{category}]: {content[:50]}...")
         else:
             # 使用原有方法
             self.workspace.append_to_daily_memory(content)
-            return f"已添加到今日记忆: {content[:50]}..."
+            return ToolResponse.success(text=f"已添加到今日记忆: {content[:50]}...")
 
     @tool_action("memory_update_longterm", "更新长期记忆")
-    def _update_longterm(self, content: str) -> str:
+    def _update_longterm(self, content: str) -> ToolResponse:
         """更新长期记忆
 
         Args:
@@ -179,15 +181,15 @@ class MemoryTool(Tool):
         current = self.workspace.load_config("MEMORY") or ""
         updated = current + f"\n\n## 新增\n\n{content}\n"
         self.workspace.save_config("MEMORY", updated)
-        return "已更新长期记忆"
+        return ToolResponse.success(text="已更新长期记忆")
 
     @tool_action("memory_list", "列出所有记忆文件")
-    def _list(self) -> str:
+    def _list(self) -> ToolResponse:
         """列出所有记忆文件"""
         files = self.workspace.list_memory_files()
 
         if not files:
-            return "暂无记忆文件"
+            return ToolResponse.success(text="暂无记忆文件")
 
         lines = ["# 记忆文件列表\n"]
 
@@ -207,10 +209,10 @@ class MemoryTool(Tool):
                 size_kb = f["size"] / 1024
                 lines.append(f"- **{f['name']}** ({size_kb:.1f} KB)")
 
-        return "\n".join(lines)
+        return ToolResponse.success(text="\n".join(lines))
 
     @tool_action("memory_cleanup", "清理过期的每日记忆")
-    def _cleanup(self, days: int = 30) -> str:
+    def _cleanup(self, days: int = 30) -> ToolResponse:
         """清理过期记忆
 
         Args:
@@ -219,9 +221,11 @@ class MemoryTool(Tool):
         deleted = self.workspace.cleanup_old_memories(days)
 
         if not deleted:
-            return f"没有需要清理的记忆（保留最近 {days} 天）"
+            return ToolResponse.success(text=f"没有需要清理的记忆（保留最近 {days} 天）")
 
-        return f"已清理 {len(deleted)} 个过期记忆文件:\n" + "\n".join(f"- {f}" for f in deleted)
+        return ToolResponse.success(
+            text=f"已清理 {len(deleted)} 个过期记忆文件:\n" + "\n".join(f"- {f}" for f in deleted)
+        )
 
     def _list_memory_files_brief(self) -> str:
         """简要列出记忆文件"""

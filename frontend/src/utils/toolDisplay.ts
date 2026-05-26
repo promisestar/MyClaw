@@ -33,9 +33,6 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayConfig> = {
 
   // 命令执行工具
   execute_command: { name: '执行命令', icon: '💻' },
-  exec_run: { name: '执行命令', icon: '💻' },
-  exec_allowed_commands: { name: '查看允许的命令', icon: '📋' },
-  exec_dangerous_patterns: { name: '查看危险命令', icon: '⚠️' },
 
   // 网络工具
   web_search: { name: '网络搜索', icon: '🌐' },

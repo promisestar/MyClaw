@@ -1,7 +1,7 @@
 """内置工具模块"""
 
 from .memory import MemoryTool
-from .execute_command import ExecuteCommandTool
+from .bash import BashTool
 from .web_search import WebSearchTool
 from .web_fetch import WebFetchTool
 from .rag_tool import RAGTool
@@ -9,7 +9,7 @@ from .mcp_tool import MCPTool
 
 __all__ = [
     "MemoryTool",
-    "ExecuteCommandTool",
+    "BashTool",
     "WebSearchTool",
     "WebFetchTool",
     "RAGTool",

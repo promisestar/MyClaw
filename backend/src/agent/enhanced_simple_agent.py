@@ -181,6 +181,148 @@ class EnhancedSimpleAgent(SimpleAgent):
         })
         return messages
 
+    async def _yield_tool_call_execution(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: Dict[str, Any],
+        tracked_temp_files: Set[Path],
+        tool_call_records: List[Dict[str, Any]],
+        tool_results_by_id: Dict[str, str],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """执行单个工具调用并 yield 流式事件。"""
+        print(f"🎬 调用工具: {tool_name}({arguments})")
+        preexisting_file = False
+        raw_path = arguments.get("path")
+        if isinstance(raw_path, str):
+            resolved_before = self._resolve_workspace_file(raw_path)
+            preexisting_file = bool(
+                resolved_before and resolved_before.exists() and resolved_before.is_file()
+            )
+
+        yield StreamEvent.create(
+            StreamEventType.TOOL_CALL_START,
+            self.name,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            args=arguments
+        )
+
+        await asyncio.sleep(0)
+
+        exec_result = self._execute_tool_call(tool_name, arguments)
+        self._maybe_track_temp_file(
+            tool_name=tool_name,
+            arguments=arguments,
+            exec_result=exec_result,
+            existed_before=preexisting_file,
+            tracked_files=tracked_temp_files,
+        )
+
+        result_preview = exec_result[:200] + "..." if len(exec_result) > 200 else exec_result
+        if exec_result.startswith("❌"):
+            print(f"❌ 工具执行失败: {result_preview}")
+        else:
+            print(f"👀 观察: {result_preview}")
+
+        yield StreamEvent.create(
+            StreamEventType.TOOL_CALL_FINISH,
+            self.name,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            result=exec_result
+        )
+
+        tool_call_records.append({
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "args": arguments,
+            "result": exec_result,
+            "status": "error" if exec_result.startswith("❌") else "done"
+        })
+        tool_results_by_id[tool_call_id] = exec_result
+
+    async def _try_execute_ready_tool(
+        self,
+        tc_state: Dict[str, Any],
+        tracked_temp_files: Set[Path],
+        tool_call_records: List[Dict[str, Any]],
+        tool_results_by_id: Dict[str, str],
+        executed_ids: Set[str],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """若工具参数 JSON 已完整，立即执行该工具。"""
+        if tc_state.get("executed"):
+            return
+
+        tool_call_id = tc_state.get("id") or ""
+        tool_name = tc_state.get("name") or ""
+        if not tool_call_id or not tool_name:
+            return
+
+        args_str = tc_state.get("arguments", "")
+        if not args_str:
+            return
+
+        try:
+            arguments = json.loads(args_str)
+        except json.JSONDecodeError:
+            return
+
+        tc_state["executed"] = True
+        executed_ids.add(tool_call_id)
+        async for event in self._yield_tool_call_execution(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            arguments=arguments,
+            tracked_temp_files=tracked_temp_files,
+            tool_call_records=tool_call_records,
+            tool_results_by_id=tool_results_by_id,
+        ):
+            yield event
+
+    async def _execute_tool_call_with_error(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        error_message: str,
+        tool_call_records: List[Dict[str, Any]],
+        tool_results_by_id: Dict[str, str],
+        executed_ids: Set[str],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """工具参数无法解析时，记录错误结果。"""
+        if tool_call_id in executed_ids:
+            return
+
+        executed_ids.add(tool_call_id)
+        print(f"❌ 工具参数解析失败: {error_message}")
+
+        yield StreamEvent.create(
+            StreamEventType.TOOL_CALL_START,
+            self.name,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            args={}
+        )
+        await asyncio.sleep(0)
+
+        exec_result = f"错误：参数格式不正确 - {error_message}"
+        yield StreamEvent.create(
+            StreamEventType.TOOL_CALL_FINISH,
+            self.name,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            result=exec_result
+        )
+
+        tool_call_records.append({
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "args": {},
+            "result": exec_result,
+            "status": "error"
+        })
+        tool_results_by_id[tool_call_id] = exec_result
+
     async def arun_stream_with_tools(
         self,
         input_text: str,
@@ -188,7 +330,8 @@ class EnhancedSimpleAgent(SimpleAgent):
     ) -> AsyncGenerator[StreamEvent, None]:
         """异步流式运行（支持工具调用）
 
-        使用 EnhancedHelloAgentsLLM 的 astream_invoke_with_tools 方法实现优雅的流式工具调用。
+        使用 EnhancedHelloAgentsLLM 的 astream_invoke_with_tools 方法实现流式工具调用。
+        每个工具调用的参数 JSON 解析完成后会立即执行，无需等待整轮流结束。
 
         Args:
             input_text: 用户输入
@@ -260,6 +403,11 @@ class EnhancedSimpleAgent(SimpleAgent):
                 print(f"\n--- 第 {current_iteration} 轮 ---")
                 print("💭 LLM 输出: ", end="", flush=True)
 
+                pending_tools: Dict[int, Dict[str, Any]] = {}
+                tool_results_by_id: Dict[str, str] = {}
+                executed_ids: Set[str] = set()
+                iteration_tool_records: List[Dict[str, Any]] = []
+
                 # 使用 LLM 的流式工具调用方法
                 try:
                     async for event in self.llm.astream_invoke_with_tools(
@@ -278,9 +426,83 @@ class EnhancedSimpleAgent(SimpleAgent):
                             )
                             print(event.content, end="", flush=True)
 
-                        # 工具调用开始（打印信息，不发送事件）
                         elif event.event_type == StreamToolEventType.TOOL_CALL_START:
-                            pass  # 等工具调用完成后再发送事件
+                            idx = event.tool_call_index
+                            if idx is None:
+                                continue
+                            if idx not in pending_tools:
+                                pending_tools[idx] = {
+                                    "id": "",
+                                    "name": "",
+                                    "arguments": "",
+                                    "executed": False,
+                                }
+                            if event.tool_call_id:
+                                pending_tools[idx]["id"] = event.tool_call_id
+                            if event.tool_name:
+                                pending_tools[idx]["name"] = event.tool_name
+                            # 新工具开始时，尝试执行已完成解析的前序工具
+                            for prev_idx in sorted(pending_tools.keys()):
+                                if prev_idx >= idx:
+                                    break
+                                async for tool_event in self._try_execute_ready_tool(
+                                    pending_tools[prev_idx],
+                                    tracked_temp_files,
+                                    iteration_tool_records,
+                                    tool_results_by_id,
+                                    executed_ids,
+                                ):
+                                    yield tool_event
+
+                        elif event.event_type == StreamToolEventType.TOOL_CALL_DELTA:
+                            idx = event.tool_call_index
+                            if idx is None or not event.tool_arguments_delta:
+                                continue
+                            if idx not in pending_tools:
+                                pending_tools[idx] = {
+                                    "id": "",
+                                    "name": "",
+                                    "arguments": "",
+                                    "executed": False,
+                                }
+                            pending_tools[idx]["arguments"] += event.tool_arguments_delta
+                            async for tool_event in self._try_execute_ready_tool(
+                                pending_tools[idx],
+                                tracked_temp_files,
+                                iteration_tool_records,
+                                tool_results_by_id,
+                                executed_ids,
+                            ):
+                                yield tool_event
+
+                        elif event.event_type == StreamToolEventType.FINISH:
+                            for idx in sorted(pending_tools.keys()):
+                                tc_state = pending_tools[idx]
+                                if tc_state.get("executed"):
+                                    continue
+                                async for tool_event in self._try_execute_ready_tool(
+                                    tc_state,
+                                    tracked_temp_files,
+                                    iteration_tool_records,
+                                    tool_results_by_id,
+                                    executed_ids,
+                                ):
+                                    yield tool_event
+                                if tc_state.get("executed"):
+                                    continue
+                                tool_call_id = tc_state.get("id") or ""
+                                tool_name = tc_state.get("name") or ""
+                                if tool_call_id and tool_name:
+                                    async for tool_event in self._execute_tool_call_with_error(
+                                        tool_name=tool_name,
+                                        tool_call_id=tool_call_id,
+                                        error_message="参数 JSON 不完整或格式错误",
+                                        tool_call_records=iteration_tool_records,
+                                        tool_results_by_id=tool_results_by_id,
+                                        executed_ids=executed_ids,
+                                    ):
+                                        yield tool_event
+                                    tc_state["executed"] = True
 
                     print()  # 换行
 
@@ -299,7 +521,6 @@ class EnhancedSimpleAgent(SimpleAgent):
                 if result is None:
                     break
 
-                # 检查是否有工具调用
                 complete_tool_calls = result.get_complete_tool_calls()
 
                 # 无论是否有工具调用，都保存本轮的文本内容
@@ -310,93 +531,52 @@ class EnhancedSimpleAgent(SimpleAgent):
                     # 没有工具调用，直接返回
                     if not final_response:
                         final_response = "抱歉，我无法回答这个问题。"
-                    # 显示内容预览
                     preview = final_response[:100] + "..." if len(final_response) > 100 else final_response
                     print(f"💬 直接回复: {preview}")
                     break
 
-                print(f"🔧 准备执行 {len(complete_tool_calls)} 个工具调用...")
-
-                # 将助手消息添加到历史
-                messages.append(result.to_assistant_message())
-
-                # 执行所有工具调用
+                # 兜底：流结束后仍未执行的工具（如未收到 FINISH 事件）
                 for tc in complete_tool_calls:
-                    tool_name = tc["name"]
                     tool_call_id = tc["id"]
-
+                    if tool_call_id in executed_ids:
+                        continue
+                    tool_name = tc["name"]
                     try:
                         arguments = json.loads(tc["arguments"])
                     except json.JSONDecodeError as e:
-                        print(f"❌ 工具参数解析失败: {e}")
+                        async for tool_event in self._execute_tool_call_with_error(
+                            tool_name=tool_name,
+                            tool_call_id=tool_call_id,
+                            error_message=str(e),
+                            tool_call_records=iteration_tool_records,
+                            tool_results_by_id=tool_results_by_id,
+                            executed_ids=executed_ids,
+                        ):
+                            yield tool_event
+                        continue
+
+                    async for tool_event in self._yield_tool_call_execution(
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                        arguments=arguments,
+                        tracked_temp_files=tracked_temp_files,
+                        tool_call_records=iteration_tool_records,
+                        tool_results_by_id=tool_results_by_id,
+                    ):
+                        yield tool_event
+                    executed_ids.add(tool_call_id)
+
+                tool_call_records.extend(iteration_tool_records)
+
+                messages.append(result.to_assistant_message())
+                for tc in complete_tool_calls:
+                    tool_call_id = tc["id"]
+                    if tool_call_id in tool_results_by_id:
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
-                            "content": f"错误：参数格式不正确 - {str(e)}"
+                            "content": tool_results_by_id[tool_call_id]
                         })
-                        continue
-
-                    print(f"🎬 调用工具: {tool_name}({arguments})")
-                    preexisting_file = False
-                    raw_path = arguments.get("path")
-                    if isinstance(raw_path, str):
-                        resolved_before = self._resolve_workspace_file(raw_path)
-                        preexisting_file = bool(
-                            resolved_before and resolved_before.exists() and resolved_before.is_file()
-                        )
-
-                    # 发送工具调用开始事件
-                    yield StreamEvent.create(
-                        StreamEventType.TOOL_CALL_START,
-                        self.name,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        args=arguments
-                    )
-
-                    # 让出控制权，确保 SSE 发送 tool_start 事件
-                    await asyncio.sleep(0)
-
-                    # 执行工具
-                    exec_result = self._execute_tool_call(tool_name, arguments)
-                    self._maybe_track_temp_file(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                        exec_result=exec_result,
-                        existed_before=preexisting_file,
-                        tracked_files=tracked_temp_files,
-                    )
-
-                    # 截断显示
-                    result_preview = exec_result[:200] + "..." if len(exec_result) > 200 else exec_result
-                    if exec_result.startswith("❌"):
-                        print(f"❌ 工具执行失败: {result_preview}")
-                    else:
-                        print(f"👀 观察: {result_preview}")
-
-                    # 发送工具调用完成事件
-                    yield StreamEvent.create(
-                        StreamEventType.TOOL_CALL_FINISH,
-                        self.name,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        result=exec_result
-                    )
-
-                    # 记录工具调用（用于存入会话）
-                    tool_call_records.append({
-                        "name": tool_name,
-                        "args": arguments,
-                        "result": exec_result,
-                        "status": "error" if exec_result.startswith("❌") else "done"
-                    })
-
-                    # 添加工具结果到消息
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": exec_result
-                    })
 
                 # 发送步骤完成事件
                 yield StreamEvent.create(
@@ -429,10 +609,9 @@ class EnhancedSimpleAgent(SimpleAgent):
 
             # 如果有工具调用，保存工具调用消息
             if tool_call_records:
-                # 保存 assistant 消息（包含 tool_calls）
                 tool_calls_for_message = [
                     {
-                        "id": f"call_{i}",
+                        "id": tc.get("tool_call_id", f"call_{i}"),
                         "type": "function",
                         "function": {
                             "name": tc["name"],
@@ -442,17 +621,16 @@ class EnhancedSimpleAgent(SimpleAgent):
                     for i, tc in enumerate(tool_call_records)
                 ]
                 self.add_message(Message(
-                    "",  # 工具调用时可能没有文本内容
+                    "",
                     "assistant",
                     metadata={"tool_calls": tool_calls_for_message}
                 ))
 
-                # 保存每个 tool 消息
-                for i, tc in enumerate(tool_call_records):
+                for tc in tool_call_records:
                     self.add_message(Message(
                         tc["result"],
                         "tool",
-                        metadata={"tool_call_id": f"call_{i}"}
+                        metadata={"tool_call_id": tc.get("tool_call_id", "")}
                     ))
 
             # 保存最终 assistant 回答

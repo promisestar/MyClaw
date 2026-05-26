@@ -26,6 +26,14 @@ export interface StreamEvent {
 
 export type StreamCallback = (event: StreamEvent) => void
 
+export interface SendMessageOptions {
+  sessionId?: string | null
+  userTurnIndex?: number
+  /** 重新生成时传 true（与 userTurnIndex 合用）；编辑后发送传 false */
+  regenerate?: boolean
+  signal?: AbortSignal
+}
+
 export const chatApi = {
   // 流式发送消息 (SSE)
   sendMessage: async (message: string, sessionId?: string) => {
@@ -47,16 +55,25 @@ export const chatApi = {
   // 流式发送消息 (SSE) - 返回完整响应
   sendMessageStream: async (
     message: string,
-    sessionId: string | null | undefined,
     onChunk: StreamCallback,
-    signal?: AbortSignal
+    options: SendMessageOptions = {}
   ): Promise<ChatResponse> => {
+    const { sessionId, userTurnIndex, regenerate, signal } = options
+    const body: Record<string, unknown> = {
+      message,
+      session_id: sessionId,
+    }
+    if (userTurnIndex !== undefined) {
+      body.user_turn_index = userTurnIndex
+      body.regenerate = regenerate ?? false
+    }
+
     const response = await fetch(`${API_BASE}/api/chat/send/stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ message, session_id: sessionId }),
+      body: JSON.stringify(body),
       signal,
     })
 

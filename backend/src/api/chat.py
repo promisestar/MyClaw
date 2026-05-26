@@ -12,6 +12,10 @@ class ChatRequest(BaseModel):
     """聊天请求"""
     message: str
     session_id: Optional[str] = None
+    # 从第几条用户消息（0 起）替换该轮助手回复；该轮之后的用户/助手对话会保留
+    user_turn_index: Optional[int] = None
+    # True：重新生成该轮回复；False：使用编辑后的 message
+    regenerate: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -41,9 +45,19 @@ async def send_message_sync(request: ChatRequest):
     lock = get_agent_lock()
     if lock:
         async with lock:
-            response = agent.chat(request.message, request.session_id)
+            response = agent.chat(
+                request.message,
+                request.session_id,
+                user_turn_index=request.user_turn_index,
+                regenerate=request.regenerate,
+            )
     else:
-        response = agent.chat(request.message, request.session_id)
+        response = agent.chat(
+            request.message,
+            request.session_id,
+            user_turn_index=request.user_turn_index,
+            regenerate=request.regenerate,
+        )
     return ChatResponse(content=response, session_id=request.session_id)
 
 
@@ -74,7 +88,12 @@ async def send_message_stream(request: ChatRequest):
         lock = get_agent_lock()
         try:
             async def _run_stream():
-                async for event in agent.achat(request.message, request.session_id):
+                async for event in agent.achat(
+                    request.message,
+                    request.session_id,
+                    user_turn_index=request.user_turn_index,
+                    regenerate=request.regenerate,
+                ):
                     event_type = event.type.value
                     event_data = event.data
 

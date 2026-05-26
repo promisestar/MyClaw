@@ -7,9 +7,12 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js"
+    "dev": "tsc && node dist/index.js",
+    "start:feishu": "node dist/feishu_adapter.js",
+    "dev:feishu": "tsc && node dist/feishu_adapter.js"
   },
   "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.44.0",
     "@whiskeysockets/baileys": "7.0.0-rc.9",
     "ws": "^8.17.1",
     "qrcode-terminal": "^0.12.0",

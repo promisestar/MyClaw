@@ -1,9 +1,10 @@
 """HelloClaw Agent - 基于 HelloAgents SimpleAgent 的个性化 AI 助手"""
 
 import os
-from typing import List
+from typing import List, Optional
 
 from hello_agents import Config
+from hello_agents.core.message import Message
 from .enhanced_simple_agent import EnhancedSimpleAgent
 from .enhanced_llm import EnhancedHelloAgentsLLM  # HelloClaw 专用 LLM（支持流式工具调用）
 from ..memory.memory_flush import MemoryFlushManager
@@ -17,7 +18,7 @@ from hello_agents.tools import (
 )
 
 from ..workspace.manager import WorkspaceManager
-from ..tools import MemoryTool, ExecuteCommandTool, WebSearchTool, WebFetchTool, RAGTool, MCPTool
+from ..tools import MemoryTool, BashTool, WebSearchTool, WebFetchTool, RAGTool, MCPTool
 
 
 class HelloClawAgent:
@@ -56,6 +57,9 @@ class HelloClawAgent:
 
         # 确保工作空间存在
         self.workspace.ensure_workspace_exists()
+
+        # 编辑/重新生成时暂存该轮之后的对话，跑完新回复后再拼回
+        self._resend_suffix: List[Message] = []
 
         # 从 IDENTITY.md 读取名称，如果没有则使用默认值
         self.name = name or self._read_identity_name() or "HelloClaw"
@@ -250,7 +254,7 @@ class HelloClawAgent:
 
         # HelloClaw 自定义工具
         registry.register_tool(MemoryTool(self.workspace))
-        registry.register_tool(ExecuteCommandTool(
+        registry.register_tool(BashTool(
             allowed_directories=[self.workspace_path],  # 限制在工作空间目录
             default_workdir=self.workspace_path,  # 与 Read/Write 根目录一致，避免 uvicorn CWD 下找不到脚本
         ))
@@ -310,7 +314,62 @@ class HelloClawAgent:
         else:
             print("ℹ️ 未配置 mcp.servers 且 builtin_demo=false，未注册 MCP 工具")
 
-    def chat(self, message: str, session_id: str = None) -> str:
+    @staticmethod
+    def _split_history_at_user_turn(
+        history: List[Message],
+        user_turn_index: int,
+    ) -> tuple[List[Message], List[Message]]:
+        """将历史拆为 prefix + suffix，中间为该轮用户消息及其旧回复（将被替换）。"""
+        if user_turn_index < 0:
+            raise ValueError("user_turn_index 不能为负数")
+
+        user_count = 0
+        for i, msg in enumerate(history):
+            if msg.role != "user":
+                continue
+            if user_count == user_turn_index:
+                next_user = len(history)
+                for k in range(i + 1, len(history)):
+                    if history[k].role == "user":
+                        next_user = k
+                        break
+                return history[:i], history[next_user:]
+            user_count += 1
+
+        raise ValueError(
+            f"user_turn_index={user_turn_index} 超出会话中的用户消息数量（共 {user_count} 条用户消息）"
+        )
+
+    def _prepare_session_turn_replace(self, session_id: str, user_turn_index: int) -> None:
+        """加载会话：保留该轮之前的上下文与之后的对话，仅替换该轮回复。"""
+        session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+        if not os.path.exists(session_file):
+            self._agent.clear_history()
+            raise ValueError(f"会话 {session_id} 不存在")
+
+        self._agent.load_session(session_file)
+        history = list(self._agent.get_history())
+        prefix, suffix = self._split_history_at_user_turn(history, user_turn_index)
+        self._agent._history = prefix
+        self._resend_suffix = suffix
+
+    def _finalize_turn_replace_if_needed(self) -> None:
+        """将保留的后续对话拼回历史（在保存会话前调用）。"""
+        suffix = getattr(self, "_resend_suffix", None)
+        if not suffix:
+            return
+        history = list(self._agent.get_history())
+        self._agent._history = history + suffix
+        self._resend_suffix = []
+
+    def chat(
+        self,
+        message: str,
+        session_id: str = None,
+        *,
+        user_turn_index: Optional[int] = None,
+        regenerate: bool = False,
+    ) -> str:
         """同步聊天"""
         # 热加载配置（检测 config.json 变化）
         self._reload_llm_if_changed()
@@ -320,11 +379,15 @@ class HelloClawAgent:
 
         # 如果有 session_id，检查是否需要加载或清除历史
         if session_id:
-            session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
-            if os.path.exists(session_file):
-                self._agent.load_session(session_file)
+            if user_turn_index is not None:
+                self._prepare_session_turn_replace(session_id, user_turn_index)
             else:
-                self._agent.clear_history()
+                self._resend_suffix = []
+                session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+                if os.path.exists(session_file):
+                    self._agent.load_session(session_file)
+                else:
+                    self._agent.clear_history()
         else:
             self._agent.clear_history()
 
@@ -336,6 +399,7 @@ class HelloClawAgent:
 
         # 运行 Agent
         response = self._agent.run(message, **llm_kwargs)
+        self._finalize_turn_replace_if_needed()
 
         # 保存会话
         save_id = session_id or self.create_session()
@@ -346,12 +410,21 @@ class HelloClawAgent:
 
         return response
 
-    async def achat(self, message: str, session_id: str = None):
+    async def achat(
+        self,
+        message: str,
+        session_id: str = None,
+        *,
+        user_turn_index: Optional[int] = None,
+        regenerate: bool = False,
+    ):
         """异步聊天（支持流式输出）
 
         Args:
             message: 用户消息
             session_id: 会话 ID，如果为 None 则创建新会话
+            user_turn_index: 要替换回复的用户轮次（0 起）；保留该轮之后的对话
+            regenerate: 是否为重新生成（与编辑共用替换逻辑）
 
         Yields:
             StreamEvent: 流式事件
@@ -376,12 +449,25 @@ class HelloClawAgent:
             # 重置 Memory Flush 状态（新会话）
             self._memory_flush_manager.reset()
         else:
-            session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
-            if os.path.exists(session_file):
-                self._agent.load_session(session_file)
+            if user_turn_index is not None:
+                try:
+                    self._prepare_session_turn_replace(session_id, user_turn_index)
+                except ValueError as exc:
+                    from hello_agents.core.streaming import StreamEvent, StreamEventType
+                    yield StreamEvent.create(
+                        StreamEventType.ERROR,
+                        self._agent.name,
+                        error=str(exc),
+                    )
+                    return
             else:
-                self._agent.clear_history()
-                self._memory_flush_manager.reset()
+                session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+                if os.path.exists(session_file):
+                    self._agent.load_session(session_file)
+                else:
+                    self._agent.clear_history()
+                    self._memory_flush_manager.reset()
+                self._resend_suffix = []
         print(f"[⏱️ {time.time():.3f}] 会话加载完成 (+{time.time()-t0:.3f}s)")
 
         # 保存 session_id 供后续保存使用
@@ -482,6 +568,7 @@ class HelloClawAgent:
 
     def save_current_session(self):
         """保存当前会话"""
+        self._finalize_turn_replace_if_needed()
         if hasattr(self, '_current_session_id') and self._current_session_id:
             try:
                 self._agent.save_session(self._current_session_id)

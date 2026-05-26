@@ -24,7 +24,7 @@ const customTheme = {
       <aside class="sidebar">
         <div class="logo">
           <img :src="LobsterIcon" alt="HelloClaw" class="logo-icon" />
-          <span class="logo-text">HelloClaw</span>
+          <span class="logo-text">MyClaw</span>
         </div>
         <Menu
           mode="inline"

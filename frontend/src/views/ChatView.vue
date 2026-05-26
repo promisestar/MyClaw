@@ -1,7 +1,15 @@
 <script setup lang="ts">
 import { ref, watch, computed, nextTick, onMounted } from 'vue'
-import { Input, Button, message, Tag, Tooltip } from 'ant-design-vue'
-import { SendOutlined, PlusOutlined, StopOutlined, LoadingOutlined, UploadOutlined } from '@ant-design/icons-vue'
+import { Input, Button, message, Tag, Tooltip, Modal } from 'ant-design-vue'
+import {
+  SendOutlined,
+  PlusOutlined,
+  StopOutlined,
+  LoadingOutlined,
+  UploadOutlined,
+  EditOutlined,
+  ReloadOutlined,
+} from '@ant-design/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { sessionApi } from '@/api/session'
 import { chatApi } from '@/api/chat'
@@ -41,6 +49,8 @@ interface Message {
   content: string  // 用于从历史加载的消息
   timestamp: Date
   segments?: MessageSegment[]  // 用于流式消息的分段
+  /** 会话中第几条用户消息（0 起），用于编辑/重新生成 */
+  userTurnIndex?: number
 }
 
 interface MessageGroup {
@@ -59,6 +69,9 @@ const abortController = ref<AbortController | null>(null)
 const initializing = ref(true)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const uploading = ref(false)
+const editModalOpen = ref(false)
+const editDraft = ref('')
+const editingUserTurnIndex = ref<number | null>(null)
 
 /** 上传到服务端工作空间 uploads 目录，并把相对路径插入输入框供助手处理 */
 const UPLOAD_TOOLTIP =
@@ -122,6 +135,15 @@ const messageGroups = computed<MessageGroup[]>(() => {
   }
 
   return groups
+})
+
+const lastAssistantGroupIndex = computed(() => {
+  for (let i = messageGroups.value.length - 1; i >= 0; i--) {
+    if (messageGroups.value[i]?.role === 'assistant') {
+      return i
+    }
+  }
+  return -1
 })
 
 // 是否应该显示加载指示器（底部的独立指示器）
@@ -209,6 +231,7 @@ const loadSessionHistory = async (sessionId: string) => {
     // 第二遍：构建显示消息
     const displayMessages: Message[] = []
     let pendingAssistant: Message | null = null
+    let userTurnCounter = 0
 
     for (let i = 0; i < rawMessages.length; i++) {
       const msg = rawMessages[i]!
@@ -224,8 +247,10 @@ const loadSessionHistory = async (sessionId: string) => {
           id: Date.now() + i,
           role: 'user',
           content: msg.content || '',
-          timestamp: new Date()
+          timestamp: new Date(),
+          userTurnIndex: userTurnCounter,
         })
+        userTurnCounter += 1
       }
       else if (msg.role === 'assistant') {
         if (msg.tool_calls && msg.tool_calls.length > 0) {
@@ -499,35 +524,144 @@ const updateMessageSegments = (msgIndex: number, segments: MessageSegment[]) => 
   }
 }
 
-const sendMessage = async () => {
-  if (!inputMessage.value.trim()) return
+const countUserMessages = () =>
+  messages.value.filter(m => m.role === 'user').length
 
-  const userMessage = inputMessage.value
+const findFirstMessageIndexByUserTurn = (turn: number) =>
+  messages.value.findIndex(m => m.role === 'user' && m.userTurnIndex === turn)
+
+/** 定位该用户轮次：保留此前消息 + 之后其他轮对话，仅替换中间旧回复 */
+const splitMessagesAtUserTurn = (turn: number) => {
+  const userIdx = findFirstMessageIndexByUserTurn(turn)
+  if (userIdx < 0) return null
+
+  let nextUserIdx = messages.value.length
+  for (let i = userIdx + 1; i < messages.value.length; i++) {
+    if (messages.value[i]?.role === 'user') {
+      nextUserIdx = i
+      break
+    }
+  }
+
+  return {
+    userIdx,
+    assistantInsertAt: userIdx + 1,
+    prefix: messages.value.slice(0, userIdx),
+    suffix: messages.value.slice(nextUserIdx),
+  }
+}
+
+const replaceUserTurnInUi = (turn: number, newContent: string) => {
+  const split = splitMessagesAtUserTurn(turn)
+  if (!split) return null
+
   const userMsg: Message = {
     id: Date.now(),
     role: 'user',
-    content: userMessage,
-    timestamp: new Date()
+    content: newContent,
+    timestamp: new Date(),
+    userTurnIndex: turn,
   }
 
-  messages.value.push(userMsg)
-  inputMessage.value = ''
+  messages.value = [...split.prefix, userMsg, ...split.suffix]
+  return split.assistantInsertAt
+}
+
+const getLastUserMessage = (): Message | undefined => {
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const m = messages.value[i]
+    if (m?.role === 'user') return m
+  }
+  return undefined
+}
+
+const openEditUserMessage = (msg: Message) => {
+  if (loading.value || msg.userTurnIndex === undefined) return
+  editingUserTurnIndex.value = msg.userTurnIndex
+  editDraft.value = msg.content
+  editModalOpen.value = true
+}
+
+const submitEditUserMessage = async () => {
+  const text = editDraft.value.trim()
+  if (!text || editingUserTurnIndex.value === null) return
+  editModalOpen.value = false
+  const turn = editingUserTurnIndex.value
+  editingUserTurnIndex.value = null
+  await runChatRequest(text, { userTurnIndex: turn, regenerate: false })
+}
+
+const regenerateLastResponse = async () => {
+  const lastUser = getLastUserMessage()
+  if (!lastUser || lastUser.userTurnIndex === undefined || loading.value) return
+  await runChatRequest(lastUser.content, {
+    userTurnIndex: lastUser.userTurnIndex,
+    regenerate: true,
+  })
+}
+
+interface ChatRequestOptions {
+  userTurnIndex?: number
+  regenerate?: boolean
+  skipInputClear?: boolean
+}
+
+const runChatRequest = async (userMessage: string, options: ChatRequestOptions = {}) => {
+  if (!userMessage.trim() || loading.value) return
+
+  const isResend = options.userTurnIndex !== undefined
+  let assistantInsertAt: number | undefined
+
+  if (isResend) {
+    assistantInsertAt = replaceUserTurnInUi(options.userTurnIndex!, userMessage) ?? undefined
+  } else {
+    const userTurnIndex = countUserMessages()
+    messages.value.push({
+      id: Date.now(),
+      role: 'user',
+      content: userMessage,
+      timestamp: new Date(),
+      userTurnIndex,
+    })
+  }
+
+  if (!options.skipInputClear) {
+    inputMessage.value = ''
+  }
   loading.value = true
 
-  // 创建 AbortController
   abortController.value = new AbortController()
 
-  // 助手消息的索引和段
   let assistantMsgIndex = -1
   let currentSegments: MessageSegment[] = []
   let currentTextSegmentId = -1
+
+  const ensureAssistantMessage = () => {
+    if (assistantMsgIndex !== -1) {
+      updateMessageSegments(assistantMsgIndex, currentSegments)
+      return
+    }
+    const newAssistant: Message = {
+      id: Date.now(),
+      role: 'assistant',
+      content: '',
+      timestamp: new Date(),
+      segments: currentSegments,
+    }
+    if (assistantInsertAt !== undefined) {
+      assistantMsgIndex = assistantInsertAt
+      messages.value.splice(assistantInsertAt, 0, newAssistant)
+    } else {
+      assistantMsgIndex = messages.value.length
+      messages.value.push(newAssistant)
+    }
+  }
 
   await scrollToBottom()
 
   try {
     await chatApi.sendMessageStream(
       userMessage,
-      currentSessionId.value || undefined,
       (event) => {
         if (event.type === 'session') {
           // 收到会话 ID
@@ -544,19 +678,7 @@ const sendMessage = async () => {
             content: ''
           })
 
-          // 如果还没有助手消息，创建一个
-          if (assistantMsgIndex === -1) {
-            assistantMsgIndex = messages.value.length
-            messages.value.push({
-              id: Date.now(),
-              role: 'assistant',
-              content: '',
-              timestamp: new Date(),
-              segments: currentSegments
-            })
-          } else {
-            updateMessageSegments(assistantMsgIndex, currentSegments)
-          }
+          ensureAssistantMessage()
           scrollToBottom()
         } else if (event.type === 'chunk' && event.content) {
           // 更新当前文本段
@@ -576,19 +698,7 @@ const sendMessage = async () => {
             status: 'running'
           })
 
-          // 如果还没有助手消息，创建一个
-          if (assistantMsgIndex === -1) {
-            assistantMsgIndex = messages.value.length
-            messages.value.push({
-              id: Date.now(),
-              role: 'assistant',
-              content: '',
-              timestamp: new Date(),
-              segments: currentSegments
-            })
-          } else {
-            updateMessageSegments(assistantMsgIndex, currentSegments)
-          }
+          ensureAssistantMessage()
           scrollToBottom()
         } else if (event.type === 'tool_finish') {
           // 工具调用结束 - 查找或创建工具段
@@ -627,25 +737,39 @@ const sendMessage = async () => {
           message.error(event.error || '发送消息失败')
         }
       },
-      abortController.value.signal
+      {
+        sessionId: currentSessionId.value,
+        userTurnIndex: options.userTurnIndex,
+        regenerate: options.regenerate,
+        signal: abortController.value.signal,
+      }
     )
 
     await scrollToBottom()
   } catch (error: unknown) {
-    // 如果是用户主动取消，不显示错误
     if (error instanceof Error && error.name === 'AbortError') {
       console.log('用户取消了请求')
-      // 取消时保留已生成的内容
     } else {
       console.error('发送消息失败:', error)
       message.error('发送消息失败')
-      // 移除用户消息
-      messages.value.pop()
+      if (currentSessionId.value) {
+        await loadSessionHistory(currentSessionId.value)
+      } else {
+        const last = messages.value[messages.value.length - 1]
+        if (last?.role === 'user') {
+          messages.value.pop()
+        }
+      }
     }
   } finally {
     loading.value = false
     abortController.value = null
   }
+}
+
+const sendMessage = async () => {
+  if (!inputMessage.value.trim()) return
+  await runChatRequest(inputMessage.value)
 }
 
 const createNewSession = async () => {
@@ -738,11 +862,23 @@ const createNewSession = async () => {
                 </template>
               </template>
               <!-- 如果没有分段，显示普通内容（历史消息） -->
-              <div v-else-if="msg.content" class="message-bubble">
+              <div
+                v-else-if="msg.content"
+                class="message-bubble"
+                :class="{ 'user-editable': group.role === 'user' && !loading }"
+                @click="group.role === 'user' && !loading && openEditUserMessage(msg)"
+              >
                 <div
                   class="message-text"
                   v-html="renderMarkdown(msg.content)"
                 ></div>
+                <div
+                  v-if="group.role === 'user' && !loading"
+                  class="message-edit-hint"
+                  title="点击编辑并重新发送"
+                >
+                  <EditOutlined /> 编辑
+                </div>
               </div>
             </template>
 
@@ -759,6 +895,15 @@ const createNewSession = async () => {
             <div v-if="!isGroupWaiting(group)" class="group-footer">
               <span class="group-name">{{ group.role === 'user' ? '你' : assistantName }}</span>
               <span class="group-time">{{ formatTime(group.messages[group.messages.length - 1]?.timestamp || new Date()) }}</span>
+              <button
+                v-if="group.role === 'assistant' && !loading && groupIndex === lastAssistantGroupIndex"
+                type="button"
+                class="regenerate-btn"
+                title="重新生成回答"
+                @click.stop="regenerateLastResponse"
+              >
+                <ReloadOutlined /> 重新生成
+              </button>
             </div>
           </div>
         </div>
@@ -851,6 +996,22 @@ const createNewSession = async () => {
         </div>
       </div>
     </div>
+
+    <Modal
+      v-model:open="editModalOpen"
+      title="编辑消息"
+      ok-text="发送"
+      cancel-text="取消"
+      :confirm-loading="loading"
+      @ok="submitEditUserMessage"
+      @cancel="() => { editingUserTurnIndex = null }"
+    >
+      <Input.TextArea
+        v-model:value="editDraft"
+        :auto-size="{ minRows: 3, maxRows: 12 }"
+        placeholder="修改后重新发送，将仅替换该条消息对应的助手回复，后续对话会保留"
+      />
+    </Modal>
   </div>
 </template>
 
@@ -941,6 +1102,46 @@ const createNewSession = async () => {
 .message-group.user .message-text {
   background-color: var(--color-primary-light);
   border: 1px solid rgba(255, 92, 92, 0.2);
+}
+
+.message-bubble.user-editable {
+  cursor: pointer;
+}
+
+.message-bubble.user-editable:hover .message-text {
+  border-color: var(--color-primary);
+}
+
+.message-edit-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  padding: 2px 14px 6px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.message-bubble.user-editable:hover .message-edit-hint {
+  opacity: 1;
+}
+
+.regenerate-btn {
+  margin-left: 4px;
+  padding: 0 6px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.regenerate-btn:hover {
+  color: var(--color-primary);
 }
 
 /* Markdown 样式 */
