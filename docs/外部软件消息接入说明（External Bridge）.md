@@ -14,7 +14,7 @@
 
 - 通过 WebSocket 连接到一个外部桥接服务（Bridge）
 - 接收桥接服务推送的入站消息（`type="message"`）
-- 将入站消息映射为对 Agent 的一次对话输入（内部调用 `HelloClawAgent.achat`）
+- 将入站消息映射为对 Agent 的一次对话输入（内部调用 `MyClawAgent.achat`）
 - 获取最终回复后，回写给桥接服务（`type="send"`）
 - 为同一 `chat_id` 固定生成 `session_id`，保证多轮对话上下文连续
 
@@ -36,7 +36,7 @@
 flowchart LR
     ext[外部软件<br/>你的程序/脚本/平台] -->|WebSocket| bridge[Bridge 服务<br/>协议适配/鉴权/多客户端广播]
     bridge -->|type=message| recv[ExternalSoftwareReceiver<br/>后端接收器]
-    recv -->|achat: session_id 固定| agent[HelloClawAgent]
+    recv -->|achat: session_id 固定| agent[MyClawAgent]
     agent -->|最终回复文本| recv
     recv -->|type=send| bridge
     bridge -->|转发/下发| ext
@@ -49,7 +49,7 @@ sequenceDiagram
     participant Ext as 外部软件
     participant Bridge as Bridge(WebSocket)
     participant Recv as ExternalSoftwareReceiver
-    participant Agent as HelloClawAgent
+    participant Agent as MyClawAgent
 
     Ext->>Bridge: 触发/产生消息（平台事件、脚本输入等）
     Bridge-->>Recv: {"type":"message", ...}
@@ -329,7 +329,7 @@ flowchart LR
     Feishu[飞书 IM] -->|WS 长连接事件| Adapter[feishu_adapter]
     Adapter -->|type=message| Bridge[Bridge 中继]
     Bridge -->|type=message| Recv[ExternalSoftwareReceiver]
-    Recv --> Agent[HelloClawAgent]
+    Recv --> Agent[MyClawAgent]
     Agent --> Recv
     Recv -->|type=send| Bridge
     Bridge -->|type=send| Adapter
@@ -392,7 +392,7 @@ npm run start:feishu
 
 ## 并发与稳定性说明（重要）
 
-由于 `HelloClawAgent` 在后端进程内是“全局单例”，内部会维护 `_current_session_id` 等状态。
+由于 `MyClawAgent` 在后端进程内是“全局单例”，内部会维护 `_current_session_id` 等状态。
 
 为避免并发请求导致会话串线，本实现：
 

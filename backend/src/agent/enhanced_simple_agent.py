@@ -15,6 +15,8 @@ from hello_agents.core.config import Config
 from hello_agents.core.message import Message
 from hello_agents.core.streaming import StreamEvent, StreamEventType
 
+from ..context import ContextManager
+
 # 导入 HelloClaw 专用 LLM（支持流式工具调用）
 from .enhanced_llm import EnhancedHelloAgentsLLM, StreamToolEventType
 
@@ -73,6 +75,26 @@ class EnhancedSimpleAgent(SimpleAgent):
         self._supports_streaming_tools = isinstance(llm, EnhancedHelloAgentsLLM)
         self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
         self.auto_cleanup_temp_files = auto_cleanup_temp_files
+
+        # 解耦的上下文管理（替代基类 Agent 内嵌的压缩逻辑）
+        self.context_manager = ContextManager(
+            config=self.config,
+            history_manager=self.history_manager,
+            token_counter=self.token_counter,
+            llm=self.llm,
+        )
+        self.context_manager.recalculate_history_tokens()
+
+    @property
+    def _history(self) -> List[Message]:
+        return self.history_manager.get_history()
+
+    @_history.setter
+    def _history(self, value: List[Message]) -> None:
+        self.history_manager.clear()
+        for msg in value:
+            self.history_manager.append(msg)
+        self.context_manager.recalculate_history_tokens()
 
     def _resolve_workspace_file(self, raw_path: str) -> Optional[Path]:
         """将工具参数中的路径解析为工作空间内绝对路径。"""
@@ -148,17 +170,18 @@ class EnhancedSimpleAgent(SimpleAgent):
         return deleted_count, failed
 
     def _build_messages(self, input_text: str) -> List[Dict[str, Any]]:
-        """构建消息列表（保留 tool_calls/tool_call_id 元数据）。"""
+        """构建消息列表，并在对话开始前执行上下文管理。"""
+        if self.context_manager.maybe_compress_history():
+            print("📦 对话开始前已压缩历史上下文")
+
         messages: List[Dict[str, Any]] = []
 
-        # 系统提示词
         if self.system_prompt:
             messages.append({
                 "role": "system",
                 "content": self.system_prompt
             })
 
-        # 历史消息：必须保留 metadata，避免丢失工具调用链
         for msg in self._history:
             item: Dict[str, Any] = {
                 "role": msg.role,
@@ -167,19 +190,35 @@ class EnhancedSimpleAgent(SimpleAgent):
             metadata = getattr(msg, "metadata", None) or {}
             if msg.role == "assistant" and metadata.get("tool_calls"):
                 item["tool_calls"] = metadata["tool_calls"]
-                # function calling 场景下，assistant 携带 tool_calls 时 content 通常为 None
                 if not msg.content:
                     item["content"] = None
             elif msg.role == "tool" and metadata.get("tool_call_id"):
                 item["tool_call_id"] = metadata["tool_call_id"]
             messages.append(item)
 
-        # 当前用户输入
         messages.append({
             "role": "user",
             "content": input_text
         })
+
+        if self.context_manager.maybe_compress_messages(messages, self.system_prompt):
+            print("📦 对话开始前已压缩本轮消息上下文")
         return messages
+
+    def add_message(self, message: Message):
+        """添加消息到历史，由 ContextManager 负责压缩判断。"""
+        self.history_manager.append(message)
+        self.context_manager.on_message_added(message)
+
+        if self.config.auto_save_enabled and self.session_store:
+            history_len = len(self.history_manager.get_history())
+            if history_len % self.config.auto_save_interval == 0:
+                self._auto_save()
+
+    def clear_history(self):
+        """清空历史并重置上下文 token 计数。"""
+        self.history_manager.clear()
+        self.context_manager.reset()
 
     async def _yield_tool_call_execution(
         self,
@@ -353,13 +392,13 @@ class EnhancedSimpleAgent(SimpleAgent):
         tracked_temp_files: Set[Path] = set()
 
         try:
-            # 构建消息列表，包括系统提示词、历史消息、用户问题
+            # 构建消息列表，并在对话开始前检查/执行上下文压缩
             messages = self._build_messages(input_text)
 
             # 检查是否有工具
             if not self.enable_tool_calling or not self.tool_registry:
-                # 纯对话模式，使用基类的方法
-                async for event in self._stream_without_tools(messages, **kwargs):
+                # 纯对话模式（复用已构建并压缩过的 messages）
+                async for event in self._stream_without_tools(messages, input_text, **kwargs):
                     yield event
                 return
 
@@ -578,6 +617,10 @@ class EnhancedSimpleAgent(SimpleAgent):
                             "content": tool_results_by_id[tool_call_id]
                         })
 
+                self.context_manager.maybe_compress_messages(
+                    messages, self.system_prompt
+                )
+
                 # 发送步骤完成事件
                 yield StreamEvent.create(
                     StreamEventType.STEP_FINISH,
@@ -673,10 +716,16 @@ class EnhancedSimpleAgent(SimpleAgent):
 
     async def _stream_without_tools(
         self,
-        messages: List[Dict],
+        messages: List[Dict[str, Any]],
+        input_text: str,
         **kwargs
     ) -> AsyncGenerator[StreamEvent, None]:
-        """纯对话模式（无工具调用）"""
+        """纯对话模式（无工具调用）
+
+        Args:
+            messages: 已由 _build_messages 构建并完成上下文管理的消息列表
+            input_text: 原始用户输入（用于写入历史，避免压缩后 messages 末条失真）
+        """
         print("📝 纯对话模式（无工具调用）")
 
         full_response = ""
@@ -691,8 +740,8 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         print()
 
-        # 保存历史
-        self.add_message(Message(messages[-1]["content"], "user"))
+        # 保存历史（用原始 input_text，不用 messages 末条，压缩后末条可能不是用户原文）
+        self.add_message(Message(input_text, "user"))
         self.add_message(Message(full_response, "assistant"))
 
         print(f"💬 回复完成")

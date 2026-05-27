@@ -32,7 +32,7 @@ def cli():
 def chat(session_id: Optional[str], workspace: Optional[str]):
     """启动交互式对话（REPL 模式）"""
     from ..channels.cli_channel import CLIChannel
-    from ..agent.helloclaw_agent import HelloClawAgent
+    from ..agent.helloclaw_agent import MyClawAgent
     from ..workspace.manager import WorkspaceManager
 
     # 确定工作空间路径
@@ -44,7 +44,7 @@ def chat(session_id: Optional[str], workspace: Optional[str]):
 
     # 初始化 Agent
     try:
-        agent = HelloClawAgent(workspace_path=workspace_path)
+        agent = MyClawAgent(workspace_path=workspace_path)
     except Exception as e:
         console.print(f"[red]❌ 初始化 Agent 失败: {e}[/red]")
         raise SystemExit(1)
@@ -61,7 +61,7 @@ def chat(session_id: Optional[str], workspace: Optional[str]):
 @click.option("--no-stream", is_flag=True, help="禁用流式输出")
 def ask(question: str, session_id: Optional[str], workspace: Optional[str], no_stream: bool):
     """单次提问，输出结果后退出"""
-    from ..agent.helloclaw_agent import HelloClawAgent
+    from ..agent.helloclaw_agent import MyClawAgent
     from ..workspace.manager import WorkspaceManager
 
     # 确定工作空间路径
@@ -73,7 +73,7 @@ def ask(question: str, session_id: Optional[str], workspace: Optional[str], no_s
 
     # 初始化 Agent
     try:
-        agent = HelloClawAgent(workspace_path=workspace_path)
+        agent = MyClawAgent(workspace_path=workspace_path)
     except Exception as e:
         console.print(f"[red]❌ 初始化 Agent 失败: {e}[/red]")
         raise SystemExit(1)

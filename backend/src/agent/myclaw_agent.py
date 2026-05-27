@@ -21,7 +21,7 @@ from ..workspace.manager import WorkspaceManager
 from ..tools import MemoryTool, BashTool, WebSearchTool, WebFetchTool, RAGTool, MCPTool
 
 
-class HelloClawAgent:
+class MyClawAgent:
     """HelloClaw Agent - 个性化 AI 助手
 
     基于 HelloAgents SimpleAgent，增加了：
@@ -352,6 +352,29 @@ class HelloClawAgent:
         prefix, suffix = self._split_history_at_user_turn(history, user_turn_index)
         self._agent._history = prefix
         self._resend_suffix = suffix
+        self._current_session_id = session_id
+        if hasattr(self._agent, "context_manager"):
+            self._agent.context_manager.recalculate_history_tokens()
+
+    def activate_session(self, session_id: str) -> None:
+        """将 Agent 内存切换到指定会话（打开历史会话 / 开始对话前调用）。
+
+        从会话文件加载历史并设置 ``_current_session_id``，使内存状态与前端当前会话一致。
+        """
+        # 当内存中的session_id与传入的session_id一致时，直接返回
+        if getattr(self, "_current_session_id", None) == session_id:
+            return
+        session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+        self._resend_suffix = []
+        if os.path.exists(session_file):
+            self._agent.load_session(session_file)
+        else:
+            self._agent.clear_history()
+            if hasattr(self, "_memory_flush_manager"):
+                self._memory_flush_manager.reset()
+        self._current_session_id = session_id
+        if hasattr(self._agent, "context_manager"):
+            self._agent.context_manager.recalculate_history_tokens()
 
     def _finalize_turn_replace_if_needed(self) -> None:
         """将保留的后续对话拼回历史（在保存会话前调用）。"""
@@ -377,19 +400,14 @@ class HelloClawAgent:
         # 动态更新系统提示词（检查 BOOTSTRAP 状态、读取最新配置）
         self._agent.system_prompt = self._build_system_prompt()
 
-        # 如果有 session_id，检查是否需要加载或清除历史
         if session_id:
             if user_turn_index is not None:
                 self._prepare_session_turn_replace(session_id, user_turn_index)
             else:
-                self._resend_suffix = []
-                session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
-                if os.path.exists(session_file):
-                    self._agent.load_session(session_file)
-                else:
-                    self._agent.clear_history()
+                self.activate_session(session_id)
         else:
             self._agent.clear_history()
+            self._current_session_id = None
 
         # LLM 调用参数（防止重复循环）
         llm_kwargs = {
@@ -442,36 +460,23 @@ class HelloClawAgent:
         self._agent.system_prompt = self._build_system_prompt()
         print(f"[⏱️ {time.time():.3f}] 系统提示词构建完成 (+{time.time()-t0:.3f}s)")
 
-        # 如果没有 session_id，创建新的
         if not session_id:
             session_id = str(uuid.uuid4())[:8]
-            self._agent.clear_history()
-            # 重置 Memory Flush 状态（新会话）
-            self._memory_flush_manager.reset()
-        else:
-            if user_turn_index is not None:
-                try:
-                    self._prepare_session_turn_replace(session_id, user_turn_index)
-                except ValueError as exc:
-                    from hello_agents.core.streaming import StreamEvent, StreamEventType
-                    yield StreamEvent.create(
-                        StreamEventType.ERROR,
-                        self._agent.name,
-                        error=str(exc),
-                    )
-                    return
-            else:
-                session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
-                if os.path.exists(session_file):
-                    self._agent.load_session(session_file)
-                else:
-                    self._agent.clear_history()
-                    self._memory_flush_manager.reset()
-                self._resend_suffix = []
-        print(f"[⏱️ {time.time():.3f}] 会话加载完成 (+{time.time()-t0:.3f}s)")
 
-        # 保存 session_id 供后续保存使用
-        self._current_session_id = session_id
+        if user_turn_index is not None:
+            try:
+                self._prepare_session_turn_replace(session_id, user_turn_index)
+            except ValueError as exc:
+                from hello_agents.core.streaming import StreamEvent, StreamEventType
+                yield StreamEvent.create(
+                    StreamEventType.ERROR,
+                    self._agent.name,
+                    error=str(exc),
+                )
+                return
+        else:
+            self.activate_session(session_id)
+        print(f"[⏱️ {time.time():.3f}] 会话加载完成 (+{time.time()-t0:.3f}s)")
 
         # LLM 调用参数（防止重复循环）
         llm_kwargs = {
@@ -543,28 +548,118 @@ class HelloClawAgent:
                 print(f"⚠️ Memory Flush 失败: {e}")
 
     def _estimate_tokens(self) -> int:
-        """估算当前上下文的 token 数
+        """估算当前上下文的 token 数（优先使用 ContextManager 的精确计数）。"""
+        agent = self._agent
+        if hasattr(agent, "context_manager"):
+            total = agent.context_manager.history_token_count
+            if agent.system_prompt:
+                total += len(agent.system_prompt) // 3
+            return total
 
-        使用简单的字符估算方法。
-        对于中文，大约 1.5 字符/token；对于英文，大约 4 字符/token。
-        这里使用保守估算：字符数 / 3。
-
-        Returns:
-            估算的 token 数
-        """
         total_chars = 0
-
-        # 系统提示词
-        if self._agent.system_prompt:
-            total_chars += len(self._agent.system_prompt)
-
-        # 历史消息
-        for msg in self._agent._history:
+        if agent.system_prompt:
+            total_chars += len(agent.system_prompt)
+        for msg in agent._history:
             if msg.content:
                 total_chars += len(msg.content)
-
-        # 保守估算：字符数 / 3
         return total_chars // 3
+
+    def _count_system_prompt_tokens(self) -> int:
+        """系统提示词 token 数。"""
+        prompt = self._agent.system_prompt or ""
+        if not prompt:
+            return 0
+        if hasattr(self._agent, "token_counter"):
+            return self._agent.token_counter.count_text(prompt)
+        return len(prompt) // 3
+
+    def _count_messages_tokens(self, messages: List[Message]) -> int:
+        """消息列表 token 数（含 tool_calls 元数据粗略估算）。"""
+        if hasattr(self._agent, "token_counter"):
+            total = self._agent.token_counter.count_messages(messages)
+            for msg in messages:
+                metadata = getattr(msg, "metadata", None) or {}
+                tool_calls = metadata.get("tool_calls")
+                if tool_calls:
+                    total += len(str(tool_calls)) // 3
+            return total
+
+        total_chars = 0
+        for msg in messages:
+            if msg.content:
+                total_chars += len(msg.content)
+            metadata = getattr(msg, "metadata", None) or {}
+            if metadata.get("tool_calls"):
+                total_chars += len(str(metadata["tool_calls"]))
+        return total_chars // 3
+
+    def _estimate_session_file_tokens(self, session_id: str) -> int:
+        """从会话文件估算历史 token（未加载到内存时使用）。"""
+        import json
+        from hello_agents.core.message import Message
+
+        filepath = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+        if not os.path.exists(filepath):
+            return 0
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return 0
+
+        messages: List[Message] = []
+        for msg_data in data.get("history", []):
+            try:
+                messages.append(Message.from_dict(msg_data))
+            except Exception:
+                role = msg_data.get("role", "user")
+                content = msg_data.get("content", "") or ""
+                messages.append(Message(content, role))
+
+        return self._count_messages_tokens(messages)
+
+    def get_context_usage(self, session_id: Optional[str] = None) -> dict:
+        """返回上下文窗口使用情况。
+
+        若 session_id 与当前内存会话一致，使用内存中的 token 计数；否则读会话文件估算。
+        """
+        context_window = self.config.context_window
+        system_tokens = self._count_system_prompt_tokens()
+
+        in_memory_session = (
+            session_id is not None
+            and getattr(self, "_current_session_id", None) == session_id
+        )
+        if in_memory_session:
+            history_tokens = (
+                self._agent.context_manager.history_token_count
+                if hasattr(self._agent, "context_manager")
+                else self._count_messages_tokens(self._agent.get_history())
+            )
+        elif session_id:
+            history_tokens = self._estimate_session_file_tokens(session_id)
+        else:
+            history_tokens = (
+                self._agent.context_manager.history_token_count
+                if hasattr(self._agent, "context_manager")
+                else self._count_messages_tokens(self._agent.get_history())
+            )
+
+        used_tokens = system_tokens + history_tokens
+        if context_window > 0:
+            used_percent = min(100.0, (used_tokens / context_window) * 100.0)
+        else:
+            used_percent = 0.0
+
+        return {
+            "session_id": session_id,
+            "context_window": context_window,
+            "used_tokens": used_tokens,
+            "system_tokens": system_tokens,
+            "history_tokens": history_tokens,
+            "used_percent": round(used_percent, 2),
+        }
 
     def save_current_session(self):
         """保存当前会话"""

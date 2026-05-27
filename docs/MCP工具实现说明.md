@@ -175,7 +175,7 @@ sequenceDiagram
 ## 6. 当前实现可继续增强的点（建议）
 
 1. **接入层注册可见性**
-   - 目前 `backend/src/tools/__init__.py` 未导出 `MCPTool`，`HelloClawAgent._setup_tools()` 也未注册 MCP。
+   - 目前 `backend/src/tools/__init__.py` 未导出 `MCPTool`，`MyClawAgent._setup_tools()` 也未注册 MCP。
    - 若要正式启用，建议补齐导出与注册路径。
 
 2. **返回结构标准化**

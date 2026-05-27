@@ -1,5 +1,5 @@
 """HelloClaw Agent 模块"""
 
-from .helloclaw_agent import HelloClawAgent
+from .myclaw_agent import MyClawAgent
 
-__all__ = ["HelloClawAgent"]
+__all__ = ["MyClawAgent"]

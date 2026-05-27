@@ -72,7 +72,7 @@ async def send_message_stream(request: ChatRequest):
     - tool_start: 工具调用开始
     - tool_finish: 工具调用结束
     - step_finish: 步骤结束
-    - done: 完成
+    - done: 完成（含 context_usage 上下文用量）
     - error: 错误
     """
 
@@ -154,15 +154,17 @@ async def send_message_stream(request: ChatRequest):
                         }
 
                     elif event_type == "agent_finish":
-                        # Agent 完成，保存会话
+                        # Agent 完成，保存会话并推送上下文用量
                         session_id = agent.save_current_session()
                         final_content = event_data.get("result", "")
+                        context_usage = agent.get_context_usage(session_id)
 
                         yield {
                             "event": "done",
                             "data": json.dumps({
                                 "content": final_content,
-                                "session_id": session_id
+                                "session_id": session_id,
+                                "context_usage": context_usage,
                             }, ensure_ascii=False)
                         }
 

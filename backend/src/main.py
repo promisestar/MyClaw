@@ -14,18 +14,18 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .api import chat, session, config, memory, upload
 from .workspace.manager import WorkspaceManager
-from .agent.helloclaw_agent import HelloClawAgent
+from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
 
 # 加载环境变量
 load_dotenv()
 
 # 全局 Agent 实例
-_agent: HelloClawAgent = None
+_agent: MyClawAgent = None
 _agent_lock: asyncio.Lock | None = None
 
 
-def get_agent() -> HelloClawAgent:
+def get_agent() -> MyClawAgent:
     """获取全局 Agent 实例"""
     global _agent
     return _agent
@@ -56,8 +56,8 @@ async def lifespan(app: FastAPI):
     memory.set_workspace(workspace)
 
     # 初始化全局 Agent 实例
-    _agent = HelloClawAgent(workspace_path=workspace_path)
-    print("HelloClawAgent initialized")
+    _agent = MyClawAgent(workspace_path=workspace_path)
+    print("MyClawAgent initialized")
 
     # 防并发：所有对同一进程内 agent 的调用共享同一把锁
     _agent_lock = asyncio.Lock()

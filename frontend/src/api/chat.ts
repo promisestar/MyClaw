@@ -1,4 +1,5 @@
 import api from './index'
+import type { ContextUsage } from './session'
 
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
@@ -22,6 +23,8 @@ export interface StreamEvent {
   session_id?: string | null
   step?: number
   max_steps?: number
+  /** 对话完成后由服务端推送的上下文窗口用量 */
+  context_usage?: ContextUsage
 }
 
 export type StreamCallback = (event: StreamEvent) => void
@@ -133,7 +136,12 @@ export const chatApi = {
                   onChunk({ type: 'step_finish', step: parsed.step })
                 } else if (currentEvent === 'done') {
                   finalSessionId = parsed.session_id
-                  onChunk({ type: 'done', content: parsed.content, session_id: parsed.session_id })
+                  onChunk({
+                    type: 'done',
+                    content: parsed.content,
+                    session_id: parsed.session_id,
+                    context_usage: parsed.context_usage,
+                  })
                 } else if (currentEvent === 'error') {
                   onChunk({ type: 'error', error: parsed.error })
                 }

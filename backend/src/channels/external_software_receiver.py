@@ -5,7 +5,7 @@
 - 通过 websocket 连接到桥接服务
 - 监听来自桥接服务的消息事件（type="message"）
 - 解析 sender/chat_id/content/media
-- 调用 HelloClawAgent.achat 生成回复，并将回复回写到桥接服务（type="send"）
+- 调用 MyClawAgent.achat 生成回复，并将回复回写到桥接服务（type="send"）
 
 桥接服务：ws://127.0.0.1:3001（默认）
 配置：

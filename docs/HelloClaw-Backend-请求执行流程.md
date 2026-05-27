@@ -22,9 +22,9 @@ flowchart TB
         B3 -->|其他 /api/*| C3[会话 / 配置 / 记忆等]
     end
 
-    A4 --> D[全局 _agent: HelloClawAgent]
-    C1 --> E[HelloClawAgent.chat]
-    C2 --> F[HelloClawAgent.achat]
+    A4 --> D[全局 _agent: MyClawAgent]
+    C1 --> E[MyClawAgent.chat]
+    C2 --> F[MyClawAgent.achat]
     E --> G[EnhancedSimpleAgent.run]
     F --> H[EnhancedSimpleAgent.arun_stream_with_tools]
     G --> I[HelloAgents 非流式推理]
@@ -47,7 +47,7 @@ flowchart LR
     subgraph life["lifespan 上下文 - 启动"]
         L1[读取 WORKSPACE_PATH，默认 ~/.helloclaw/workspace] --> L2[WorkspaceManager.ensure_workspace_exists]
         L2 --> L3[config.set_workspace / memory.set_workspace]
-        L3 --> L4[HelloClawAgent 构造]
+        L3 --> L4[MyClawAgent 构造]
     end
 ```
 
@@ -61,10 +61,10 @@ flowchart LR
 | `CORSMiddleware` | `main.py` | 允许前端源（默认 `http://localhost:5173`，可由 `CORS_ORIGINS` 逗号分隔配置）跨域访问 API。 |
 | 注册路由 | `main.py` | 聊天相关主要在 `api/chat.py`（前缀 `/chat`，整体挂载在 `/api` 下 → 实际路径如 `/api/chat/send/stream`）。 |
 | 工作空间初始化 | `lifespan` | `WorkspaceManager` 确保目录、模板配置文件等就绪；后续配置类 API 与记忆 API 依赖同一 workspace 实例。 |
-| `config.set_workspace` / `memory.set_workspace` | `lifespan` | 把全局 workspace 注入配置与记忆模块，与聊天用的 `HelloClawAgent` 共用同一磁盘根路径。 |
-| `HelloClawAgent(...)` | `lifespan` | 构造**进程内单例**的全局 Agent（赋值给模块级 `_agent`），`get_agent()` 始终返回该实例。 |
+| `config.set_workspace` / `memory.set_workspace` | `lifespan` | 把全局 workspace 注入配置与记忆模块，与聊天用的 `MyClawAgent` 共用同一磁盘根路径。 |
+| `MyClawAgent(...)` | `lifespan` | 构造**进程内单例**的全局 Agent（赋值给模块级 `_agent`），`get_agent()` 始终返回该实例。 |
 
-### `HelloClawAgent.__init__` 内部（启动时一次性完成）
+### `MyClawAgent.__init__` 内部（启动时一次性完成）
 
 ```mermaid
 flowchart TB
@@ -92,7 +92,7 @@ flowchart TB
 1. 前端（如 Vite 开发服务器）向 `http://localhost:8000/api/chat/...` 发请求。
 2. **Uvicorn** 将请求交给 **Starlette/FastAPI** 路由层。
 3. **CORSMiddleware** 处理预检与实际响应头。
-4. 匹配到 `chat` 路由的处理函数，通过 `get_agent()` 取得全局 `HelloClawAgent`。
+4. 匹配到 `chat` 路由的处理函数，通过 `get_agent()` 取得全局 `MyClawAgent`。
 
 以下分**同步**与**流式（主路径）**两条链路说明。
 
@@ -104,7 +104,7 @@ flowchart TB
 sequenceDiagram
     participant FE as 前端
     participant API as chat.send_message_sync
-    participant HA as HelloClawAgent
+    participant HA as MyClawAgent
     participant SA as EnhancedSimpleAgent
 
     FE->>API: JSON message, session_id?
@@ -157,7 +157,7 @@ flowchart TB
 | `agent_finish` | `done` | 最终正文 + `session_id`，并触发磁盘保存 |
 | `error` | `error` | 错误信息 |
 
-### 5.2 `HelloClawAgent.achat` 流程
+### 5.2 `MyClawAgent.achat` 流程
 
 ```mermaid
 flowchart TB
@@ -225,7 +225,7 @@ flowchart TB
 sequenceDiagram
     participant FE as 前端
     participant SSE as EventSourceResponse
-    participant HC as HelloClawAgent
+    participant HC as MyClawAgent
     participant ESA as EnhancedSimpleAgent
     participant LLM as EnhancedHelloAgentsLLM
     participant API_LLM as 上游 Chat API
@@ -259,9 +259,9 @@ sequenceDiagram
 
 | 阶段 | 关键组件 | 要点 |
 |------|----------|------|
-| 启动 | `lifespan`、`HelloClawAgent` | 单例 Agent、工作空间、工具与 LLM 一次性就绪。 |
+| 启动 | `lifespan`、`MyClawAgent` | 单例 Agent、工作空间、工具与 LLM 一次性就绪。 |
 | 请求入口 | `CORSMiddleware`、`api/chat` | 同步 `/send/sync`，流式 `/send/stream`（SSE）。 |
-| 业务编排 | `HelloClawAgent` | 配置热更新、系统提示动态拼接、会话加载/新建、记忆捕获与 Flush。 |
+| 业务编排 | `MyClawAgent` | 配置热更新、系统提示动态拼接、会话加载/新建、记忆捕获与 Flush。 |
 | 推理与工具 | `EnhancedSimpleAgent` + `EnhancedHelloAgentsLLM` | 流式输出 + 流式解析工具调用，多轮消息直至无工具或达上限。 |
 | 持久化 | `WorkspaceManager` / `sessions/*.json` | 会话历史；记忆文件由工具与 Memory 模块维护。 |
 

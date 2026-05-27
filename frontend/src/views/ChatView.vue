@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, computed, nextTick, onMounted } from 'vue'
-import { Input, Button, message, Tag, Tooltip, Modal } from 'ant-design-vue'
+import { Input, Button, message, Tag, Tooltip, Modal, Progress } from 'ant-design-vue'
 import {
   SendOutlined,
   PlusOutlined,
@@ -11,7 +11,7 @@ import {
   ReloadOutlined,
 } from '@ant-design/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
-import { sessionApi } from '@/api/session'
+import { sessionApi, type ContextUsage } from '@/api/session'
 import { chatApi } from '@/api/chat'
 import { configApi } from '@/api/config'
 import { uploadApi } from '@/api/upload'
@@ -72,6 +72,54 @@ const uploading = ref(false)
 const editModalOpen = ref(false)
 const editDraft = ref('')
 const editingUserTurnIndex = ref<number | null>(null)
+
+const defaultContextUsage = (): ContextUsage => ({
+  session_id: null,
+  context_window: 128000,
+  used_tokens: 0,
+  system_tokens: 0,
+  history_tokens: 0,
+  used_percent: 0,
+})
+
+const contextUsage = ref<ContextUsage>(defaultContextUsage())
+
+const contextUsagePercent = computed(() =>
+  Math.min(100, Math.max(0, contextUsage.value.used_percent))
+)
+
+const contextUsageTooltip = computed(() => {
+  const u = contextUsage.value
+  const pct = u.used_percent.toFixed(2)
+  return `${pct}% context used (${u.used_tokens.toLocaleString()} / ${u.context_window.toLocaleString()} tokens)`
+})
+
+const contextStrokeColor = computed(() => {
+  const p = contextUsagePercent.value
+  if (p >= 90) return '#ff4d4f'
+  if (p >= 70) return '#faad14'
+  return '#52c41a'
+})
+
+/** 从服务端拉取上下文用量（仅用于进入会话/切换会话时初始化，对话中由 SSE done 推送更新） */
+const refreshContextUsage = async () => {
+  const sid = currentSessionId.value
+  if (!sid) {
+    contextUsage.value = defaultContextUsage()
+    return
+  }
+  try {
+    contextUsage.value = await sessionApi.getContextUsage(sid)
+  } catch {
+    // 忽略失败，避免打断页面
+  }
+}
+
+const applyContextUsage = (usage: ContextUsage | undefined) => {
+  if (usage) {
+    contextUsage.value = usage
+  }
+}
 
 /** 上传到服务端工作空间 uploads 目录，并把相对路径插入输入框供助手处理 */
 const UPLOAD_TOOLTIP =
@@ -322,9 +370,11 @@ const loadSessionHistory = async (sessionId: string) => {
 
     messages.value = displayMessages
     await scrollToBottom()
+    await refreshContextUsage()
   } catch (error) {
     // 会话不存在或加载失败，清空消息
     messages.value = []
+    await refreshContextUsage()
   }
 }
 
@@ -426,6 +476,11 @@ watch(
 // 组件挂载时初始化会话
 onMounted(async () => {
   await initSession()
+  await refreshContextUsage()
+})
+
+watch(currentSessionId, () => {
+  void refreshContextUsage()
 })
 
 // 滚动到底部
@@ -725,6 +780,7 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
           if (event.session_id) {
             currentSessionId.value = event.session_id
           }
+          applyContextUsage(event.context_usage)
           // 对话结束后重新获取助手名字（可能在对话中更新了 IDENTITY.md）
           configApi.getAgentInfo().then(agentInfo => {
             if (agentInfo.name) {
@@ -776,7 +832,9 @@ const createNewSession = async () => {
   try {
     const res = await sessionApi.create()
     saveCurrentSession(res.session_id)
+    contextUsage.value = defaultContextUsage()
     router.push({ name: 'chat', query: { session: res.session_id } })
+    await refreshContextUsage()
   } catch (error) {
     message.error('新建会话失败')
   }
@@ -965,6 +1023,18 @@ const createNewSession = async () => {
         />
         <!-- 按钮区域（固定宽度） -->
         <div class="input-actions">
+          <Tooltip :title="contextUsageTooltip">
+            <div class="context-usage-ring" aria-label="上下文使用情况">
+              <Progress
+                type="circle"
+                :percent="contextUsagePercent"
+                :size="34"
+                :stroke-width="10"
+                :show-info="false"
+                :stroke-color="contextStrokeColor"
+              />
+            </div>
+          </Tooltip>
           <!-- 新建会话按钮 -->
           <Button
             class="icon-btn"
@@ -1345,9 +1415,25 @@ const createNewSession = async () => {
 .input-actions {
   flex-shrink: 0;
   display: flex;
-  gap: 12px;
+  gap: 8px;
   align-items: center;
-  width: 92px;
+  width: auto;
+  min-width: 92px;
+}
+
+.context-usage-ring {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  flex-shrink: 0;
+}
+
+.context-usage-ring :deep(.ant-progress-inner) {
+  width: 34px !important;
+  height: 34px !important;
 }
 
 /* 新建会话按钮 */

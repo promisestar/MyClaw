@@ -30,6 +30,15 @@ export interface SessionHistory {
   messages: ChatMessage[]
 }
 
+export interface ContextUsage {
+  session_id: string | null
+  context_window: number
+  used_tokens: number
+  system_tokens: number
+  history_tokens: number
+  used_percent: number
+}
+
 export const sessionApi = {
   list: async () => {
     return api.get<{ sessions: Session[] }>('/session/list')
@@ -45,5 +54,8 @@ export const sessionApi = {
   },
   getHistory: async (id: string) => {
     return api.get<SessionHistory>(`/session/${id}/history`)
+  },
+  getContextUsage: async (id: string) => {
+    return api.get<ContextUsage>(`/session/${id}/context-usage`)
   },
 }

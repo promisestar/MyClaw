@@ -143,7 +143,7 @@ flowchart TB
     end
     Py <-->|JSON: auth / message / send / status| B
     Ext <-->|JSON: auth / message / send / status| B
-    Py -->|achat + save_current_session| Agent[HelloClawAgent]
+    Py -->|achat + save_current_session| Agent[MyClawAgent]
 ```
 
 ### 7.2 连接与鉴权生命周期
@@ -167,7 +167,7 @@ sequenceDiagram
     participant E as 外部软件
     participant B as Bridge
     participant P as ExternalSoftwareReceiver
-    participant A as HelloClawAgent
+    participant A as MyClawAgent
 
     Note over E,B: 双方均已连接且可选鉴权已完成
     E->>B: {"type":"message",...}

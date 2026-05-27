@@ -19,7 +19,7 @@ from rich.live import Live
 from rich.text import Text
 
 if TYPE_CHECKING:
-    from ..agent.helloclaw_agent import HelloClawAgent
+    from ..agent.helloclaw_agent import MyClawAgent
 
 
 class CLIChannel:
@@ -44,7 +44,7 @@ class CLIChannel:
 
     def __init__(
         self,
-        agent: "HelloClawAgent",
+        agent: "MyClawAgent",
         session_id: Optional[str] = None,
     ):
         """初始化 CLI Channel

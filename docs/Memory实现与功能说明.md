@@ -114,7 +114,7 @@ flowchart TD
 
 ### 5.1 `MemoryCaptureManager`（`capture.py`）
 
-在 **每轮用户消息处理结束后**（`HelloClawAgent.achat` 流程末尾），对用户消息异步执行 `acapture_and_store`：
+在 **每轮用户消息处理结束后**（`MyClawAgent.achat` 流程末尾），对用户消息异步执行 `acapture_and_store`：
 
 - 按 **句子** 切分，用 `MEMORY_TRIGGERS` 正则匹配是否值得记（偏好、决策、实体、事实等）。
 - 命中后规范化文本，**去重**（同轮次 + `check_duplicate_memory`）。
@@ -123,7 +123,7 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant User as 用户消息
-    participant Agent as HelloClawAgent
+    participant Agent as MyClawAgent
     participant Cap as MemoryCaptureManager
     participant WS as WorkspaceManager
 
@@ -135,7 +135,7 @@ sequenceDiagram
 
 ### 5.2 `MemoryFlushManager`（`memory_flush.py`）
 
-在 **上下文接近压缩阈值** 时（`HelloClawAgent` 用字符数/3 估算 token，与 `should_trigger_flush` 比较），触发 **一次静默回合**：向底层 Agent 注入英文 prompt，要求使用 `memory_add` / `memory_update_longterm` 保存重要信息；若模型只回复 `[SILENT]` 则视为无需保存。**每会话仅触发一次**（`_flush_triggered`），新会话加载时 `reset()`。
+在 **上下文接近压缩阈值** 时（`MyClawAgent` 用字符数/3 估算 token，与 `should_trigger_flush` 比较），触发 **一次静默回合**：向底层 Agent 注入英文 prompt，要求使用 `memory_add` / `memory_update_longterm` 保存重要信息；若模型只回复 `[SILENT]` 则视为无需保存。**每会话仅触发一次**（`_flush_triggered`），新会话加载时 `reset()`。
 
 ```mermaid
 flowchart TD
@@ -189,7 +189,7 @@ flowchart LR
         R1["知识库文档"]
         R2["向量检索 + rag 工具"]
     end
-    User["用户任务"] --> Agent["HelloClawAgent"]
+    User["用户任务"] --> Agent["MyClawAgent"]
     Agent --> M2
     Agent --> R2
     M2 --> M1
@@ -217,7 +217,7 @@ flowchart LR
 ## 9. 配置与运维提示
 
 - **工作空间路径**：由 `WORKSPACE_PATH` 决定，记忆文件均在对应工作空间下。
-- **Memory Flush 参数**：与 `HelloClawAgent` 使用的 `context_window`、`compression_threshold` 一致，可在 Agent 配置中体现（见 `MemoryFlushManager` 构造函数传参）。
+- **Memory Flush 参数**：与 `MyClawAgent` 使用的 `context_window`、`compression_threshold` 一致，可在 Agent 配置中体现（见 `MemoryFlushManager` 构造函数传参）。
 - **自动捕获的局限**：基于规则与正则，可能漏检或误检；重要信息仍建议用户确认或让 Agent 显式调用 `memory_add`。
 
 ---

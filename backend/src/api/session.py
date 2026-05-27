@@ -75,10 +75,26 @@ class SessionHistoryResponse(BaseModel):
     messages: List[ChatMessage]
 
 
+class ContextUsageResponse(BaseModel):
+    """上下文窗口使用情况"""
+    session_id: Optional[str] = None
+    context_window: int
+    used_tokens: int
+    system_tokens: int
+    history_tokens: int
+    used_percent: float
+
+
 def get_agent():
     """获取全局 Agent 实例"""
     from ..main import get_agent as _get_agent
     return _get_agent()
+
+
+def get_agent_lock():
+    """获取全局 Agent 锁（与 chat 路由共用，避免并发切换会话）"""
+    from ..main import get_agent_lock as _get_agent_lock
+    return _get_agent_lock()
 
 
 @router.get("/list", response_model=SessionListResponse)
@@ -133,8 +149,14 @@ async def create_session(request: SessionCreateRequest = None):
         if old_session_id:
             summary_file = await _summarize_session(agent, old_session_id)
 
-    # 创建新会话
+    # 创建新会话并激活到 Agent 内存
     session_id = agent.create_session()
+    lock = get_agent_lock()
+    if lock:
+        async with lock:
+            agent.activate_session(session_id)
+    else:
+        agent.activate_session(session_id)
 
     return SessionCreateResponse(
         session_id=session_id,
@@ -205,6 +227,24 @@ async def get_session(session_id: str):
     raise HTTPException(status_code=404, detail="Session not found")
 
 
+@router.get("/{session_id}/context-usage", response_model=ContextUsageResponse)
+async def get_session_context_usage(session_id: str):
+    """获取指定会话的上下文窗口使用情况（token 估算）。"""
+    agent = get_agent()
+    if not agent:
+        raise HTTPException(status_code=500, detail="Agent not initialized")
+
+    lock = get_agent_lock()
+    if lock:
+        async with lock:
+            agent.activate_session(session_id)
+            usage = agent.get_context_usage(session_id)
+    else:
+        agent.activate_session(session_id)
+        usage = agent.get_context_usage(session_id)
+    return ContextUsageResponse(**usage)
+
+
 @router.get("/{session_id}/history", response_model=SessionHistoryResponse)
 async def get_session_history(session_id: str):
     """获取会话历史消息
@@ -215,7 +255,14 @@ async def get_session_history(session_id: str):
     if not agent:
         raise HTTPException(status_code=500, detail="Agent not initialized")
 
-    raw_messages = agent.get_session_history(session_id)
+    lock = get_agent_lock()
+    if lock:
+        async with lock:
+            agent.activate_session(session_id)
+            raw_messages = agent.get_session_history(session_id)
+    else:
+        agent.activate_session(session_id)
+        raw_messages = agent.get_session_history(session_id)
     if raw_messages is None:
         raw_messages = []
 
