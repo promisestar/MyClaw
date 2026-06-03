@@ -1,208 +1,405 @@
 # MCP 工具实现说明（MyClaw）
 
 本文基于以下代码实现梳理：
-- `backend/src/tools/builtin/mcp_tool.py`
-- `backend/src/tools/builtin/mcp_wrapper_tool.py`
-- `backend/src/mcp/client.py`
-- `backend/src/mcp/server.py`
-- `backend/src/mcp/utils.py`
-- `backend/src/mcp/__init__.py`
+
+- `backend/src/tools/builtin/mcp_tool.py` — MCP 网关与渐进披露
+- `backend/src/tools/builtin/mcp_wrapper_tool.py` — 远端子工具包装
+- `backend/src/mcp/client.py` — 多传输 MCP 客户端
+- `backend/src/agent/myclaw_agent.py` — 注册与会话级清理
+- `backend/src/agent/enhanced_simple_agent.py` — 每轮重建 tool schema
+- `backend/src/workspace/templates/config.json` — 配置模板
+- `backend/src/workspace/templates/AGENTS.md` — Agent 使用约定
 
 ---
 
 ## 1. MCP 是什么，Agent 为什么需要 MCP
 
 ### 1.1 MCP 的作用
+
 MCP（Model Context Protocol）是让 Agent 以统一协议连接外部能力的接口层。  
-它把“外部工具、资源、提示词模板”都抽象成标准操作（如 `list_tools`、`call_tool`、`list_resources`、`get_prompt`），从而让 Agent 不必为每个外部系统单独写一套适配逻辑。
+它把「外部工具、资源、提示词模板」抽象成标准操作（如 `list_tools`、`call_tool`、`list_resources`、`get_prompt`），从而让 Agent 不必为每个外部系统单独写适配逻辑。
 
 ### 1.2 Agent 需要 MCP 的原因
+
 - **统一接入**：同一套调用模型，可接文件系统、GitHub、Slack、数据库等服务器。
-- **上下文增强**：不仅能调用函数，还能拿到资源与 prompt 模板，增强推理上下文。
-- **解耦扩展**：新增能力更多是“挂新 MCP Server”，不是改 Agent 核心逻辑。
-- **跨运行形态**：支持本地进程（stdio）、内存（测试）、HTTP/SSE（远程服务）。
+- **上下文增强**：不仅能调用函数，还能读取资源与 prompt 模板。
+- **解耦扩展**：新增能力多为「挂新 MCP Server」，而非改 Agent 核心。
+- **跨运行形态**：支持本地进程（stdio）、内存（测试）、HTTP/SSE（远程托管服务）。
+
+### 1.3 MyClaw 中的特殊问题：工具数量膨胀
+
+单个 GitHub MCP 服务器即可暴露二十余个 API 工具。若启动时**全部展开**并注入 LLM 的 function calling schema，会导致：
+
+- Token 占用陡增；
+- 工具选型准确率下降（与 Read / rag / web 等内置工具争抢注意力）；
+- 与 AGENTS.md「按需使用 MCP」的约定不一致。
+
+因此 MyClaw 默认采用 **渐进式披露（Progressive Disclosure）**，而非启动时全量展开。
 
 ---
 
-## 2. 当前代码如何实现 MCP
+## 2. 组件分层
 
-## 2.1 组件分层
-
-- **协议层封装**：`backend/src/mcp/`
-  - `client.py`：增强 MCP 客户端，处理多传输方式与结果标准化。
-  - `server.py`：基于 `fastmcp` 的服务器封装（工具/资源/prompt 注册）。
-  - `utils.py`：上下文与响应结构辅助函数。
-  - `__init__.py`：按依赖可用性进行导出和降级提示。
-- **工具层封装**：`backend/src/tools/builtin/`
-  - `mcp_tool.py`：Agent 可直接调用的 MCP 总入口（list/call/read/prompt）。
-  - `mcp_wrapper_tool.py`：把 MCP 远端工具“展开”为本地独立 Tool。
+| 层级 | 路径 | 职责 |
+|------|------|------|
+| 协议层 | `backend/src/mcp/` | `MCPClient` 多传输连接；`list_tools` 结果归一化 |
+| 工具层 | `mcp_tool.py` | MCP **网关**；discover、描述生成、`enable_tools`、转发 `call_tool` |
+| 包装层 | `mcp_wrapper_tool.py` | 单个远端工具 → 本地 `Tool`（含 JSON Schema → 参数列表） |
+| Agent 层 | `myclaw_agent.py` | 读 `~/.helloclaw/config.json` 注册 MCP；切换 session 时清理已披露子工具 |
+| Agent 层 | `enhanced_simple_agent.py` | **每轮工具迭代**重建 `_build_tool_schemas()`，使披露后的子工具对 LLM 可见 |
 
 ---
 
-## 2.2 核心流程图（可在 Obsidian 渲染）
+## 3. 两种运行模式
+
+配置项 `auto_expand`（`~/.helloclaw/config.json` → `mcp.servers[]`）控制行为：
+
+| 模式 | `auto_expand` | 启动时 ToolRegistry | 典型日志 |
+|------|---------------|---------------------|----------|
+| **渐进披露（默认）** | `false` | 仅 1 个网关（如 `github`） | `✅ 工具 'github' 已注册。` |
+| **全量展开（兼容旧行为）** | `true` | 网关 + 全部 `mcp_github_*` 子工具 | `✅ 工具 'github' 已展开为 N 个独立工具` |
+
+> **注意**：运行时读取的是 `~/.helloclaw/config.json`，不是项目内模板。若全局配置仍为 `"auto_expand": true`，仍会全量展开。
+
+### 3.1 渐进披露总览
 
 ```mermaid
-flowchart TD
-    A["Agent 触发工具调用"] --> B["MCPTool run"]
-    B --> C{"action"}
-    C -->|list_tools| D["MCPClient list_tools"]
-    C -->|call_tool| E["MCPClient call_tool"]
-    C -->|resources| F["MCPClient list_or_read_resource"]
-    C -->|prompts| G["MCPClient list_or_get_prompt"]
-    D --> H["返回字符串结果"]
-    E --> H
-    F --> H
-    G --> H
+flowchart TB
+    subgraph startup [Agent 启动]
+        Discover["_discover_tools()"]
+        Catalog["生成网关 Skill 式目录描述"]
+        Register["仅注册 MCPTool 网关"]
+    end
+
+    subgraph runtime [对话运行时]
+        LLM1["LLM 见 Tier-0：核心工具 + github 网关"]
+        Enable["enable_tools(tool_names)"]
+        Wrap["MCPWrappedTool 注册进 ToolRegistry"]
+        Rebuild["每轮重建 tool_schemas"]
+        LLM2["LLM 见 mcp_github_* 完整 schema"]
+        Call["子工具调用 → call_tool 转发"]
+    end
+
+    Discover --> Catalog --> Register
+    Register --> LLM1
+    LLM1 --> Enable --> Wrap --> Rebuild --> LLM2 --> Call
 ```
 
----
+### 3.2 与 Skill 的类比
 
-## 2.3 传输层选择流程（`MCPClient`）
+| 维度 | Skill | MCP 渐进披露 |
+|------|-------|----------------|
+| 常驻暴露 | 1 个 `Skill` 工具 | 1 个 MCP 网关（如 `github`） |
+| 目录来源 | `SkillLoader` 聚合描述 | 启动时 `list_tools`，写入网关 `description` |
+| 按需加载 | `run({ skill: "pdf" })` | `run({ action: "enable_tools", tool_names: [...] })` |
+| 加载结果 | 手册文本注入 tool_result | **可调用子工具**注册进 ToolRegistry |
+| 参数准确性 | 手册指导行为 | 子工具自带 MCP `input_schema` |
 
-`MCPClient._prepare_server_source()` 根据输入自动选择传输方式：
-
-```mermaid
-flowchart LR
-    A["server_source 输入"] --> B{"类型判断"}
-    B -->|FastMCP| C["memory 传输"]
-    B -->|dict 配置| D["按配置构造 stdio 或 http 或 sse"]
-    B -->|http url| E["HTTP 或 SSE 传输"]
-    B -->|python script| F["PythonStdioTransport"]
-    B -->|command list| G["StdioTransport 或 PythonStdioTransport"]
-    B -->|other| H["交由 fastmcp 自动推断"]
-```
+**一句话**：Skill 决定「该怎么做」；MCP 提供「能连哪里、能调什么 API」。
 
 ---
 
-## 2.4 MCPTool 的运行机制（关键点）
+## 4. 推荐调用协议（两阶段）
 
-1. **初始化**
-   - 支持三种服务来源：
-     - 内置 Demo Server（未传 `server_command` / `server`）
-     - 外部命令启动（`server_command`）
-     - 直接传 `FastMCP` 实例（内存传输）
-   - 自动发现远端工具（`_discover_tools`），用于描述生成与 auto-expand。
-
-2. **环境变量注入策略**
-   - 优先级：`env` > `env_keys` > 自动检测（`MCP_SERVER_ENV_MAP`）。
-   - 能自动识别常见服务器（如 GitHub/Slack）所需 token。
-
-3. **调用执行**
-   - `run()` 内根据 `action` 路由到异步客户端操作。
-   - 若当前线程已有事件循环，使用 `ThreadPoolExecutor + 新 event loop` 避免冲突。
-   - 输出对用户友好的文本结果，而非原始协议对象。
-
-4. **auto_expand 机制**
-   - `get_expanded_tools()` 使用 `MCPWrappedTool` 将远端每个工具转为独立 Tool。
-   - 包装器会把 JSON Schema 输入自动映射为 `ToolParameter` 列表。
-
----
-
-## 2.5 MCPWrappedTool 展开机制图
+Agent 侧约定（见 `AGENTS.md` §5.5）：
 
 ```mermaid
 sequenceDiagram
+    participant A as Agent / LLM
+    participant G as MCP 网关 github
     participant R as ToolRegistry
-    participant M as MCPTool
-    participant W as MCPWrappedTool
-    participant C as MCPClient
+    participant S as MCP Server
 
-    R->>M: get_expanded_tools()
-    M->>M: 遍历 _available_tools
-    M->>W: 创建包装工具(prefix + name)
-    Note over W: 解析 input_schema -> ToolParameter
+    Note over G,S: 启动：discover，仅注册网关
+    A->>G: action=enable_tools, tool_names=[远端名来自网关目录]
+    G->>G: 校验远端工具存在于 _available_tools
+    G->>R: register MCPWrappedTool → mcp_github_{远端名}
+    G-->>A: 披露成功 + schema 摘要（tool_result）
+    Note over A,R: 下一轮 EnhancedSimpleAgent 重建 schemas
+    A->>R: 调用 mcp_github_*（参数来自 input_schema）
+    R->>G: MCPWrappedTool.run → call_tool
+    G->>S: MCPClient.call_tool
+    S-->>A: API 结果
+```
 
-    W->>M: run(params)
-    M->>C: call_tool(tool_name, params)
-    C-->>M: ToolResult
-    M-->>W: 文本结果
-    W-->>R: 返回给 Agent
+### 4.1 网关 action 一览
+
+| action | 用途 | 必填参数 |
+|--------|------|----------|
+| **enable_tools** | 推荐 — 按需披露子工具 | `tool_names` |
+| **enable_and_call** | 披露并立即调用（同轮兜底） | `tool_name`, `arguments` |
+| list_tools | 刷新/调试远端清单 | — |
+| call_tool | 不经披露的直连（参数易错） | `tool_name`, `arguments` |
+| list_resources / read_resource | 资源 | `uri`（read 时） |
+| list_prompts / get_prompt | 提示词模板 | `prompt_name`（get 时） |
+
+披露后的子工具命名：`mcp_{网关名}_{远端工具名}`（远端名必须与 discover 目录一致，托管与 npm 命名可能不同）。
+
+---
+
+## 5. 工具描述如何生成
+
+数据流：
+
+```mermaid
+flowchart LR
+    Server[MCP Server 定义 name / description / inputSchema]
+    Client[MCPClient.list_tools 归一化]
+    Cache[MCPTool._available_tools]
+    GW[网关 description]
+    Wrap[子工具 description + schema]
+
+    Server --> Client --> Cache
+    Cache --> GW
+    Cache --> Wrap
+```
+
+### 5.1 远端元数据来源
+
+`MCPClient.list_tools()` 将 fastmcp 返回归一化为：
+
+```python
+{
+    "name": tool.name,
+    "description": tool.description or "",
+    "input_schema": tool.inputSchema  # JSON Schema
+}
+```
+
+**描述与 schema 的权威来源是 MCP 服务器**，MyClaw 不做业务语义改写。
+
+### 5.2 网关描述（`_generate_description`）
+
+- **渐进模式**：拼接 Skill 式长描述 — 远端工具目录（每工具取 description **首句**）+ 使用说明 + 本会话已披露列表。
+- **全量展开模式**：简短说明「包含 N 个工具、启动时已展开」。
+- **discover 失败**：兜底文案，提示 `list_tools` / `enable_tools`。
+
+### 5.3 子工具描述（`MCPWrappedTool`）
+
+- **description**：MCP 返回的**完整** `description`（不截断）。
+- **参数**：见下节。
+
+---
+
+## 6. 参数 schema 如何确定
+
+### 6.1 网关 schema — 代码固定
+
+`MCPTool.get_parameters()` 手写 `action`、`tool_names`、`tool_name`、`arguments` 等，与远端 API 无关。LLM 通过网关调用时，**看不到** GitHub 各 API 的字段级 schema。
+
+### 6.2 披露子工具 schema — 来自 MCP `input_schema`
+
+`MCPWrappedTool._parse_input_schema()` 将 JSON Schema 映射为 `ToolParameter`：
+
+| JSON Schema | ToolParameter |
+|-------------|---------------|
+| `properties` 的 key | 参数名 |
+| property.`type` | 类型（默认 `string`） |
+| property.`description` | 参数说明 |
+| `required` 数组 | 是否必填 |
+
+**已知局限**：仅处理一层 `properties`；嵌套 object、oneOf、$ref 等复杂 schema 未完整支持。
+
+### 6.3 发给 LLM 的最终 schema
+
+`EnhancedSimpleAgent._build_tool_schemas()` 将 `ToolParameter` 转为 OpenAI function calling 格式。**每轮工具迭代都会重新构建**，否则 `enable_tools` 后 LLM 看不到新注册的 `mcp_*` 工具。
+
+---
+
+## 7. MCPTool 初始化与连接
+
+### 7.1 服务来源（三选一）
+
+1. **内置 Demo Server** — 未配置 `server_command` / `server_url` / `server`
+2. **本地 stdio** — `server_command: ["npx", "-y", "..."]`
+3. **远程 HTTP/SSE** — `server_url` + 可选 `transport_type`、`headers`
+
+GitHub **推荐**托管地址（工具更全）：
+
+```json
+{
+  "name": "github",
+  "server_url": "https://api.githubcopilot.com/mcp/",
+  "transport_type": "http",
+  "env_keys": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+  "auto_expand": false
+}
+```
+
+若仍使用已弃用的 `@modelcontextprotocol/server-github`（npm，约 26 个工具），启动时会打印迁移提示。
+
+### 7.2 GitHub：托管 MCP vs 本地 npm（为何 Cursor 工具更多）
+
+| 对比项 | `server_url` 托管（推荐） | `server_command` + 弃用 npm 包 |
+|--------|---------------------------|--------------------------------|
+| 地址 / 命令 | `https://api.githubcopilot.com/mcp/` | `npx -y @modelcontextprotocol/server-github` |
+| 传输 | HTTP（`StreamableHttpTransport`） | stdio（`NpxStdioTransport` / `StdioTransport`） |
+| 工具数量（实测量级） | 约 **46**（含 Copilot 专属 toolset） | 约 **26** |
+| 与 Cursor 对齐 | 是 | 否（旧版 API 面） |
+| 鉴权 | `Authorization: Bearer <PAT>`（可由 `env_keys` 自动注入） | 子进程环境变量 `GITHUB_PERSONAL_ACCESS_TOKEN` |
+| 维护状态 | GitHub 官方托管、持续更新 | npm 包已弃用，迁移至 `github/github-mcp-server` |
+
+**重要**：两套服务器的**远端工具名不一定相同**（例如旧包常见 `search_repositories`，托管版可能为 `search_repositories` 或其它命名）。`enable_tools` 必须使用网关 `description` 目录中的**精确远端名**，不能凭记忆或 Cursor 文档里的别名。
+
+### 7.3 环境变量与鉴权
+
+优先级：`env` > `env_keys` > `MCP_SERVER_ENV_MAP` 自动检测。
+
+远程 GitHub：可从 `GITHUB_PERSONAL_ACCESS_TOKEN` 自动注入 `Authorization: Bearer ...` 请求头。
+
+### 7.4 异步与事件循环
+
+`_discover_tools()` 与 `run()` 内 MCP 操作：若当前线程已有 asyncio 事件循环（如 uvicorn/FastAPI），则在**新线程 + 新 event loop** 中执行，避免 `asyncio.run()` 与运行中 loop 冲突。
+
+若网关 `list_tools` / `enable_tools` 报错 `asyncio.run() cannot be called from a running event loop`，说明 MCP 调用未正确落入线程隔离路径，需检查 Agent 是否在异步上下文中同步调用了 `Tool.run()`（属 Harness 集成问题，与 MCP 配置无关）。
+
+### 7.5 `MCPClient` 实现要点（相对初版）
+
+- **HTTP**：`server_url` + `headers` / `auth`（Bearer PAT），对应 `StreamableHttpTransport`。
+- **npx**：`["npx","-y","@scope/pkg"]` 解析为 `NpxStdioTransport`，Windows 上自动解析 `npx.cmd`。
+- **list_tools / list_resources / list_prompts**：兼容 fastmcp 3.x 直接返回 `list` 与旧版带 `.tools` 字段的两种结果；`list_tools` 分页由 fastmcp 自动拉全。
+- **日志**：传输层使用 `logging`，避免 Windows GBK 控制台因 emoji `print` 崩溃。
+
+---
+
+## 8. 传输层选择（`MCPClient`）
+
+```mermaid
+flowchart LR
+    A[server_source 输入] --> B{类型判断}
+    B -->|FastMCP 实例| C[memory 传输]
+    B -->|dict 配置| D[stdio / http / sse]
+    B -->|http(s) URL| E[StreamableHttpTransport 或 SSETransport]
+    B -->|.py 脚本| F[PythonStdioTransport]
+    B -->|npx -y pkg| G[NpxStdioTransport]
+    B -->|其它 command| H[StdioTransport]
 ```
 
 ---
 
-## 3. MCP 与 Skill 的区别
+## 9. MCPWrappedTool 与 call_tool 转发
 
-| 维度 | MCP | Skill |
-|---|---|---|
-| 本质 | 协议化“能力连接器” | 领域知识/流程说明加载器 |
-| 主要解决 | 如何连外部系统并执行动作 | 如何让 Agent 遵循某领域最佳实践 |
-| 典型产出 | 工具调用结果、资源内容、prompt 模板 | `SKILL.md` 指南文本与资源提示 |
-| 时效性 | 面向实时/动态系统（API、服务） | 面向静态/半静态方法论 |
-| 风险点 | 网络、鉴权、远程副作用、协议兼容 | 指令过时、流程漂移 |
-| 组合方式 | “做事” | “指导如何做事” |
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant W as MCPWrappedTool
+    participant M as MCPTool 网关
+    participant C as MCPClient
 
-一句话：**Skill 决定“该怎么做”，MCP 提供“能去哪里做、做什么”。**
+    A->>W: run({ owner, repo, ... })
+    W->>M: run({ action: call_tool, tool_name, arguments })
+    M->>C: call_tool
+    C-->>M: ToolResult 文本
+    M-->>W: ToolResponse
+    W-->>A: 返回 Agent
+```
 
----
-
-## 4. MCP 的常见问题与本实现中的表现
-
-### 4.1 常见问题
-- **鉴权复杂**：不同服务器有不同 token/key 约定。
-- **传输兼容性**：stdio/http/sse 行为和错误模型不同。
-- **事件循环冲突**：在异步框架内嵌套调用容易报错。
-- **结果格式异构**：不同 server 返回对象结构不一致。
-- **安全边界**：连接外部工具意味着更大副作用面。
-
-### 4.2 在本实现中的处理
-- 通过 `MCP_SERVER_ENV_MAP + env/env_keys` 缓解鉴权配置负担。
-- `MCPClient` 统一多传输入口，隐藏底层差异。
-- `MCPTool.run()` 采用“有循环则新线程+新loop”的兼容策略。
-- `client.py` 对 `ToolResult`/`Resource`/`Prompt` 做了二次解析，统一成更易消费的数据。
+全量展开模式下，启动时即创建全部 `MCPWrappedTool` 并注册，无需 `enable_tools`。
 
 ---
 
-## 5. 这份 MCP 实现的亮点
+## 10. 会话级披露生命周期
 
-1. **多传输自动推断很实用**  
-   一个 `MCPClient` 同时覆盖 memory / stdio / http / sse，工程可迁移性高。
-
-2. **事件循环冲突处理成熟**  
-   在已有 loop 的场景下切线程跑新 loop，避免“cannot run event loop”类问题。
-
-3. **自动工具发现 + 自动展开**  
-   先发现远端能力，再按 JSON Schema 转本地 Tool 参数，Agent 体验接近原生工具。
-
-4. **环境变量三层优先级**  
-   同时兼顾“快速起步”（自动检测）和“生产可控”（显式 env 覆盖）。
-
-5. **内置演示服务器降低接入门槛**  
-   无外部依赖时也可验证 MCP 全链路行为，便于开发调试与教学。
+| 事件 | 行为 |
+|------|------|
+| `enable_tools` 成功 | 子工具注册进 ToolRegistry，同 session 内保持可用 |
+| 切换 session / `clear_all_history` | `reset_all_mcp_disclosed_tools()` 注销已披露子工具 |
+| `shutdown` | 同上，再清空注册表 |
+| 披露上限 | 环境变量 `MCP_MAX_DISCLOSED_TOOLS`（默认 20） |
 
 ---
 
-## 6. 当前实现可继续增强的点（建议）
+## 11. 配置参考
 
-1. **接入层注册可见性**
-   - 目前 `backend/src/tools/__init__.py` 未导出 `MCPTool`，`MyClawAgent._setup_tools()` 也未注册 MCP。
-   - 若要正式启用，建议补齐导出与注册路径。
+文件：`~/.helloclaw/config.json`（模板见 `backend/src/workspace/templates/config.json`）
 
-2. **返回结构标准化**
-   - 现 `MCPTool.run()` 主要返回拼接文本；建议增加结构化 `ToolResponse`（含 code/data），便于前端与自动化处理。
+```json
+{
+  "mcp": {
+    "enabled": true,
+    "builtin_demo": true,
+    "servers": [
+      {
+        "name": "github",
+        "server_url": "https://api.githubcopilot.com/mcp/",
+        "transport_type": "http",
+        "env_keys": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        "auto_expand": false
+      }
+    ]
+  }
+}
+```
 
-3. **超时/重试/熔断**
-   - 远程 MCP 场景建议加入统一超时与重试策略，提升稳定性。
-
-4. **安全白名单**
-   - 建议增加允许连接的 MCP server 白名单（命令、域名、URI scheme）。
-
-5. **观测性**
-   - 增加 per-action 日志字段（transport、latency、server_name、error_code）。
+| 字段 | 说明 |
+|------|------|
+| `enabled` | 是否注册 MCP |
+| `builtin_demo` | `servers` 为空时是否注册内置演示 MCP |
+| `name` | 网关在 ToolRegistry 中的名称 |
+| `server_url` / `server_command` | 二选一 |
+| `transport_type` | 远程：`http`（默认）或 `sse` |
+| `env_keys` / `env` / `headers` | 鉴权 |
+| `auto_expand` | `false` = 渐进披露（推荐）；`true` = 全量展开 |
 
 ---
 
-## 7. 建议的使用姿势（实践）
+## 12. 常见问题
 
-- 对“领域方法”先用 Skill（例如 `pdf`），对“外部系统动作”用 MCP。
-- 先 `list_tools` 探索能力，再 `call_tool`，避免盲调。
-- 生产环境尽量显式传 `env_keys` 或 `env`，避免隐式自动检测导致的不确定性。
-- 对远程服务优先配置超时和重试，避免阻塞主对话链路。
+### 12.1 启动仍显示「已展开为 26 个」
+
+检查 `~/.helloclaw/config.json` 中对应 server 的 `auto_expand` 是否为 `true`。
+
+### 12.2 enable_tools 后 LLM 仍调不到子工具
+
+确认 `EnhancedSimpleAgent` 在**每轮**工具迭代重建 schema；披露发生在迭代 N，调用应在迭代 N+1（或使用 `enable_and_call`）。
+
+### 12.3 工具返回 JSON 极大，session 文件很长
+
+终端 `print` 的 200 字符预览**不**写入 session；`tool` 角色消息存**完整**结果。大体积 MCP 响应（如 `search_repositories`）会原样进入历史，需单独做输出截断策略（与选型侧渐进披露正交）。
+
+### 12.4 鉴权失败
+
+确认 `GITHUB_PERSONAL_ACCESS_TOKEN` 已设置且对托管 MCP 具备足够 scope。托管端点返回 401 时，`_discover_tools()` 会得到空目录，表现为 `enable_tools` 报「远端工具不存在」。
+
+### 12.5 `enable_tools` 报「远端工具不存在」且可用示例为空
+
+常见原因（按优先级排查）：
+
+1. **discover 失败**：未配置 `server_url`、PAT 无效、网络无法访问 `api.githubcopilot.com`。
+2. **工具名写错**：未从网关 `description` 目录复制远端名（托管与 npm 命名可能不同）。
+3. **仍用弃用 npm 包**：仅 26 个工具且名称集与文档/Cursor 示例不一致。
+4. **配置未生效**：修改的是项目模板而非 `~/.helloclaw/config.json`。
+
+处理：先对网关执行 `action=list_tools` 刷新；成功后再 `enable_tools` 目录中出现的名称。
+
+### 12.6 工具数量与 Cursor 不一致
+
+Cursor 默认连 `https://api.githubcopilot.com/mcp/`；MyClaw 若仍配 `server_command` + `@modelcontextprotocol/server-github`，只会 discover 约 26 个。改为 `server_url` 托管配置即可对齐量级。
 
 ---
 
-## 8. 一句话总结
+## 13. 实现亮点与后续增强
 
-这套实现已经具备了 MCP 在工程落地的关键骨架：**多传输、自动发现、工具展开、异步兼容、环境变量注入**。  
-如果补上“统一注册入口 + 结构化响应 + 安全/观测增强”，可以很快从“可用”走向“可运营”。
+### 已实现
 
+1. **渐进披露** — 控制 LLM 可见工具规模，对齐 Skill 心智。
+2. **多传输** — memory / stdio / http / sse 统一入口。
+3. **事件循环兼容** — 线程隔离 asyncio，适配 uvicorn。
+4. **结构化 ToolResponse** — 统一成功/错误协议。
+5. **GitHub 托管 MCP** — `server_url` 优先于弃用 npm 包；自动 Bearer 鉴权。
+6. **会话级清理** — 避免披露工具跨 session 泄漏。
+7. **传输实现加固** — NpxStdioTransport、Windows 命令解析、fastmcp 3 列表归一化。
+
+### 可继续增强
+
+1. **工具结果截断** — 写入 history / LLM context 前按工具类型限长。
+2. **复杂 JSON Schema** — 支持 nested / oneOf 或生成简化 schema。
+3. **超时 / 重试 / 熔断** — 远程 MCP 稳定性。
+4. **连接池** — 减少每次 `call_tool` 新建 stdio 进程的开销（stdio 场景）。
+5. **观测性** — per-action 延迟、transport、error_code 指标。
+
+---
+
+## 14. 一句话总结
+
+MyClaw 的 MCP 实现以 **网关 + 渐进披露** 为核心：启动时 discover 并生成目录，默认只暴露网关；Agent 通过 `enable_tools` 按需注册带完整 schema 的子工具，并在每轮迭代重建 function calling 列表。全量 `auto_expand` 保留作兼容；GitHub 等远程场景优先 `server_url` 托管 MCP。

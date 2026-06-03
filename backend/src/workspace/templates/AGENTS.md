@@ -19,7 +19,7 @@
 | 写入今日见闻 | **memory_add** | 直接改 MEMORY.md（长期用 **memory_update_longterm**） |
 | 用户已入库文档（PDF 等） | **rag**（`ask` / `search`） | 仅凭记忆或 `Read` 工作区外的库 |
 | 领域标准流程（PDF、专项规范） | **Skill**（先加载再动手） | 凭常识猜步骤 |
-| 外部系统（GitHub、Slack 等） | **mcp**（先 `list_tools`） | 编造 API |
+| 外部系统（GitHub、Slack 等） | **MCP 网关**（如 `github`）→ `enable_tools` 披露 → `mcp_*` 子工具 | 编造 API 或直接 `call_tool` 猜参数 |
 | 查公开网络信息（新闻、文档入口） | **web_search** | `web_fetch` |
 | 抓取已知 URL 全文 | **web_fetch** | `web_search` |
 
@@ -54,7 +54,7 @@
 2. **memory_search** — 用户问题涉及过往偏好、人名、项目名时
 3. **rag** — 问题依赖「用户上传/入库的资料」时（`ask` 或 `search`）
 4. **Skill** — 任务匹配某领域技能（如 PDF）时，**在写代码或改文件之前**加载
-5. **mcp** `list_tools` — 需要外部集成且不确定工具名时
+5. **MCP 网关**（如 `github`）— 读网关描述选远端工具 → `enable_tools` 披露 → 调用 `mcp_{网关}_*` 子工具
 
 ---
 
@@ -103,16 +103,26 @@
 - 参数：`skill`（必填，如 `pdf`），`args`（可选，替换 `$ARGUMENTS`）
 - **Skill** = 系统预置操作手册；**rag** = 用户已入库文档；可同时使用
 
-### 5.5 MCP（mcp / mcp_*）
+### 5.5 MCP（渐进披露，类似 Skill）
+
+MCP 采用 **两阶段** 模式（与 Skill 的「先加载再执行」类似，但披露的是可调用子工具）：
+
+1. **选工具**：阅读 MCP 网关（如 `github`）描述中的远端工具目录
+2. **披露**：`{"action":"enable_tools","tool_names":["远端工具名",...]}`
+3. **调用**：下一轮直接使用披露后的名称（如 `mcp_github_search_repositories`）并传入完整参数
 
 | action | 用途 |
 |--------|------|
-| list_tools | 首次或不确定名称时 **必须先执行** |
-| call_tool | 调用远端工具 |
+| **enable_tools** | **推荐** — 按需披露远端工具到 Agent（必填 `tool_names`） |
+| enable_and_call | 披露并立即调用（单次任务兜底，需 `tool_name` + `arguments`） |
+| list_tools | 刷新远端工具清单（调试/兜底） |
+| call_tool | 不经披露的直连调用（参数易错，尽量避免） |
 | list_resources / read_resource | 资源列表与读取 |
 | list_prompts / get_prompt | 提示词模板 |
 
-外部集成、内置工具不够时再用 MCP；勿编造参数。
+**命名**：网关名为 `github` 时，披露后子工具名为 `mcp_github_{远端工具名}`。
+
+**注意**：同一会话内已披露工具保持可用；切换会话后需重新披露。外部集成、内置工具不够时再用 MCP；勿编造参数。
 
 ### 5.6 网络
 

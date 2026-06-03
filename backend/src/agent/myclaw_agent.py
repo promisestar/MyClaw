@@ -19,6 +19,7 @@ from hello_agents.tools import (
 
 from ..workspace.manager import WorkspaceManager
 from ..tools import MemoryTool, BashTool, WebSearchTool, WebFetchTool, RAGTool, MCPTool
+from ..tools.builtin.mcp_tool import reset_all_mcp_disclosed_tools
 
 
 class MyClawAgent:
@@ -267,6 +268,11 @@ class MyClawAgent:
 
         return registry
 
+    def _reset_mcp_disclosed_tools(self) -> None:
+        """切换会话或关闭时清理 MCP 动态披露的子工具。"""
+        if hasattr(self, "tool_registry") and self.tool_registry:
+            reset_all_mcp_disclosed_tools(self.tool_registry)
+
     def _register_mcp_tools(self, registry: ToolRegistry) -> None:
         """按 ~/.helloclaw/config.json 的 `mcp` 段注册 MCP 工具。
 
@@ -286,21 +292,31 @@ class MyClawAgent:
                     print("⚠️ MCP servers 项格式无效（应为对象），已跳过")
                     continue
                 name = (item.get("name") or "mcp").strip() or "mcp"
+                url = (item.get("server_url") or "").strip()
                 cmd = item.get("server_command")
-                if not cmd or not isinstance(cmd, list) or not all(
-                    isinstance(x, str) for x in cmd
-                ):
-                    print(f"⚠️ MCP「{name}」缺少有效 server_command（字符串列表），已跳过")
+                has_cmd = (
+                    cmd
+                    and isinstance(cmd, list)
+                    and all(isinstance(x, str) for x in cmd)
+                )
+                if not url and not has_cmd:
+                    print(
+                        f"⚠️ MCP「{name}」需配置 server_url 或 server_command，已跳过"
+                    )
                     continue
                 try:
                     registry.register_tool(
                         MCPTool(
                             name=name,
-                            server_command=cmd,
+                            server_url=url or None,
+                            server_command=cmd if has_cmd else None,
                             server_args=item.get("server_args") or [],
+                            transport_type=item.get("transport_type"),
+                            headers=item.get("headers"),
                             env=item.get("env"),
                             env_keys=item.get("env_keys"),
-                            auto_expand=item.get("auto_expand", True),
+                            auto_expand=item.get("auto_expand", False),
+                            tool_registry=registry,
                         )
                     )
                     print(f"✅ MCP 工具已注册: {name}")
@@ -309,7 +325,7 @@ class MyClawAgent:
             return
 
         if cfg.get("builtin_demo", True):
-            registry.register_tool(MCPTool())
+            registry.register_tool(MCPTool(tool_registry=registry))
             print("✅ MCP 工具已注册（内置演示服务器）")
         else:
             print("ℹ️ 未配置 mcp.servers 且 builtin_demo=false，未注册 MCP 工具")
@@ -364,6 +380,7 @@ class MyClawAgent:
         # 当内存中的session_id与传入的session_id一致时，直接返回
         if getattr(self, "_current_session_id", None) == session_id:
             return
+        self._reset_mcp_disclosed_tools()
         session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
         self._resend_suffix = []
         if os.path.exists(session_file):
@@ -752,6 +769,7 @@ class MyClawAgent:
         """
         self._agent.clear_history()
         self._current_session_id = None
+        self._reset_mcp_disclosed_tools()
 
         # 重置 MemoryFlushManager 状态
         if hasattr(self, '_memory_flush_manager'):
@@ -762,6 +780,7 @@ class MyClawAgent:
 
     def shutdown(self):
         """关闭 Agent 持有的外部连接与可释放资源。"""
+        self._reset_mcp_disclosed_tools()
         # 1) 尝试让各工具自行释放资源（如 RAG/Qdrant、HTTP client 等）
         try:
             if hasattr(self, "tool_registry") and self.tool_registry:

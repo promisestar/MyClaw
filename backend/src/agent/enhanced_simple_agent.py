@@ -362,6 +362,190 @@ class EnhancedSimpleAgent(SimpleAgent):
         })
         tool_results_by_id[tool_call_id] = exec_result
 
+    def run(self, input_text: str, **kwargs) -> str:
+        """同步运行；每轮工具迭代重建 tool_schemas（支持 MCP 渐进披露）。"""
+        from datetime import datetime as dt
+        from hello_agents.observability import TraceLogger
+
+        session_start_time = dt.now()
+        trace_logger = None
+        if self.config.trace_enabled:
+            trace_logger = TraceLogger(
+                output_dir=self.config.trace_dir,
+                sanitize=self.config.trace_sanitize,
+                html_include_raw_response=self.config.trace_html_include_raw_response,
+            )
+            trace_logger.log_event(
+                "session_start",
+                {"agent_name": self.name, "agent_type": self.__class__.__name__},
+            )
+
+        messages = self._build_messages(input_text)
+
+        if trace_logger:
+            trace_logger.log_event("message_written", {"role": "user", "content": input_text})
+
+        if not self.enable_tool_calling or not self.tool_registry:
+            llm_response = self.llm.invoke(messages, **kwargs)
+            response_text = (
+                llm_response.content if hasattr(llm_response, "content") else str(llm_response)
+            )
+            self.add_message(Message(input_text, "user"))
+            self.add_message(Message(response_text, "assistant"))
+            if trace_logger:
+                duration = (dt.now() - session_start_time).total_seconds()
+                trace_logger.log_event(
+                    "session_end",
+                    {
+                        "duration": duration,
+                        "final_answer": response_text,
+                        "status": "success",
+                        "usage": getattr(llm_response, "usage", {}),
+                        "latency_ms": getattr(llm_response, "latency_ms", 0),
+                    },
+                )
+                trace_logger.finalize()
+            return response_text
+
+        current_iteration = 0
+        final_response = ""
+
+        while current_iteration < self.max_tool_iterations:
+            current_iteration += 1
+            tool_schemas = self._build_tool_schemas()
+            print(
+                f"🔧 同步第 {current_iteration} 轮可用工具 "
+                f"({len(tool_schemas)}): {self.tool_registry.list_tools()}"
+            )
+
+            try:
+                response = self.llm.invoke_with_tools(
+                    messages=messages,
+                    tools=tool_schemas,
+                    tool_choice="auto",
+                    **kwargs,
+                )
+            except Exception as e:
+                print(f"❌ LLM 调用失败: {e}")
+                if trace_logger:
+                    trace_logger.log_event(
+                        "error",
+                        {"error_type": "LLM_ERROR", "message": str(e)},
+                        step=current_iteration,
+                    )
+                break
+
+            response_message = response.choices[0].message
+
+            if trace_logger:
+                usage = response.usage
+                trace_logger.log_event(
+                    "model_output",
+                    {
+                        "content": response_message.content,
+                        "tool_calls": len(response_message.tool_calls)
+                        if response_message.tool_calls
+                        else 0,
+                        "usage": {
+                            "prompt_tokens": usage.prompt_tokens if usage else 0,
+                            "completion_tokens": usage.completion_tokens if usage else 0,
+                            "total_tokens": usage.total_tokens if usage else 0,
+                        },
+                    },
+                    step=current_iteration,
+                )
+
+            tool_calls = response_message.tool_calls
+            if not tool_calls:
+                final_response = response_message.content or "抱歉，我无法回答这个问题。"
+                break
+
+            messages.append({
+                "role": "assistant",
+                "content": response_message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                tool_call_id = tool_call.id
+                try:
+                    arguments = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    print(f"❌ 工具参数解析失败: {e}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": f"错误：参数格式不正确 - {str(e)}",
+                    })
+                    continue
+
+                if trace_logger:
+                    trace_logger.log_event(
+                        "tool_call",
+                        {
+                            "tool_name": tool_name,
+                            "tool_call_id": tool_call_id,
+                            "args": arguments,
+                        },
+                        step=current_iteration,
+                    )
+
+                result = self._execute_tool_call(tool_name, arguments)
+
+                if trace_logger:
+                    trace_logger.log_event(
+                        "tool_result",
+                        {
+                            "tool_name": tool_name,
+                            "tool_call_id": tool_call_id,
+                            "result": result,
+                        },
+                        step=current_iteration,
+                    )
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result,
+                })
+
+            self.context_manager.maybe_compress_messages(messages, self.system_prompt)
+
+        if current_iteration >= self.max_tool_iterations and not final_response:
+            llm_response = self.llm.invoke(messages, **kwargs)
+            final_response = (
+                llm_response.content if hasattr(llm_response, "content") else str(llm_response)
+            )
+
+        self.add_message(Message(input_text, "user"))
+        self.add_message(Message(final_response, "assistant"))
+
+        if trace_logger:
+            duration = (dt.now() - session_start_time).total_seconds()
+            trace_logger.log_event(
+                "session_end",
+                {
+                    "duration": duration,
+                    "total_steps": current_iteration,
+                    "final_answer": final_response,
+                    "status": "success",
+                },
+            )
+            trace_logger.finalize()
+
+        return final_response
+
     async def arun_stream_with_tools(
         self,
         input_text: str,
@@ -420,9 +604,6 @@ class EnhancedSimpleAgent(SimpleAgent):
                 return
 
             # === 流式工具调用模式 ===
-            tool_schemas = self._build_tool_schemas()
-            print(f"🔧 已启用工具调用，可用工具: {list(self.tool_registry._tools.keys())}")
-
             current_iteration = 0
             final_response = ""
             # 收集工具调用记录（用于存入会话）
@@ -430,6 +611,17 @@ class EnhancedSimpleAgent(SimpleAgent):
 
             while current_iteration < self.max_tool_iterations:
                 current_iteration += 1
+
+                tool_schemas = self._build_tool_schemas()
+                tool_names = (
+                    list(self.tool_registry._tools.keys())
+                    if self.tool_registry
+                    else []
+                )
+                print(
+                    f"🔧 第 {current_iteration} 轮可用工具 "
+                    f"({len(tool_schemas)}): {tool_names}"
+                )
 
                 # 发送步骤开始事件
                 yield StreamEvent.create(

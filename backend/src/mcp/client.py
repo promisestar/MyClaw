@@ -2,49 +2,33 @@
 增强的 MCP 客户端实现
 
 支持多种传输方式的 MCP 客户端，用于教学和实际应用。
-这个实现展示了如何使用不同的传输方式连接到 MCP 服务器。
 
 支持的传输方式：
 1. Memory: 内存传输（用于测试，直接传递 FastMCP 实例）
-2. Stdio: 标准输入输出传输（本地进程，Python/Node.js 脚本）
-3. HTTP: HTTP 传输（远程服务器）
+2. Stdio: 标准输入输出传输（本地进程，Python/Node.js/npx 脚本）
+3. HTTP: Streamable HTTP 传输（远程服务器，如 GitHub 托管 MCP）
 4. SSE: Server-Sent Events 传输（实时通信）
-
-使用示例：
-```python
-# 1. 内存传输（测试）
-from fastmcp import FastMCP
-server = FastMCP("TestServer")
-client = MCPClient(server)
-
-# 2. Stdio 传输（本地脚本）
-client = MCPClient("server.py")
-client = MCPClient(["python", "server.py"])
-
-# 3. HTTP 传输（远程服务器）
-client = MCPClient("https://api.example.com/mcp")
-
-# 4. SSE 传输（实时通信）
-client = MCPClient("https://api.example.com/mcp", transport_type="sse")
-
-# 5. 配置传输（高级用法）
-config = {
-    "transport": "stdio",
-    "command": "python",
-    "args": ["server.py"],
-    "env": {"DEBUG": "1"}
-}
-client = MCPClient(config)
-```
 """
 
-from typing import Dict, Any, List, Optional, Union
-import asyncio
+from __future__ import annotations
+
+from typing import Dict, Any, List, Optional, Union, Tuple
+import logging
 import os
+import shutil
+
+logger = logging.getLogger(__name__)
 
 try:
     from fastmcp import Client, FastMCP
-    from fastmcp.client.transports import PythonStdioTransport, SSETransport, StreamableHttpTransport
+    from fastmcp.client.transports import (
+        PythonStdioTransport,
+        SSETransport,
+        StreamableHttpTransport,
+        NpxStdioTransport,
+        StdioTransport,
+    )
+    from fastmcp.client.transports.inference import infer_transport
     FASTMCP_AVAILABLE = True
 except ImportError:
     FASTMCP_AVAILABLE = False
@@ -53,34 +37,105 @@ except ImportError:
     PythonStdioTransport = None
     SSETransport = None
     StreamableHttpTransport = None
+    NpxStdioTransport = None
+    StdioTransport = None
+    infer_transport = None
+
+
+def _resolve_stdio_command(command: str) -> str:
+    """Windows 上 npx/node 等常需 .cmd 后缀。"""
+    if os.name != "nt" or os.path.isabs(command) or command.endswith(".cmd"):
+        return command
+    if shutil.which(command):
+        return command
+    cmd_path = shutil.which(f"{command}.cmd")
+    return cmd_path or command
+
+
+def _parse_npx_command(
+    command: List[str], extra_args: Optional[List[str]] = None
+) -> Optional[Tuple[str, List[str]]]:
+    """解析 ['npx','-y','@scope/pkg', ...] → (package, package_args)。"""
+    if not command:
+        return None
+    exe = command[0].lower().removesuffix(".cmd")
+    if exe != "npx" or len(command) < 2:
+        return None
+
+    args = list(command[1:])
+    package: Optional[str] = None
+    package_args: List[str] = []
+    i = 0
+    while i < len(args):
+        flag = args[i]
+        if flag in ("-y", "--yes"):
+            i += 1
+            continue
+        if flag in ("--prefer-offline", "--no-install"):
+            i += 1
+            continue
+        if package is None:
+            package = args[i]
+            i += 1
+            package_args = args[i:]
+            break
+        i += 1
+
+    if not package:
+        return None
+    if extra_args:
+        package_args = list(extra_args) + package_args
+    return package, package_args
+
+
+def _normalize_tools(result: Any) -> List[Any]:
+    if isinstance(result, list):
+        return result
+    if hasattr(result, "tools"):
+        return result.tools or []
+    return []
+
+
+def _normalize_resources(result: Any) -> List[Any]:
+    if isinstance(result, list):
+        return result
+    if hasattr(result, "resources"):
+        return result.resources or []
+    return []
+
+
+def _normalize_prompts(result: Any) -> List[Any]:
+    if isinstance(result, list):
+        return result
+    if hasattr(result, "prompts"):
+        return result.prompts or []
+    return []
 
 
 class MCPClient:
     """MCP 客户端，支持多种传输方式"""
 
-    def __init__(self,
-                 server_source: Union[str, List[str], FastMCP, Dict[str, Any]],
-                 server_args: Optional[List[str]] = None,
-                 transport_type: Optional[str] = None,
-                 env: Optional[Dict[str, str]] = None,
-                 **transport_kwargs):
+    def __init__(
+        self,
+        server_source: Union[str, List[str], FastMCP, Dict[str, Any]],
+        server_args: Optional[List[str]] = None,
+        transport_type: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        auth: Optional[str] = None,
+        **transport_kwargs,
+    ):
         """
-        初始化MCP 客户端
+        初始化 MCP 客户端
 
         Args:
-            server_source: 服务器源，支持多种格式：
-                - FastMCP 实例: 内存传输（用于测试）
-                - 字符串路径: Python 脚本路径（如 "server.py"）
-                - HTTP URL: 远程服务器（如 "https://api.example.com/mcp"）
-                - 命令列表: 完整命令（如 ["python", "server.py"]）
-                - 配置字典: 传输配置
-            server_args: 服务器参数列表（可选）
-            transport_type: 强制指定传输类型 ("stdio", "http", "sse", "memory")
-            env: 环境变量字典（传递给MCP服务器进程）
-            **transport_kwargs: 传输特定的额外参数
-
-        Raises:
-            ImportError: 如果 fastmcp 库未安装
+            server_source: 服务器源（FastMCP 实例 / HTTP URL / 命令列表 / 配置字典）
+            server_args: 附加命令行参数（stdio）
+            transport_type: 强制传输类型 ("stdio", "http", "sse")
+            env: 传给子进程的环境变量（stdio）
+            headers: HTTP/SSE 请求头（远程 MCP 鉴权等）
+            auth: HTTP Bearer token 或 httpx.Auth（远程 MCP）
+            **transport_kwargs: 其他传输参数
         """
         if not FASTMCP_AVAILABLE:
             raise ImportError(
@@ -91,247 +146,283 @@ class MCPClient:
         self.server_args = server_args or []
         self.transport_type = transport_type
         self.env = env or {}
+        self.headers = headers or {}
+        self.auth = auth
         self.transport_kwargs = transport_kwargs
         self.server_source = self._prepare_server_source(server_source)
         self.client: Optional[Client] = None
         self._context_manager = None
 
-    def _prepare_server_source(self, server_source: Union[str, List[str], FastMCP, Dict[str, Any]]):
-        """准备服务器源，根据类型创建合适的传输配置"""
-        
-        # 1. FastMCP 实例 - 内存传输
-        if isinstance(server_source, FastMCP):
-            print(f"🧠 使用内存传输: {server_source.name}")
-            return server_source
-        
-        # 2. 配置字典 - 根据配置创建传输
-        if isinstance(server_source, dict):
-            print(f"⚙️ 使用配置传输: {server_source.get('transport', 'stdio')}")
-            return self._create_transport_from_config(server_source)
-        
-        # 3. HTTP URL - HTTP/SSE 传输
-        if isinstance(server_source, str) and (server_source.startswith("http://") or server_source.startswith("https://")):
-            transport_type = self.transport_type or "http"
-            print(f"🌐 使用 {transport_type.upper()} 传输: {server_source}")
-            if transport_type == "sse":
-                return SSETransport(url=server_source, **self.transport_kwargs)
-            else:
-                return StreamableHttpTransport(url=server_source, **self.transport_kwargs)
+    def _http_transport_kwargs(self) -> Dict[str, Any]:
+        kw = dict(self.transport_kwargs)
+        if self.headers:
+            kw["headers"] = {**kw.get("headers", {}), **self.headers}
+        if self.auth is not None and "auth" not in kw:
+            kw["auth"] = self.auth
+        return kw
 
-        # 4. Python 脚本路径 - Stdio 传输
+    def _prepare_server_source(
+        self, server_source: Union[str, List[str], FastMCP, Dict[str, Any]]
+    ):
+        if isinstance(server_source, FastMCP):
+            logger.debug("MCP transport: memory (%s)", server_source.name)
+            return server_source
+
+        if isinstance(server_source, dict):
+            logger.debug(
+                "MCP transport: config (%s)",
+                server_source.get("transport", "stdio"),
+            )
+            return self._create_transport_from_config(server_source)
+
+        if isinstance(server_source, str) and server_source.startswith(("http://", "https://")):
+            ttype = (self.transport_type or "http").lower()
+            http_kw = self._http_transport_kwargs()
+            logger.debug("MCP transport: %s %s", ttype, server_source)
+            if ttype == "sse":
+                return SSETransport(url=server_source, **http_kw)
+            return StreamableHttpTransport(url=server_source, **http_kw)
+
         if isinstance(server_source, str) and server_source.endswith(".py"):
-            print(f"🐍 使用 Stdio 传输 (Python): {server_source}")
+            logger.debug("MCP transport: stdio python %s", server_source)
             return PythonStdioTransport(
                 script_path=server_source,
                 args=self.server_args,
-                env=self.env if self.env else None,
-                **self.transport_kwargs
+                env=self.env or None,
+                **self.transport_kwargs,
             )
 
-        # 5. 命令列表 - Stdio 传输
-        if isinstance(server_source, list) and len(server_source) >= 1:
-            print(f"📝 使用 Stdio 传输 (命令): {' '.join(server_source)}")
-            if server_source[0] == "python" and len(server_source) > 1 and server_source[1].endswith(".py"):
-                # Python 脚本
+        if isinstance(server_source, list) and server_source:
+            npx_parsed = _parse_npx_command(server_source, self.server_args)
+            if npx_parsed and NpxStdioTransport is not None:
+                package, pkg_args = npx_parsed
+                logger.debug("MCP transport: npx %s", package)
+                return NpxStdioTransport(
+                    package=package,
+                    args=pkg_args or None,
+                    env_vars=self.env or None,
+                    **self.transport_kwargs,
+                )
+
+            cmd = _resolve_stdio_command(server_source[0])
+            args = server_source[1:] + self.server_args
+            if (
+                cmd.lower().removesuffix(".cmd") == "python"
+                and args
+                and args[0].endswith(".py")
+            ):
+                logger.debug("MCP transport: stdio python %s", args[0])
                 return PythonStdioTransport(
-                    script_path=server_source[1],
-                    args=server_source[2:] + self.server_args,
-                    env=self.env if self.env else None,
-                    **self.transport_kwargs
+                    script_path=args[0],
+                    args=args[1:],
+                    env=self.env or None,
+                    **self.transport_kwargs,
                 )
-            else:
-                # 其他命令，使用通用 Stdio 传输
-                from fastmcp.client.transports import StdioTransport
-                return StdioTransport(
-                    command=server_source[0],
-                    args=server_source[1:] + self.server_args,
-                    env=self.env if self.env else None,
-                    **self.transport_kwargs
-                )
-        
-        # 6. 其他情况 - 直接返回，让 FastMCP 自动推断
-        print(f"🔍 自动推断传输: {server_source}")
+
+            logger.debug("MCP transport: stdio %s %s", cmd, " ".join(args))
+            return StdioTransport(
+                command=cmd,
+                args=args,
+                env=self.env or None,
+                **self.transport_kwargs,
+            )
+
+        if infer_transport is not None:
+            try:
+                inferred = infer_transport(server_source)
+                logger.debug("MCP transport: inferred %s", type(inferred).__name__)
+                return inferred
+            except (ValueError, TypeError):
+                pass
+
+        logger.debug("MCP transport: passthrough %r", server_source)
         return server_source
 
     def _create_transport_from_config(self, config: Dict[str, Any]):
-        """从配置字典创建传输"""
         transport_type = config.get("transport", "stdio")
-        
+
         if transport_type == "stdio":
-            # 检查是否是 Python 脚本
-            args = config.get("args", [])
+            args = list(config.get("args", [])) + self.server_args
+            env = config.get("env") or self.env or None
+            cwd = config.get("cwd")
+            command = config.get("command", "python")
+
+            npx_cmd = [command] + args if command == "npx" else None
+            if command == "npx" or (args and _parse_npx_command([command] + args)):
+                parsed = _parse_npx_command([command] + args, self.server_args)
+                if parsed and NpxStdioTransport is not None:
+                    package, pkg_args = parsed
+                    return NpxStdioTransport(
+                        package=package,
+                        args=pkg_args or None,
+                        env_vars=env,
+                        cwd=cwd,
+                        **self.transport_kwargs,
+                    )
+
             if args and args[0].endswith(".py"):
                 return PythonStdioTransport(
                     script_path=args[0],
-                    args=args[1:] + self.server_args,
-                    env=config.get("env"),
-                    cwd=config.get("cwd"),
-                    **self.transport_kwargs
+                    args=args[1:],
+                    env=env,
+                    cwd=cwd,
+                    **self.transport_kwargs,
                 )
-            else:
-                # 使用通用 Stdio 传输
-                from fastmcp.client.transports import StdioTransport
-                return StdioTransport(
-                    command=config.get("command", "python"),
-                    args=args + self.server_args,
-                    env=config.get("env"),
-                    cwd=config.get("cwd"),
-                    **self.transport_kwargs
-                )
-        elif transport_type == "sse":
+            return StdioTransport(
+                command=_resolve_stdio_command(command),
+                args=args,
+                env=env,
+                cwd=cwd,
+                **self.transport_kwargs,
+            )
+
+        if transport_type == "sse":
+            http_kw = self._http_transport_kwargs()
             return SSETransport(
                 url=config["url"],
                 headers=config.get("headers"),
                 auth=config.get("auth"),
-                **self.transport_kwargs
+                **http_kw,
             )
-        elif transport_type == "http":
+
+        if transport_type == "http":
+            http_kw = self._http_transport_kwargs()
             return StreamableHttpTransport(
                 url=config["url"],
                 headers=config.get("headers"),
                 auth=config.get("auth"),
-                **self.transport_kwargs
+                **http_kw,
             )
-        else:
-            raise ValueError(f"Unsupported transport type: {transport_type}")
+
+        raise ValueError(f"Unsupported transport type: {transport_type}")
 
     async def __aenter__(self):
-        """异步上下文管理器入口"""
-        print("🔗 连接到 MCP 服务器...")
+        logger.debug("Connecting to MCP server...")
         self.client = Client(self.server_source)
         self._context_manager = self.client
         await self._context_manager.__aenter__()
-        print("✅ 连接成功！")
+        logger.debug("MCP connected")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """异步上下文管理器出口"""
         if self._context_manager:
             await self._context_manager.__aexit__(exc_type, exc_val, exc_tb)
             self.client = None
             self._context_manager = None
-        print("🔌 连接已断开")
+        logger.debug("MCP disconnected")
 
     async def list_tools(self) -> List[Dict[str, Any]]:
-        """列出所有可用的工具"""
         if not self.client:
             raise RuntimeError("Client not connected. Use 'async with client:' context manager.")
 
         result = await self.client.list_tools()
-
-        # 处理不同的返回格式
-        if hasattr(result, 'tools'):
-            tools = result.tools
-        elif isinstance(result, list):
-            tools = result
-        else:
-            tools = []
+        tools = _normalize_tools(result)
 
         return [
             {
                 "name": tool.name,
                 "description": tool.description or "",
-                "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+                "input_schema": getattr(tool, "inputSchema", None) or {},
             }
             for tool in tools
         ]
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """调用 MCP 工具"""
         if not self.client:
             raise RuntimeError("Client not connected. Use 'async with client:' context manager.")
 
         result = await self.client.call_tool(tool_name, arguments)
 
-        # 解析结果 - FastMCP 返回 ToolResult 对象
-        if hasattr(result, 'content') and result.content:
+        if hasattr(result, "content") and result.content:
             if len(result.content) == 1:
                 content = result.content[0]
-                if hasattr(content, 'text'):
+                if hasattr(content, "text"):
                     return content.text
-                elif hasattr(content, 'data'):
+                if hasattr(content, "data"):
                     return content.data
             return [
-                getattr(c, 'text', getattr(c, 'data', str(c)))
+                getattr(c, "text", getattr(c, "data", str(c)))
                 for c in result.content
             ]
+        if hasattr(result, "data") and result.data is not None:
+            return result.data
         return None
 
     async def list_resources(self) -> List[Dict[str, Any]]:
-        """列出所有可用的资源"""
         if not self.client:
             raise RuntimeError("Client not connected. Use 'async with client:' context manager.")
 
         result = await self.client.list_resources()
+        resources = _normalize_resources(result)
         return [
             {
                 "uri": resource.uri,
                 "name": resource.name or "",
                 "description": resource.description or "",
-                "mime_type": getattr(resource, 'mimeType', None)
+                "mime_type": getattr(resource, "mimeType", None),
             }
-            for resource in result.resources
+            for resource in resources
         ]
 
     async def read_resource(self, uri: str) -> Any:
-        """读取资源内容"""
         if not self.client:
             raise RuntimeError("Client not connected. Use 'async with client:' context manager.")
 
         result = await self.client.read_resource(uri)
 
-        # 解析资源内容
-        if hasattr(result, 'contents') and result.contents:
+        if hasattr(result, "contents") and result.contents:
             if len(result.contents) == 1:
                 content = result.contents[0]
-                if hasattr(content, 'text'):
+                if hasattr(content, "text"):
                     return content.text
-                elif hasattr(content, 'blob'):
+                if hasattr(content, "blob"):
                     return content.blob
             return [
-                getattr(c, 'text', getattr(c, 'blob', str(c)))
+                getattr(c, "text", getattr(c, "blob", str(c)))
                 for c in result.contents
             ]
         return None
 
     async def list_prompts(self) -> List[Dict[str, Any]]:
-        """列出所有可用的提示词模板"""
         if not self.client:
             raise RuntimeError("Client not connected. Use 'async with client:' context manager.")
 
         result = await self.client.list_prompts()
+        prompts = _normalize_prompts(result)
         return [
             {
                 "name": prompt.name,
                 "description": prompt.description or "",
-                "arguments": getattr(prompt, 'arguments', [])
+                "arguments": getattr(prompt, "arguments", []),
             }
-            for prompt in result.prompts
+            for prompt in prompts
         ]
 
-    async def get_prompt(self, prompt_name: str, arguments: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-        """获取提示词内容"""
+    async def get_prompt(
+        self, prompt_name: str, arguments: Optional[Dict[str, str]] = None
+    ) -> List[Dict[str, Any]]:
         if not self.client:
             raise RuntimeError("Client not connected. Use 'async with client:' context manager.")
 
         result = await self.client.get_prompt(prompt_name, arguments or {})
 
-        # 解析提示词消息
-        if hasattr(result, 'messages') and result.messages:
+        if hasattr(result, "messages") and result.messages:
             return [
                 {
                     "role": msg.role,
-                    "content": getattr(msg.content, 'text', str(msg.content)) if hasattr(msg.content, 'text') else str(msg.content)
+                    "content": (
+                        getattr(msg.content, "text", str(msg.content))
+                        if hasattr(msg.content, "text")
+                        else str(msg.content)
+                    ),
                 }
                 for msg in result.messages
             ]
         return []
 
     async def ping(self) -> bool:
-        """测试服务器连接"""
         if not self.client:
             raise RuntimeError("Client not connected. Use 'async with client:' context manager.")
-        
         try:
             await self.client.ping()
             return True
@@ -339,15 +430,14 @@ class MCPClient:
             return False
 
     def get_transport_info(self) -> Dict[str, Any]:
-        """获取传输信息"""
         if not self.client:
             return {"status": "not_connected"}
-        
-        transport = getattr(self.client, 'transport', None)
+
+        transport = getattr(self.client, "transport", None)
         if transport:
             return {
                 "status": "connected",
                 "transport_type": type(transport).__name__,
-                "transport_info": str(transport)
+                "transport_info": str(transport),
             }
         return {"status": "unknown"}

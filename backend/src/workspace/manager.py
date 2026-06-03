@@ -98,11 +98,16 @@ class WorkspaceManager:
 
         每条 server 支持：
         - name: 工具注册名（建议唯一，如 github、fs）
-        - server_command: 启动命令列表，如 ["npx","-y","@modelcontextprotocol/server-github"]
+        - server_url: 远程 MCP 地址（推荐 GitHub 托管：https://api.githubcopilot.com/mcp/）
+        - server_command: 本地启动命令，如 ["npx","-y","@modelcontextprotocol/server-github"]
+          （与 server_url 二选一；GitHub 场景请优先 server_url，工具更全）
+        - transport_type: 远程传输类型，http（默认）或 sse
+        - headers: 远程 MCP 请求头（也可用 env_keys 自动注入 Bearer PAT）
         - server_args: 可选附加参数列表
         - env: 可选，传给子进程的环境变量字典
         - env_keys: 可选，从当前进程环境读取的变量名列表
-        - auto_expand: 可选，是否展开远端工具（默认 True）
+        - auto_expand: 可选，是否启动时全量展开远端工具（默认 False，渐进披露）
+        - 渐进披露：auto_expand=false 时通过 action=enable_tools 按需注册 mcp_{name}_* 子工具
         """
         defaults: Dict[str, Any] = {
             "enabled": True,

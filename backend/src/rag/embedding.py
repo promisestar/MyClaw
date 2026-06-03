@@ -8,14 +8,64 @@
 环境变量：
 - EMBED_MODEL_TYPE: "local" | "tfidf"（默认 local）
 - EMBED_MODEL_NAME: 模型名称（local默认 sentence-transformers/all-MiniLM-L6-v2）
+- EMBED_MODEL_PATH: 本地模型目录（优先于 EMBED_MODEL_NAME，不访问 Hugging Face）
+- EMBED_LOCAL_FILES_ONLY: "1"/"true" 强制仅本地；"0"/"false" 允许联网校验（默认：有缓存则仅本地）
+- HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE: 设为 1 时等同强制仅本地
 - EMBED_API_KEY: Embedding API Key（统一命名）
 - EMBED_BASE_URL: Embedding Base URL（统一命名，可选）
 """
 
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Tuple
 import threading
 import os
+from pathlib import Path
 import numpy as np
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _hf_cache_snapshot_dir(model_name: str) -> Optional[str]:
+    """若 Hugging Face 缓存中已有模型，返回 snapshots 目录路径。"""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        marker = try_to_load_from_cache(model_name, "config.json")
+        if marker:
+            return str(Path(marker).parent)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_local_model(model_name: str) -> Tuple[str, bool]:
+    """解析加载路径及是否禁止联网（local_files_only）。
+
+    Returns:
+        (model_path_or_id, local_files_only)
+    """
+    explicit_path = os.getenv("EMBED_MODEL_PATH", "").strip()
+    if explicit_path and Path(explicit_path).is_dir():
+        return explicit_path, True
+
+    force_offline = _env_flag("EMBED_LOCAL_FILES_ONLY") or _env_flag("HF_HUB_OFFLINE") or _env_flag(
+        "TRANSFORMERS_OFFLINE"
+    )
+    allow_online = os.getenv("EMBED_LOCAL_FILES_ONLY", "").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+    cached = _hf_cache_snapshot_dir(model_name)
+    if cached:
+        # 有本地缓存时默认走快照目录，避免对 huggingface.co 发 HEAD 校验
+        local_only = force_offline or not allow_online
+        return cached, local_only
+
+    return model_name, force_offline
 
 
 # ==============
@@ -38,6 +88,7 @@ class LocalTransformerEmbedding(EmbeddingModel):
 
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
         self.model_name = model_name
+        self._load_path, self._local_files_only = _resolve_local_model(model_name)
         self._backend = None  # "st" 或 "hf"
         self._st_model = None
         self._hf_tokenizer = None
@@ -46,10 +97,14 @@ class LocalTransformerEmbedding(EmbeddingModel):
         self._load_backend()
 
     def _load_backend(self):
+        load_kwargs = {}
+        if self._local_files_only:
+            load_kwargs["local_files_only"] = True
+
         # 优先 sentence-transformers
         try:
             from sentence_transformers import SentenceTransformer
-            self._st_model = SentenceTransformer(self.model_name)
+            self._st_model = SentenceTransformer(self._load_path, **load_kwargs)
             test_vec = self._st_model.encode("test_text")
             self._dimension = len(test_vec)
             self._backend = "st"
@@ -61,8 +116,10 @@ class LocalTransformerEmbedding(EmbeddingModel):
         try:
             from transformers import AutoTokenizer, AutoModel
             import torch
-            self._hf_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self._hf_model = AutoModel.from_pretrained(self.model_name)
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                self._load_path, **load_kwargs
+            )
+            self._hf_model = AutoModel.from_pretrained(self._load_path, **load_kwargs)
             with torch.no_grad():
                 inputs = self._hf_tokenizer("test_text", return_tensors="pt", padding=True, truncation=True)
                 outputs = self._hf_model(**inputs)

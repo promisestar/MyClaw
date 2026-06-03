@@ -10,9 +10,10 @@
     "servers": [
       {
         "name": "github",
-        "server_command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+        "server_url": "https://api.githubcopilot.com/mcp/",
+        "transport_type": "http",
         "env_keys": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
-        "auto_expand": true
+        "auto_expand": false
       }
     ]
   }
