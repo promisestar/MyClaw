@@ -57,15 +57,12 @@ def _rag_response_from_text(msg: str) -> ToolResponse:
 
 
 class RAGTool(Tool):
-    """RAG工具
-    
-    提供完整的 RAG 能力：
-    - 添加多格式文档（PDF、Office、图片、音频等）
-    - 智能检索与召回
-    - LLM 增强问答
-    - 知识库管理
+    """RAG 知识库工具
+
+    管理用户已入库私有文档：向量化入库、语义检索、LLM 增强问答。
+    与工作区源码/配置无关的私有资料应走本工具，不用 Read 代替检索。
     """
-    
+
     def __init__(
         self,
         knowledge_base_path: str = "./knowledge_base",
@@ -78,7 +75,14 @@ class RAGTool(Tool):
     ):
         super().__init__(
             name="rag",
-            description="RAG工具 - 支持多格式文档检索增强生成，提升智能问答能力",
+            description=(
+                "管理用户已入库私有文档的知识库：向量化入库、语义检索与 LLM 问答。"
+                "用于：用户上传/提供的 PDF、笔记等资料；问「资料里写了什么」类问题。"
+                "action 选法：入库文件→add_document | 纯文本→add_text | 综合问答→ask | "
+                "原文片段→search | 排查空库→stats | 用户明确要求清空→clear(confirm=true)。"
+                "勿查公开网页（用 web_search）；未入库内容须先 add_document/add_text。"
+                "file_path 相对路径相对于工作空间根（如 uploads/），非进程 CWD。"
+            ),
             expandable=expandable
         )
         # 与 Read/上传 API 一致：相对路径相对 Agent 工作空间根（非进程 CWD）
@@ -244,65 +248,125 @@ class RAGTool(Tool):
     def get_parameters(self) -> List[ToolParameter]:
         """获取工具参数定义 - Tool基类要求的接口"""
         return [
-            # 核心操作参数
             ToolParameter(
                 name="action",
                 type="string",
-                description="操作类型：add_document(添加文档), add_text(添加文本), ask(智能问答), search(搜索), stats(统计), clear(清空)",
-                required=True
+                description=(
+                    "必填。操作类型："
+                    "add_document=文件入库(PDF/Word/Excel/PPT/图片/音频等，需 file_path)；"
+                    "add_text=纯文本入库(需 text，无文件时用)；"
+                    "ask=检索并由 LLM 生成综合答案(需 question，用户问资料内容时优先)；"
+                    "search=仅返回原文片段与来源(需 query，不生成答案，用于核对引用)；"
+                    "stats=查看分块数与管道状态(无副作用，无结果时先调用)；"
+                    "clear=永久清空命名空间(需 confirm=true，仅用户明确要求时)"
+                ),
+                required=True,
             ),
-            
-            # 内容参数
             ToolParameter(
                 name="file_path",
                 type="string",
-                description="文档路径（支持 PDF/Word 等）；相对路径时相对于工作空间根目录（与上传目录 uploads/ 一致），勿用进程当前目录理解",
-                required=False
+                description=(
+                    "add_document 必填。文档路径；相对路径相对于工作空间根（如 uploads/report.pdf），"
+                    "非进程 CWD。已有本地文件用此参数，纯文本用 add_text+text"
+                ),
+                required=False,
             ),
             ToolParameter(
                 name="text",
                 type="string",
-                description="要添加的文本内容",
-                required=False
+                description="add_text 必填。待入库的纯文本（笔记、摘要、代码片段等）；有文件路径时用 add_document",
+                required=False,
             ),
             ToolParameter(
                 name="question",
-                type="string", 
-                description="用户问题（用于智能问答）",
-                required=False
+                type="string",
+                description="ask 必填（可与 query 二选一）。用户自然语言问题，用于检索并生成综合答案",
+                required=False,
             ),
             ToolParameter(
                 name="query",
                 type="string",
-                description="搜索查询词（用于基础搜索）",
-                required=False
+                description="search 必填（可与 question 二选一）。检索关键词或问句，仅返回原文片段，不调用 LLM 生成答案",
+                required=False,
             ),
-            
-            # 可选配置参数
             ToolParameter(
                 name="namespace",
                 type="string",
-                description="知识库命名空间（用于隔离不同项目，默认：default）",
+                description="知识库命名空间，用于多项目隔离，默认 default",
                 required=False,
-                default="default"
+                default="default",
+            ),
+            ToolParameter(
+                name="document_id",
+                type="string",
+                description="add_document/add_text 可选。自定义文档标识，便于区分来源；未传时自动生成",
+                required=False,
             ),
             ToolParameter(
                 name="limit",
                 type="integer",
-                description="返回结果数量（默认：5）",
+                description="ask/search 可选。检索返回的片段数量，默认 5",
                 required=False,
-                default=5
+                default=5,
+            ),
+            ToolParameter(
+                name="min_score",
+                type="number",
+                description="search 可选。最低相似度阈值，低于此分数的结果被过滤，默认 0.1",
+                required=False,
+                default=0.1,
+            ),
+            ToolParameter(
+                name="enable_advanced_search",
+                type="boolean",
+                description="ask/search 可选。是否启用 MQE/HyDE 扩展检索以提升召回，默认 true",
+                required=False,
+                default=True,
             ),
             ToolParameter(
                 name="include_citations",
                 type="boolean",
-                description="是否包含引用来源（默认：true）",
+                description="ask/search 可选。是否在结果中附带来源文件与章节，默认 true",
                 required=False,
-                default=True
-            )
+                default=True,
+            ),
+            ToolParameter(
+                name="max_chars",
+                type="integer",
+                description="ask/search 可选。注入上下文或展示内容的总字符上限，默认 1200",
+                required=False,
+                default=1200,
+            ),
+            ToolParameter(
+                name="chunk_size",
+                type="integer",
+                description="add_document/add_text 可选。分块大小，默认 800，一般无需修改",
+                required=False,
+                default=800,
+            ),
+            ToolParameter(
+                name="chunk_overlap",
+                type="integer",
+                description="add_document/add_text 可选。分块重叠字符数，默认 100，一般无需修改",
+                required=False,
+                default=100,
+            ),
+            ToolParameter(
+                name="confirm",
+                type="boolean",
+                description="clear 必填且须为 true。未传或为 false 时仅返回警告，不执行清空",
+                required=False,
+                default=False,
+            ),
         ]
 
-    @tool_action("rag_add_document", "添加文档到知识库（支持PDF、Word、Excel、PPT、图片、音频等多种格式）")
+    @tool_action(
+        "rag_add_document",
+        "将本地文件解析、分块、向量化后写入知识库。"
+        "用于：用户上传或提供文件路径（PDF/Word/Excel/PPT/图片/音频/网页等）后需纳入检索范围。"
+        "file_path 相对路径相对于工作空间根（如 uploads/），非进程 CWD。"
+        "入库后可用 rag_ask 问答或 rag_search 检索；勿用 web_search 查私有文档。",
+    )
     def _add_document(
         self,
         file_path: str,
@@ -314,11 +378,11 @@ class RAGTool(Tool):
         """添加文档到知识库
 
         Args:
-            file_path: 文档文件路径
-            document_id: 文档ID（可选）
-            namespace: 知识库命名空间（用于隔离不同项目）
-            chunk_size: 分块大小
-            chunk_overlap: 分块重叠大小
+            file_path: 必填，文档路径；相对路径相对于工作空间根（如 uploads/report.pdf）
+            document_id: 可选文档标识，用于区分来源
+            namespace: 知识库命名空间，默认 default，用于多项目隔离
+            chunk_size: 分块大小，默认 800，一般无需修改
+            chunk_overlap: 分块重叠，默认 100，一般无需修改
 
         Returns:
             执行结果
@@ -356,7 +420,12 @@ class RAGTool(Tool):
         except Exception as e:
             return f"❌ 添加文档失败: {str(e)}"
     
-    @tool_action("rag_add_text", "添加文本到知识库")
+    @tool_action(
+        "rag_add_text",
+        "将纯文本分块向量化入库（无需文件路径）。"
+        "用于：用户粘贴笔记、摘要、代码片段等无对应本地文件的内容。"
+        "已有文件请用 rag_add_document；入库后再用 rag_ask/rag_search 查询。",
+    )
     def _add_text(
         self,
         text: str,
@@ -368,11 +437,11 @@ class RAGTool(Tool):
         """添加文本到知识库
 
         Args:
-            text: 要添加的文本内容
-            document_id: 文档ID（可选）
-            namespace: 知识库命名空间
-            chunk_size: 分块大小
-            chunk_overlap: 分块重叠大小
+            text: 必填，待入库的纯文本内容
+            document_id: 可选文档标识，默认按内容哈希生成
+            namespace: 知识库命名空间，默认 default
+            chunk_size: 分块大小，默认 800，一般无需修改
+            chunk_overlap: 分块重叠，默认 100，一般无需修改
 
         Returns:
             执行结果
@@ -423,7 +492,13 @@ class RAGTool(Tool):
         except Exception as e:
             return f"❌ 添加文本失败: {str(e)}"
     
-    @tool_action("rag_search", "搜索知识库中的相关内容")
+    @tool_action(
+        "rag_search",
+        "语义检索已入库文档，返回原文片段、来源文件与相似度（不生成综合答案）。"
+        "用于：需自行阅读原文、核对引用、或仅需相关段落时。"
+        "用户需要综合回答时用 rag_ask；查公开网页用 web_search。"
+        "无结果时先用 rag_stats 确认是否已入库。",
+    )
     def _search(
         self,
         query: str,
@@ -437,13 +512,13 @@ class RAGTool(Tool):
         """搜索知识库
 
         Args:
-            query: 搜索查询词
-            limit: 返回结果数量
-            min_score: 最低相关度分数
-            enable_advanced_search: 是否启用高级搜索（MQE、HyDE）
-            max_chars: 每个结果最大字符数
-            include_citations: 是否包含引用来源
-            namespace: 知识库命名空间
+            query: 必填，检索关键词或自然语言问句
+            limit: 返回片段数量，默认 5
+            min_score: 最低相似度阈值，默认 0.1，低于此分数的结果被过滤
+            enable_advanced_search: 是否启用 MQE/HyDE 扩展检索，默认 true
+            max_chars: 上下文总字符上限，默认 1200
+            include_citations: 是否附带来源文件与章节，默认 true
+            namespace: 知识库命名空间，默认 default
 
         Returns:
             搜索结果
@@ -503,7 +578,13 @@ class RAGTool(Tool):
         except Exception as e:
             return f"❌ 搜索失败: {str(e)}"
     
-    @tool_action("rag_ask", "基于知识库进行智能问答")
+    @tool_action(
+        "rag_ask",
+        "检索已入库文档并由 LLM 生成综合答案（含引用来源）。"
+        "用于：用户就私有/已入库资料提具体问题、需总结或解释时。"
+        "勿查未入库内容（先 rag_add_document 或 rag_add_text）；"
+        "仅需原文片段用 rag_search；公开资讯用 web_search。",
+    )
     def _ask(
         self,
         question: str,
@@ -516,22 +597,15 @@ class RAGTool(Tool):
         """智能问答：检索 → 上下文注入 → LLM生成答案
 
         Args:
-            question: 用户问题
-            limit: 检索结果数量
-            enable_advanced_search: 是否启用高级搜索
-            include_citations: 是否包含引用来源
-            max_chars: 每个结果最大字符数
-            namespace: 知识库命名空间
+            question: 必填，用户问题（自然语言）
+            limit: 检索片段数量，默认 5
+            enable_advanced_search: 是否启用 MQE 扩展检索，默认 true
+            include_citations: 是否在答案后附参考来源，默认 true
+            max_chars: 注入 LLM 的上下文总字符上限，默认 1200
+            namespace: 知识库命名空间，默认 default
 
         Returns:
             智能问答结果
-
-        核心流程:
-        1. 解析用户问题
-        2. 智能检索相关内容
-        3. 构建上下文和提示词
-        4. LLM生成准确答案
-        5. 添加引用来源
         """
         try:
             # 验证问题
@@ -696,13 +770,18 @@ class RAGTool(Tool):
         
         return "\n".join(result)
 
-    @tool_action("rag_clear", "清空知识库（危险操作，请谨慎使用）")
+    @tool_action(
+        "rag_clear",
+        "永久清空指定命名空间全部向量数据（不可恢复）。"
+        "仅当用户明确要求删除/重置知识库时使用，且必须传 confirm=true。"
+        "默认勿调用；清空前可用 rag_stats 确认范围。",
+    )
     def _clear_knowledge_base(self, confirm: bool = False, namespace: str = "default") -> str:
         """清空知识库
 
         Args:
-            confirm: 确认执行（必须设置为True）
-            namespace: 知识库命名空间
+            confirm: 必须为 true 才会执行，否则仅返回警告
+            namespace: 要清空的命名空间，默认 default
 
         Returns:
             执行结果
@@ -734,12 +813,17 @@ class RAGTool(Tool):
         except Exception as e:
             return f"❌ 清空知识库失败: {str(e)}"
 
-    @tool_action("rag_stats", "获取知识库统计信息")
+    @tool_action(
+        "rag_stats",
+        "查看知识库状态：命名空间、分块数、向量存储与管道是否正常。"
+        "用于：检索/问答无结果时排查是否空库；入库后确认分块数；切换 namespace 前确认范围。"
+        "无副作用，可优先调用。",
+    )
     def _get_stats(self, namespace: str = "default") -> str:
         """获取知识库统计
 
         Args:
-            namespace: 知识库命名空间
+            namespace: 要查看的命名空间，默认 default
 
         Returns:
             统计信息
