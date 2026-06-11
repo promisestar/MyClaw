@@ -4,6 +4,15 @@
 - pipeline 将向量存储到qdrant数据库
 
 """
+from .embedding import (
+    create_embedding_model,
+    create_embedding_model_with_fallback,
+    get_text_embedder,
+    get_dimension,
+    refresh_embedder,
+    get_cross_encoder,
+    refresh_cross_encoder,
+)
 from .pipeline import (
     load_and_chunk_texts,
     build_graph_from_chunks,
@@ -36,4 +45,11 @@ __all__ = [
     "search_vectors_expanded",
     "compress_ranked_items",
     "tldr_summarize",
+    "create_embedding_model",
+    "create_embedding_model_with_fallback",
+    "get_text_embedder",
+    "get_dimension",
+    "refresh_embedder",
+    "get_cross_encoder",
+    "refresh_cross_encoder",
 ]

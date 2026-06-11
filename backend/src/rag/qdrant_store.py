@@ -43,8 +43,8 @@ class QdrantConnectionManager:
         **kwargs
     ) -> 'QdrantVectorStore':
         """获取或创建Qdrant实例（单例模式）"""
-        # 创建唯一键
-        key = (url or "local", collection_name)
+        # 创建唯一键：同集合但不同向量维度/距离度量不能复用同一实例
+        key = (url or "local", collection_name, int(vector_size), str(distance).lower())
         
         if key not in cls._instances:
             with cls._lock:
@@ -66,6 +66,30 @@ class QdrantConnectionManager:
             logger.debug(f"♻️ 复用现有Qdrant连接: {collection_name}")
             
         return cls._instances[key]
+
+    @classmethod
+    def close_instances(
+        cls,
+        url: Optional[str] = None,
+        collection_name: Optional[str] = None,
+    ) -> None:
+        """关闭并移除匹配的缓存连接，避免后续复用已关闭客户端。"""
+        target_url = url or "local"
+        with cls._lock:
+            for key, instance in list(cls._instances.items()):
+                key_url = key[0]
+                key_collection = key[1]
+                if url is not None and key_url != target_url:
+                    continue
+                if collection_name is not None and key_collection != collection_name:
+                    continue
+                client = getattr(instance, "client", None)
+                if client and hasattr(client, "close"):
+                    try:
+                        client.close()
+                    except Exception:
+                        logger.warning("关闭Qdrant连接失败: %s", key, exc_info=True)
+                cls._instances.pop(key, None)
 
 class QdrantVectorStore:
     """Qdrant向量数据库存储实现"""
@@ -227,6 +251,7 @@ class QdrantVectorStore:
                 ("is_rag_data", models.PayloadSchemaType.BOOL),
                 ("rag_namespace", models.PayloadSchemaType.KEYWORD),
                 ("data_source", models.PayloadSchemaType.KEYWORD),
+                ("source_path", models.PayloadSchemaType.KEYWORD),
             ]
             for field_name, schema_type in index_fields:
                 try:
@@ -496,7 +521,125 @@ class QdrantVectorStore:
         except Exception as e:
             logger.error(f"❌ 删除记忆失败: {e}")
             raise
+
+    def delete_by_filter(self, where: Dict[str, Any]) -> bool:
+        """按 payload 过滤条件删除向量。"""
+        try:
+            if not where:
+                logger.warning("⚠️ delete_by_filter 缺少过滤条件，已拒绝执行")
+                return False
+
+            conditions = []
+            for key, value in where.items():
+                if isinstance(value, (str, int, float, bool)):
+                    conditions.append(
+                        FieldCondition(
+                            key=key,
+                            match=MatchValue(value=value),
+                        )
+                    )
+
+            if not conditions:
+                logger.warning("⚠️ delete_by_filter 没有有效过滤条件，已拒绝执行")
+                return False
+
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=models.FilterSelector(filter=Filter(must=conditions)),
+                wait=True,
+            )
+            logger.info("✅ 成功按过滤条件删除Qdrant向量: %s", where)
+            return True
+        except Exception as e:
+            logger.error("❌ 按过滤条件删除向量失败: %s", e)
+            return False
+
+    def clear_namespace(self, namespace: str) -> bool:
+        """仅清空指定 RAG 命名空间的数据，避免误删同集合中其他 namespace。"""
+        if not namespace or not str(namespace).strip():
+            logger.warning("⚠️ clear_namespace 缺少 namespace，已拒绝执行")
+            return False
+        return self.delete_by_filter({
+            "memory_type": "rag_chunk",
+            "is_rag_data": True,
+            "data_source": "rag_pipeline",
+            "rag_namespace": str(namespace).strip(),
+        })
     
+    def get_document_list(self, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
+        """使用 scroll API 遍历 RAG chunk，按 source_path 聚合文档信息。
+
+        Args:
+            namespace: 可选，限定 RAG 命名空间（默认扫描全部）
+
+        Returns:
+            List[Dict]: 每个文档包含 source_path、chunk_count、first_content 等信息
+        """
+        try:
+            must_conditions = [
+                FieldCondition(
+                    key="memory_type",
+                    match=MatchValue(value="rag_chunk"),
+                ),
+                FieldCondition(
+                    key="is_rag_data",
+                    match=MatchValue(value=True),
+                ),
+            ]
+            if namespace and str(namespace).strip():
+                must_conditions.append(
+                    FieldCondition(
+                        key="rag_namespace",
+                        match=MatchValue(value=str(namespace).strip()),
+                    )
+                )
+
+            scroll_filter = Filter(must=must_conditions)
+
+            # 按 source_path 聚合
+            doc_map: Dict[str, Dict[str, Any]] = {}
+            offset = None
+
+            while True:
+                points, next_offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=scroll_filter,
+                    limit=100,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if not points:
+                    break
+
+                for point in points:
+                    payload = point.payload or {}
+                    source = payload.get("source_path", "")
+                    if not source:
+                        continue
+                    if source not in doc_map:
+                        doc_map[source] = {
+                            "source_path": source,
+                            "chunk_count": 0,
+                            "first_content": "",
+                            "rag_namespace": payload.get("rag_namespace", "default"),
+                        }
+                    doc_map[source]["chunk_count"] += 1
+                    if not doc_map[source]["first_content"] and payload.get("content"):
+                        doc_map[source]["first_content"] = payload["content"][:200]
+
+                offset = next_offset
+                if not offset:
+                    break
+
+            documents = sorted(doc_map.values(), key=lambda d: d["source_path"])
+            logger.info("get_document_list: 扫描到 %s 篇文档", len(documents))
+            return documents
+
+        except Exception as e:
+            logger.error("获取文档列表失败: %s", e)
+            return []
+
     def get_collection_info(self) -> Dict[str, Any]:
         """
         获取集合信息

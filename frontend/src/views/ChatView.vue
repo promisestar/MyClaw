@@ -473,6 +473,28 @@ watch(
   }
 )
 
+// 监听 doc 参数（从知识库页面跳转，将文档路径插入输入框）
+watch(
+  () => route.query.doc,
+  (newDoc) => {
+    if (newDoc && typeof newDoc === 'string' && newDoc.trim()) {
+      const docPath = newDoc.trim()
+      const fileName = docPath.replace(/\\/g, '/').split('/').pop() || docPath
+      const line = `[知识库文档: ${fileName}](${docPath})`
+      if (inputMessage.value.trim()) {
+        inputMessage.value = `${inputMessage.value.trim()}\n${line}`
+      } else {
+        inputMessage.value = line
+      }
+      // 清除 URL 中的 doc 参数
+      const currentQuery = { ...route.query }
+      delete currentQuery.doc
+      router.replace({ query: currentQuery })
+    }
+  },
+  { immediate: true }
+)
+
 // 组件挂载时初始化会话
 onMounted(async () => {
   await initSession()

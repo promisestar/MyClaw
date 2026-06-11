@@ -82,6 +82,7 @@ class ExternalSoftwareReceiver:
         self._lock = agent_lock or asyncio.Lock()
         self._processed_message_ids: "OrderedDict[str, None]" = OrderedDict()
         self._cfg = load_external_bridge_config()
+        self._connection_warned = False
 
     def _is_allowed(self, sender_id: str) -> bool:
         if not self._cfg.allow_from:
@@ -212,7 +213,9 @@ class ExternalSoftwareReceiver:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"外部桥接连接/运行失败：{e}（{backoff_s} 秒后重连）")
+                if not self._connection_warned:
+                    logger.warning(f"外部桥接连接/运行失败：{e}（{backoff_s} 秒后重连）")
+                    self._connection_warned = True
                 self._ws = None
                 await asyncio.sleep(backoff_s)
                 backoff_s = min(backoff_s * 2, 30.0)

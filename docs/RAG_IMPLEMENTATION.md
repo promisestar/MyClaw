@@ -356,3 +356,230 @@ flowchart TD
 - `search` -> `pipeline.search` 或 `pipeline.search_advanced`
 - `ask` -> 先检索 chunk，再拼接上下文给 LLM 生成回答
 
+---
+
+## 10. 检索后处理流水线：提升精度的多层策略
+
+检索返回的 top-K 结果只是按向量相似度排序的原始 chunk 列表，直接交给 LLM 使用时存在以下问题：
+
+- 同一文档的多个片段重复出现，挤占上下文预算
+- 语义相似但结构上孤立（缺失前后文）
+- 向量相似度 ≠ 真正相关性
+
+为此 pipeline 提供了一套可组合的后处理流水线，每一层聚焦一个维度的质量提升。
+
+整体流程如下：
+
+```mermaid
+flowchart TD
+    A["向量检索结果（merged top-K）"] --> B["rerank_with_cross_encoder"]
+    B --> C["compute_graph_signals_from_pool"]
+    C --> D["rank（向量分 + 图信号分）"]
+    D --> E["compress_ranked_items"]
+    E --> F["expand_neighbors_from_pool（可选）"]
+    F --> G["merge_snippets_grouped / merge_snippets"]
+    G --> H["tldr_summarize（可选）"]
+    H --> I["最终返回给用户的文本块"]
+```
+
+---
+
+### 10.1 Cross-Encoder 重排序（`rerank_with_cross_encoder`）
+
+向量检索使用 Bi-Encoder（query 和 document 独立编码再算余弦距离），效率高但精度有限。Cross-Encoder 将 `(query, document)` 拼接后一次性输入模型，输出相关性分数，精度更高但更慢。
+
+**核心逻辑**：
+
+```python
+def rerank_with_cross_encoder(query, items, top_k=10):
+    ce = get_cross_encoder()  # 全局单例，通过环境变量 RERANK_MODEL_NAME 配置
+    if ce is None:            # 不可用时自动回退到原始向量排序
+        return items[:top_k]
+    pairs = [[query, it["content"]] for it in items]  # (query, doc) 对
+    scores = ce.predict(pairs)                         # Cross-Encoder 打分
+    for it, s in zip(items, scores):
+        it["rerank_score"] = float(s)
+    items.sort(key=lambda x: x.get("rerank_score", x.get("score", 0.0)), reverse=True)
+    return items[:top_k]
+```
+
+**与基础检索的关系**：
+- Cross-Encoder 仅对已召回的候选集做精排，不做全量扫描
+- 默认使用 `cross-encoder/ms-marco-MiniLM-L-6-v2`（轻量，适合重排序场景）
+- 通过环境变量 `RERANK_ENABLED=0` 可禁用，回退到纯向量排序
+
+**配置环境变量**：
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `RERANK_MODEL_NAME` | Cross-Encoder 模型名称 | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| `RERANK_ENABLED` | 设为 `0`/`false` 禁用 | 默认启用 |
+
+---
+
+### 10.2 图信号计算（`compute_graph_signals_from_pool`）
+
+向量检索只看语义相似度，忽略了文档的结构信息。该方法基于 chunk 的 payload 元数据计算两种信号：
+
+**信号 1：同文档密度（Same-Doc Density）**
+
+```python
+doc_counts = {doc_id: len(chunks) for doc_id, chunks in by_doc.items()}
+density = doc_counts[doc_id] / max_count  # 归一化到 [0, 1]
+```
+
+含义：同一文档被命中的 chunk 越多，该文档整体越相关。这缓解了"一个文档的多个段落都相关但每个单看分数一般"的问题。
+
+**信号 2：位置邻近度（Proximity）**
+
+```python
+for neighbor in 窗口范围内的同文档 chunk:
+    dist = abs(chunk_i.start - neighbor.start)
+    prox_acc += max(0, 1.0 - dist / proximity_window_chars)
+```
+
+含义：同一文档中物理位置接近的 chunk 互相增强。如果向量检索命中了文档中连续多个段落，它们在答案中应该被优先考虑。
+
+**权重公式**：
+
+```
+graph_signal[chunk] = same_doc_weight × density + proximity_weight × prox_acc
+```
+
+两个权重默认均为 `1.0`，最终信号归一化到 `[0, 1]`。
+
+---
+
+### 10.3 多信号融合排序（`rank`）
+
+将向量相似度分与图信号分加权融合：
+
+```python
+score = w_vector × vector_score + w_graph × graph_score
+       = 0.7        × 向量分数      + 0.3   × 图信号分数
+```
+
+默认权重 **7:3**，可调整以偏好语义匹配或结构信号。
+
+输出包含详细的分数明细，每个结果附加：
+
+```python
+{
+    "memory_id": "chunk_id",
+    "score": 0.85,       # 综合分
+    "vector_score": 0.82, # 向量相似度
+    "graph_score": 0.30,  # 图信号分
+    "content": "文本内容",
+    "metadata": {...}
+}
+```
+
+---
+
+### 10.4 结果压缩（`compress_ranked_items`）
+
+排序后的结果往往包含来自同一文档的大量重复片段，影响答案的多样性和 LLM 上下文的利用效率。压缩策略有两种：
+
+**策略 1：合并相邻片段**（`join_gap` 默认 200 字符）
+
+同一文档中位置间隔不超过 `join_gap` 的连续 chunk 自动拼接，形成一个完整段落：
+
+```python
+if start - prev_end <= join_gap and start >= prev_start:
+    merged_text = prev_content + "\n\n" + current_content
+```
+
+**策略 2：限制每文档条目数**（`max_per_doc` 默认 2）
+
+同一文档最多保留 `max_per_doc` 个非合并片段（优先保留高分数者）：
+
+```python
+if by_doc_count[did] >= max_per_doc:
+    continue  # 跳过该片段
+```
+
+**效果**：确保最终结果中不同来源都能被展示，避免单一文档独占上下文。
+
+---
+
+### 10.5 邻域上下文扩展（`expand_neighbors_from_pool`）
+
+向量检索召回的是语义最匹配的个别 chunk，但这些 chunk 往往缺少前后文。该方法基于 chunk 的 `start/end` 位置信息，从候选池中补充前后相邻的片段：
+
+```python
+for offset in range(1, neighbors + 1):
+    for j in (idx - offset, idx + offset):  # 向前、向后扩展
+        cand = pool[j]
+        if cand not in selected:
+            additions.append(cand)
+```
+
+**参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `neighbors` | 1 | 每条结果最多向两边各扩展 1 个邻居 |
+| `max_additions` | 5 | 全局最多新增 5 个片段 |
+
+**效果**：将孤立的"语义命中点"扩展为连续段落，帮助 LLM 理解上下文。
+
+---
+
+### 10.6 结果合并与引用（`merge_snippets` / `merge_snippets_grouped`）
+
+**简单合并**（`merge_snippets`）：
+
+按 `max_chars` 限制依次拼接，超出即截断。适合快速生成无引用需求的纯文本。
+
+**分组合并**（`merge_snippets_grouped`）：
+
+1. 按 `doc_id` 分组，组内按文档原始位置排序
+2. 组间按累计分数排序（高相关文档优先展示）
+3. 每条片段自动带 `[1]` `[2]` 引用编号
+4. 末尾输出含路径、位置、章节的 References 块
+
+输出格式：
+
+```text
+[片段内容 1] [1]
+
+[片段内容 2] [2]
+
+References:
+[1] /path/to/doc.pdf (0-300) – 第1章 概述
+[2] /path/to/doc.pdf (550-800) – 第1.1节 定义
+```
+
+---
+
+### 10.7 摘要生成（`tldr_summarize`）
+
+在输出过长或用户只需要点时，调用 LLM 将上下文压缩为要点列表：
+
+```python
+def tldr_summarize(text, bullets=3):
+    llm = HelloAgentsLLM()
+    prompt = "请将以下内容概括为简洁的要点列表..."
+    return llm.invoke(prompt)
+```
+
+**使用场景**：
+- 检索返回大量片段，超出 `max_chars` 限制
+- 用户问题为"帮我总结一下这个文档"
+- 作为最终答案的摘要前缀
+
+---
+
+### 10.8 当前使用状态与接入说明
+
+| 步骤 | 函数 | 当前状态 |
+|------|------|----------|
+| Cross-Encoder 重排 | `rerank_with_cross_encoder` | ✅ 已接入 `search_vectors_expanded`（第 921 行） |
+| 图信号 + 排序 | `compute_graph_signals_from_pool` + `rank` | ⚠️ 函数已就绪，但未接入主力检索链路 |
+| 结果压缩 | `compress_ranked_items` | ⚠️ 函数已就绪，但未接入主力检索链路 |
+| 邻域扩展 | `expand_neighbors_from_pool` | ⚠️ 函数已就绪，但未接入主力检索链路 |
+| 分组合并 | `merge_snippets_grouped` | ⚠️ 函数已就绪，但未接入主力检索链路 |
+| 摘要生成 | `tldr_summarize` | ⚠️ 函数已就绪，但未接入主力检索链路 |
+
+> **说明**：带 ⚠️ 标识的函数在 `pipeline.py` 中均已完整实现，但 `create_rag_pipeline()` 返回的高层接口和 `rag_tool.py` 的 `_ask()` / `_search()` 尚未串联这些步骤。若需提升检索精度，可在工具层的检索结果返回前依次调用这些后处理函数。
+

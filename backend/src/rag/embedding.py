@@ -15,11 +15,15 @@
 - EMBED_BASE_URL: Embedding Base URL（统一命名，可选）
 """
 
-from typing import List, Union, Optional, Tuple
+from typing import Any, List, Union, Optional, Tuple
+import logging
 import threading
 import os
 from pathlib import Path
 import numpy as np
+
+
+logger = logging.getLogger(__name__)
 
 
 def _env_flag(name: str) -> bool:
@@ -288,6 +292,65 @@ def refresh_embedder() -> EmbeddingModel:
     with _lock:
         _embedder = _build_embedder()
         return _embedder
+
+
+# ==================
+# Cross-Encoder Provider（单例，用于重排序）
+# ==================
+
+_cross_encoder: Optional[Any] = None
+
+
+def _build_cross_encoder() -> Optional[Any]:
+    """根据环境变量构建 CrossEncoder 实例。
+
+    环境变量：
+    - RERANK_MODEL_NAME: 模型名称（默认 cross-encoder/ms-marco-MiniLM-L-6-v2）
+    - RERANK_ENABLED: "0"/"false"/"no" 禁用重排序，跳过加载
+    """
+    if _env_flag("RERANK_ENABLED") is False:
+        # 注意：未设置该变量时默认启用，只有显式设 false 才禁用
+        if os.getenv("RERANK_ENABLED", "").strip().lower() in ("0", "false", "no", "off"):
+            return None
+
+    model_name = os.getenv("RERANK_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2").strip()
+    load_path, local_files_only = _resolve_local_model(model_name)
+
+    try:
+        from sentence_transformers import CrossEncoder
+
+        load_kwargs = {}
+        if local_files_only:
+            load_kwargs["local_files_only"] = True
+        ce = CrossEncoder(load_path, **load_kwargs)
+        return ce
+    except Exception:
+        logger.warning(
+            "CrossEncoder 加载失败（sentence_transformers 不可用），重排序将不可用，回退到纯向量排序"
+        )
+        return None
+
+
+def get_cross_encoder() -> Optional[Any]:
+    """获取全局共享的 CrossEncoder 实例（线程安全单例）。
+
+    返回 None 表示 CrossEncoder 不可用，调用方应回退到仅向量排序。
+    """
+    global _cross_encoder, _lock
+    if _cross_encoder is not None:
+        return _cross_encoder
+    with _lock:
+        if _cross_encoder is None:
+            _cross_encoder = _build_cross_encoder()
+        return _cross_encoder
+
+
+def refresh_cross_encoder() -> Optional[Any]:
+    """强制重建 CrossEncoder 实例。"""
+    global _cross_encoder
+    with _lock:
+        _cross_encoder = _build_cross_encoder()
+        return _cross_encoder
 
 
 if __name__ == "__main__":

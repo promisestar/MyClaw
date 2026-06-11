@@ -1,6 +1,6 @@
 """RAG工具 - 检索增强生成
 
-为HelloAgents框架提供简洁易用的RAG能力：
+为MyClaw提供简洁易用的RAG能力：
 - 🔄 数据流程：用户数据 → 文档解析 → 向量化存储 → 智能检索 → LLM增强问答
 - 📚 多格式支持：PDF、Word、Excel、PPT、图片、音频、网页等
 - 🧠 智能问答：自动检索相关内容，注入提示词，生成准确答案
@@ -20,13 +20,21 @@ answer = resp.text
 ```
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+import hashlib
+import logging
 import os
+import re
+import tempfile
 import time
 
 from hello_agents.tools import Tool, ToolParameter, tool_action, ToolResponse, ToolErrorCode
 from ...rag.pipeline import create_rag_pipeline
+from ...rag.qdrant_store import QdrantConnectionManager
 from hello_agents.core.llm import HelloAgentsLLM
+
+
+logger = logging.getLogger(__name__)
 
 
 def _rag_response_from_text(msg: str) -> ToolResponse:
@@ -66,8 +74,8 @@ class RAGTool(Tool):
     def __init__(
         self,
         knowledge_base_path: str = "./knowledge_base",
-        qdrant_url: str = None,
-        qdrant_api_key: str = None,
+        qdrant_url: Optional[str] = None,
+        qdrant_api_key: Optional[str] = None,
         collection_name: str = "rag_knowledge_base",
         rag_namespace: str = "default",
         expandable: bool = False,
@@ -77,11 +85,12 @@ class RAGTool(Tool):
             name="rag",
             description=(
                 "管理用户已入库私有文档的知识库：向量化入库、语义检索与 LLM 问答。"
-                "用于：用户上传/提供的 PDF、笔记等资料；问「资料里写了什么」类问题。"
-                "action 选法：入库文件→add_document | 纯文本→add_text | 综合问答→ask | "
-                "原文片段→search | 排查空库→stats | 用户明确要求清空→clear(confirm=true)。"
-                "勿查公开网页（用 web_search）；未入库内容须先 add_document/add_text。"
-                "file_path 相对路径相对于工作空间根（如 uploads/），非进程 CWD。"
+                "此工具不具备联网能力，无法访问互联网！"
+                "用于：用户上传/提供的 PDF、笔记等资料；问「资料里写了什么」、『帮我总结一下文档』类问题。"
+                "用户上传了文件，并要求基于该文件进行对话时。"
+                "需要确认知识库中是否有某份文件时（使用 stats）。"
+                "严禁用于查询公开网页、新闻、实时信息（此类请求必须使用 web_search 工具）。"
+                "严禁假设内容已在库中；如果用户提到了新话题，必须先调用 add_document 或 add_text 入库。"
             ),
             expandable=expandable
         )
@@ -121,12 +130,12 @@ class RAGTool(Tool):
             self.llm = HelloAgentsLLM()
 
             self.initialized = True
-            print(f"✅ RAG工具初始化成功: namespace={self.rag_namespace}, collection={self.collection_name}")
+            logger.info("RAG工具初始化成功: namespace=%s, collection=%s", self.rag_namespace, self.collection_name)
             
         except Exception as e:
             self.initialized = False
             self.init_error = str(e)
-            print(f"❌ RAG工具初始化失败: {e}")
+            logger.exception("RAG工具初始化失败")
 
     def _resolve_document_path(self, file_path: str) -> str:
         """将用户给出的路径解析为磁盘绝对路径；相对路径相对工作空间根。"""
@@ -139,9 +148,86 @@ class RAGTool(Tool):
             return os.path.normpath(os.path.join(self._workspace_root, p))
         return os.path.normpath(os.path.expanduser(p))
 
+    def _normalize_namespace(self, namespace: Optional[str] = None) -> str:
+        """规范化命名空间，避免空字符串导致缓存键不一致。"""
+        return (str(namespace).strip() if namespace else self.rag_namespace) or self.rag_namespace
+
+    @staticmethod
+    def _stable_text_document_id(text: str) -> str:
+        """基于文本内容生成稳定文档 ID，避免 Python hash 随进程变化。"""
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        return f"text_{digest}"
+
+    @staticmethod
+    def _safe_filename_stem(value: str) -> str:
+        """将外部传入的 document_id 转为安全文件名前缀。"""
+        stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(value or "text")).strip("._")
+        return stem[:80] or "text"
+
+    def _write_temp_text_document(self, text: str, document_id: str) -> str:
+        """写入临时 Markdown 文件，供统一文档入库流程复用。"""
+        os.makedirs(self.knowledge_base_path, exist_ok=True)
+        safe_id = self._safe_filename_stem(document_id)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".md",
+            prefix=f"{safe_id}_",
+            dir=self.knowledge_base_path,
+            delete=False,
+        ) as tmp:
+            tmp.write(text)
+            return tmp.name
+
+    def _index_text_document(
+        self,
+        text: str,
+        document_id: Optional[str] = None,
+        namespace: str = "default",
+        chunk_size: int = 800,
+        chunk_overlap: int = 100,
+    ) -> Tuple[int, int, str]:
+        """将纯文本写临时文件并入库，返回分块数、耗时与最终文档 ID。"""
+        final_document_id = document_id or self._stable_text_document_id(text)
+        tmp_path = self._write_temp_text_document(text, final_document_id)
+        try:
+            pipeline = self._get_pipeline(namespace)
+            t0 = time.time()
+            chunks_added = pipeline["add_documents"](
+                file_paths=[tmp_path],
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            process_ms = int((time.time() - t0) * 1000)
+            return chunks_added, process_ms, final_document_id
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                logger.warning("清理 RAG 临时文本文件失败: %s", tmp_path, exc_info=True)
+
+    @staticmethod
+    def _clean_text(text: Any) -> str:
+        """安全转字符串并过滤非法 Unicode。"""
+        try:
+            return str(text).encode("utf-8", errors="ignore").decode("utf-8")
+        except Exception:
+            return str(text)
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int, suffix: str = "...") -> str:
+        """按字符上限截断文本，避免负数和重复省略号。"""
+        if max_chars <= 0:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        keep = max(0, max_chars - len(suffix))
+        return text[:keep].rstrip() + suffix
+
     def _get_pipeline(self, namespace: Optional[str] = None) -> Dict[str, Any]:
-        """获取指定命名空间的 RAG 管道，若不存在则自动创建"""
-        target_ns = namespace or self.rag_namespace
+        """获取指定命名空间的 RAG 管道，若不存在则自动创建。"""
+        target_ns = self._normalize_namespace(namespace)
         if target_ns in self._pipelines:
             return self._pipelines[target_ns]
 
@@ -152,6 +238,7 @@ class RAGTool(Tool):
             rag_namespace=target_ns
         )
         self._pipelines[target_ns] = pipeline
+        logger.info("创建 RAG pipeline: namespace=%s, collection=%s", target_ns, self.collection_name)
         return pipeline
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
@@ -209,6 +296,7 @@ class RAGTool(Tool):
                         include_citations=parameters.get("include_citations", True),
                         max_chars=parameters.get("max_chars", 1200),
                         namespace=parameters.get("namespace", "default"),
+                        debug=parameters.get("debug", False),
                     )
                 )
             elif action == "search":
@@ -352,6 +440,13 @@ class RAGTool(Tool):
                 default=100,
             ),
             ToolParameter(
+                name="debug",
+                type="boolean",
+                description="ask 可选。是否在回答中展示检索、生成耗时与平均相似度，默认 false",
+                required=False,
+                default=False,
+            ),
+            ToolParameter(
                 name="confirm",
                 type="boolean",
                 description="clear 必填且须为 true。未传或为 false 时仅返回警告，不执行清空",
@@ -370,7 +465,7 @@ class RAGTool(Tool):
     def _add_document(
         self,
         file_path: str,
-        document_id: str = None,
+        document_id: Optional[str] = None,
         namespace: str = "default",
         chunk_size: int = 800,
         chunk_overlap: int = 100
@@ -388,14 +483,17 @@ class RAGTool(Tool):
             执行结果
         """
         try:
+            if document_id:
+                logger.debug("add_document 当前由文件路径生成文档标识，忽略外部 document_id=%s", document_id)
             if not file_path:
                 return f"❌ 文件不存在: {file_path}"
             resolved = self._resolve_document_path(file_path)
             if not os.path.exists(resolved):
                 return f"❌ 文件不存在: {resolved}"
             display_name = os.path.basename(resolved)
+            target_ns = self._normalize_namespace(namespace)
 
-            pipeline = self._get_pipeline(namespace)
+            pipeline = self._get_pipeline(target_ns)
             t0 = time.time()
 
             chunks_added = pipeline["add_documents"](
@@ -404,8 +502,7 @@ class RAGTool(Tool):
                 chunk_overlap=chunk_overlap
             )
             
-            t1 = time.time()
-            process_ms = int((t1 - t0) * 1000)
+            process_ms = int((time.time() - t0) * 1000)
             
             if chunks_added == 0:
                 return f"⚠️ 未能从文件解析内容: {display_name}"
@@ -414,10 +511,11 @@ class RAGTool(Tool):
                 f"✅ 文档已添加到知识库: {display_name}\n"
                 f"📊 分块数量: {chunks_added}\n"
                 f"⏱️ 处理时间: {process_ms}ms\n"
-                f"📝 命名空间: {pipeline.get('namespace', self.rag_namespace)}"
+                f"📝 命名空间: {target_ns}"
             )
             
         except Exception as e:
+            logger.exception("添加文档失败")
             return f"❌ 添加文档失败: {str(e)}"
     
     @tool_action(
@@ -429,7 +527,7 @@ class RAGTool(Tool):
     def _add_text(
         self,
         text: str,
-        document_id: str = None,
+        document_id: Optional[str] = None,
         namespace: str = "default",
         chunk_size: int = 800,
         chunk_overlap: int = 100
@@ -446,50 +544,31 @@ class RAGTool(Tool):
         Returns:
             执行结果
         """
-        metadata = None
         try:
             if not text or not text.strip():
                 return "❌ 文本内容不能为空"
-            
-            # 创建临时文件
-            document_id = document_id or f"text_{abs(hash(text)) % 100000}"
-            tmp_path = os.path.join(self.knowledge_base_path, f"{document_id}.md")
-            
-            try:
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    f.write(text)
-                
-                pipeline = self._get_pipeline(namespace)
-                t0 = time.time()
 
-                chunks_added = pipeline["add_documents"](
-                    file_paths=[tmp_path],
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap
-                )
-                
-                t1 = time.time()
-                process_ms = int((t1 - t0) * 1000)
-                
-                if chunks_added == 0:
-                    return f"⚠️ 未能从文本生成有效分块"
-                
-                return (
-                    f"✅ 文本已添加到知识库: {document_id}\n"
-                    f"📊 分块数量: {chunks_added}\n"
-                    f"⏱️ 处理时间: {process_ms}ms\n"
-                    f"📝 命名空间: {pipeline.get('namespace', self.rag_namespace)}"
-                )
-                
-            finally:
-                # 清理临时文件
-                try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
+            target_ns = self._normalize_namespace(namespace)
+            chunks_added, process_ms, final_document_id = self._index_text_document(
+                text=text,
+                document_id=document_id,
+                namespace=target_ns,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            
+            if chunks_added == 0:
+                return "⚠️ 未能从文本生成有效分块"
+            
+            return (
+                f"✅ 文本已添加到知识库: {final_document_id}\n"
+                f"📊 分块数量: {chunks_added}\n"
+                f"⏱️ 处理时间: {process_ms}ms\n"
+                f"📝 命名空间: {target_ns}"
+            )
             
         except Exception as e:
+            logger.exception("添加文本失败")
             return f"❌ 添加文本失败: {str(e)}"
     
     @tool_action(
@@ -526,13 +605,14 @@ class RAGTool(Tool):
         try:
             if not query or not query.strip():
                 return "❌ 搜索查询不能为空"
-            
-            # 使用统一 RAG 管道搜索
-            pipeline = self._get_pipeline(namespace)
+
+            query_text = query.strip()
+            target_ns = self._normalize_namespace(namespace)
+            pipeline = self._get_pipeline(target_ns)
 
             if enable_advanced_search:
                 results = pipeline["search_advanced"](
-                    query=query,
+                    query=query_text,
                     top_k=limit,
                     enable_mqe=True,
                     enable_hyde=True,
@@ -540,42 +620,39 @@ class RAGTool(Tool):
                 )
             else:
                 results = pipeline["search"](
-                    query=query,
+                    query=query_text,
                     top_k=limit,
                     score_threshold=min_score if min_score > 0 else None
                 )
             
             if not results:
-                return f"🔍 未找到与 '{query}' 相关的内容"
+                return f"🔍 未找到与 '{query_text}' 相关的内容"
             
-            # 格式化搜索结果
             search_result = ["搜索结果："]
+            remaining_chars = max(0, int(max_chars or 0))
+            total_results = len(results)
             for i, result in enumerate(results, 1):
                 meta = result.get("metadata", {})
                 score = result.get("score", 0.0)
-                content = meta.get("content", "")[:200] + "..."
-                source = meta.get("source_path", "unknown")
+                source = self._clean_text(meta.get("source_path", "unknown"))
+                raw_content = self._clean_text(meta.get("content", "")).strip()
+                results_left = max(1, total_results - i + 1)
+                item_budget = max(80, remaining_chars // results_left) if remaining_chars else 0
+                content = self._truncate_text(raw_content, item_budget) if item_budget else ""
+                remaining_chars = max(0, remaining_chars - len(content))
                 
-                # 安全处理Unicode
-                def clean_text(text):
-                    try:
-                        return str(text).encode('utf-8', errors='ignore').decode('utf-8')
-                    except Exception:
-                        return str(text)
-                
-                clean_content = clean_text(content)
-                clean_source = clean_text(source)
-                
-                search_result.append(f"\n{i}. 文档: **{clean_source}** (相似度: {score:.3f})")
-                search_result.append(f"   {clean_content}")
+                search_result.append(f"\n{i}. 文档: **{source}** (相似度: {score:.3f})")
+                if content:
+                    search_result.append(f"   {content}")
                 
                 if include_citations and meta.get("heading_path"):
-                    clean_heading = clean_text(str(meta['heading_path']))
+                    clean_heading = self._clean_text(meta["heading_path"])
                     search_result.append(f"   章节: {clean_heading}")
             
             return "\n".join(search_result)
             
         except Exception as e:
+            logger.exception("搜索知识库失败")
             return f"❌ 搜索失败: {str(e)}"
     
     @tool_action(
@@ -592,7 +669,8 @@ class RAGTool(Tool):
         enable_advanced_search: bool = True,
         include_citations: bool = True,
         max_chars: int = 1200,
-        namespace: str = "default"
+        namespace: str = "default",
+        debug: bool = False,
     ) -> str:
         """智能问答：检索 → 上下文注入 → LLM生成答案
 
@@ -603,6 +681,7 @@ class RAGTool(Tool):
             include_citations: 是否在答案后附参考来源，默认 true
             max_chars: 注入 LLM 的上下文总字符上限，默认 1200
             namespace: 知识库命名空间，默认 default
+            debug: 是否在答案中附加检索/生成性能信息
 
         Returns:
             智能问答结果
@@ -613,10 +692,11 @@ class RAGTool(Tool):
                 return "❌ 请提供要询问的问题"
 
             user_question = question.strip()
-            print(f"🔍 智能问答: {user_question}")
+            target_ns = self._normalize_namespace(namespace)
+            logger.info("RAG智能问答: namespace=%s, question=%s", target_ns, user_question)
             
             # 1. 检索相关内容
-            pipeline = self._get_pipeline(namespace)
+            pipeline = self._get_pipeline(target_ns)
             search_start = time.time()
             
             if enable_advanced_search:
@@ -682,14 +762,35 @@ class RAGTool(Tool):
                 {"role": "user", "content": user_prompt}
             ]
             
-            # 5. 调用 LLM 生成答案
+            # 5. 调用 LLM 生成答案；失败时退化为检索片段返回
             llm_start = time.time()
-            answer = self.llm.invoke(enhanced_prompt)
-            answer = str(answer)
+            try:
+                answer = self.llm.invoke(enhanced_prompt)
+                answer = str(answer)
+            except Exception as llm_error:
+                llm_time = int((time.time() - llm_start) * 1000)
+                logger.warning("RAG LLM 生成失败，退化为检索结果: %s", llm_error, exc_info=True)
+                return self._format_llm_fallback_answer(
+                    question=user_question,
+                    context=context,
+                    citations=citations if include_citations else None,
+                    search_time=search_time,
+                    llm_time=llm_time,
+                    avg_score=total_score / len(results) if results else 0,
+                    debug=debug,
+                )
             llm_time = int((time.time() - llm_start) * 1000)
             
             if not answer or not answer.strip():
-                return "❌ LLM未能生成有效答案，请稍后重试"
+                return self._format_llm_fallback_answer(
+                    question=user_question,
+                    context=context,
+                    citations=citations if include_citations else None,
+                    search_time=search_time,
+                    llm_time=llm_time,
+                    avg_score=total_score / len(results) if results else 0,
+                    debug=debug,
+                )
             
             # 6. 构建最终回答
             final_answer = self._format_final_answer(
@@ -698,25 +799,37 @@ class RAGTool(Tool):
                 citations=citations if include_citations else None,
                 search_time=search_time,
                 llm_time=llm_time,
-                avg_score=total_score / len(results) if results else 0
+                avg_score=total_score / len(results) if results else 0,
+                debug=debug,
             )
             
             return final_answer
             
         except Exception as e:
+            logger.exception("智能问答失败")
             return f"❌ 智能问答失败: {str(e)}\n💡 请检查知识库状态或稍后重试"
     
     def _clean_content_for_context(self, content: str) -> str:
-        """清理内容用于上下文"""
-        # 移除过多的换行和空格
-        content = " ".join(content.split())
-        # 截断过长内容
-        if len(content) > 300:
-            content = content[:300] + "..."
-        return content
+        """清理内容用于上下文，尽量保留 Markdown 段落、列表和表格结构。"""
+        cleaned_lines = []
+        previous_blank = False
+        for raw_line in self._clean_text(content).splitlines():
+            line = re.sub(r"[ \t]+", " ", raw_line).strip()
+            if not line:
+                if not previous_blank:
+                    cleaned_lines.append("")
+                previous_blank = True
+                continue
+            cleaned_lines.append(line)
+            previous_blank = False
+
+        cleaned = "\n".join(cleaned_lines).strip()
+        return self._truncate_text(cleaned, 500)
     
     def _smart_truncate_context(self, context: str, max_chars: int) -> str:
         """智能截断上下文，保持段落完整性"""
+        if max_chars <= 0:
+            return ""
         if len(context) <= max_chars:
             return context
         
@@ -726,8 +839,7 @@ class RAGTool(Tool):
         
         if last_break > max_chars * 0.7:  # 如果断点位置合理
             return truncated[:last_break] + "\n\n[...更多内容被截断]"
-        else:
-            return truncated[:max_chars-20] + "...[内容被截断]"
+        return self._truncate_text(truncated, max_chars, suffix="...[内容被截断]")
     
     def _build_system_prompt(self) -> str:
         """构建系统提示词"""
@@ -754,9 +866,19 @@ class RAGTool(Tool):
             f"【要求】请提供准确、有帮助的回答。如果上下文信息不足，请说明需要什么额外信息。"
         )
     
-    def _format_final_answer(self, question: str, answer: str, citations: Optional[List[Dict]] = None, search_time: int = 0, llm_time: int = 0, avg_score: float = 0) -> str:
-        """格式化最终答案"""
-        result = [f"🤖 **智能问答结果**\n"]
+    def _format_final_answer(
+        self,
+        question: str,
+        answer: str,
+        citations: Optional[List[Dict]] = None,
+        search_time: int = 0,
+        llm_time: int = 0,
+        avg_score: float = 0,
+        debug: bool = False,
+    ) -> str:
+        """格式化最终答案。"""
+        _ = question
+        result = ["🤖 **智能问答结果**\n"]
         result.append(answer)
         
         if citations:
@@ -765,10 +887,35 @@ class RAGTool(Tool):
                 score_emoji = "🟢" if citation["score"] > 0.8 else "🟡" if citation["score"] > 0.6 else "🔵"
                 result.append(f"{score_emoji} [{citation['index']}] {citation['source']} (相似度: {citation['score']:.3f})")
         
-        # 添加性能信息（调试模式）
-        result.append(f"\n⚡ 检索: {search_time}ms | 生成: {llm_time}ms | 平均相似度: {avg_score:.3f}")
+        if debug:
+            result.append(f"\n⚡ 检索: {search_time}ms | 生成: {llm_time}ms | 平均相似度: {avg_score:.3f}")
         
         return "\n".join(result)
+
+    def _format_llm_fallback_answer(
+        self,
+        question: str,
+        context: str,
+        citations: Optional[List[Dict]] = None,
+        search_time: int = 0,
+        llm_time: int = 0,
+        avg_score: float = 0,
+        debug: bool = False,
+    ) -> str:
+        """LLM 不可用时返回检索上下文，避免丢失已召回的信息。"""
+        fallback_text = (
+            "⚠️ LLM 暂时未能生成综合答案，以下为知识库中检索到的相关片段：\n\n"
+            f"{context or '（无可展示上下文）'}"
+        )
+        return self._format_final_answer(
+            question=question,
+            answer=fallback_text,
+            citations=citations,
+            search_time=search_time,
+            llm_time=llm_time,
+            avg_score=avg_score,
+            debug=debug,
+        )
 
     @tool_action(
         "rag_clear",
@@ -796,21 +943,20 @@ class RAGTool(Tool):
             pipeline = self._get_pipeline(namespace)
             store = pipeline.get("store")
             namespace_id = pipeline.get("namespace", self.rag_namespace)
-            success = store.clear_collection() if store else False
+            if store and hasattr(store, "clear_namespace"):
+                success = store.clear_namespace(namespace_id)
+            else:
+                success = store.clear_collection() if store else False
             
             if success:
-                # 重新初始化该命名空间
-                self._pipelines[namespace_id] = create_rag_pipeline(
-                    qdrant_url=self.qdrant_url,
-                    qdrant_api_key=self.qdrant_api_key,
-                    collection_name=self.collection_name,
-                    rag_namespace=namespace_id
-                )
+                # 清理该命名空间 pipeline 缓存，下次访问自动重建
+                self._pipelines.pop(namespace_id, None)
                 return f"✅ 知识库已成功清空（命名空间：{namespace_id}）"
             else:
                 return "❌ 清空知识库失败"
             
         except Exception as e:
+            logger.exception("清空知识库失败")
             return f"❌ 清空知识库失败: {str(e)}"
 
     @tool_action(
@@ -829,14 +975,16 @@ class RAGTool(Tool):
             统计信息
         """
         try:
-            pipeline = self._get_pipeline(namespace)
+            target_ns = self._normalize_namespace(namespace)
+            pipeline = self._get_pipeline(target_ns)
             stats = pipeline["get_stats"]()
             
             stats_info = [
                 "📊 **RAG 知识库统计**",
-                f"📝 命名空间: {pipeline.get('namespace', self.rag_namespace)}",
+                f"📝 命名空间: {pipeline.get('namespace', target_ns)}",
                 f"📋 集合名称: {self.collection_name}",
-                f"📂 存储根路径: {self.knowledge_base_path}"
+                f"📂 存储根路径: {self.knowledge_base_path}",
+                f"🗂️ 已加载命名空间: {', '.join(sorted(self._pipelines.keys())) or '无'}"
             ]
             
             # 添加存储统计
@@ -874,6 +1022,7 @@ class RAGTool(Tool):
             return "\n".join(stats_info)
             
         except Exception as e:
+            logger.exception("获取 RAG 统计信息失败")
             return f"❌ 获取统计信息失败: {str(e)}"
 
     def get_relevant_context(self, query: str, limit: int = 3, max_chars: int = 1200, namespace: Optional[str] = None) -> str:
@@ -914,7 +1063,7 @@ class RAGTool(Tool):
             return f"获取上下文失败: {str(e)}"
     
     def batch_add_texts(self, texts: List[str], document_ids: Optional[List[str]] = None, chunk_size: int = 800, chunk_overlap: int = 100, namespace: Optional[str] = None) -> str:
-        """批量添加文本"""
+        """批量添加文本。"""
         try:
             if not texts:
                 return "❌ 文本列表不能为空"
@@ -922,82 +1071,81 @@ class RAGTool(Tool):
             if document_ids and len(document_ids) != len(texts):
                 return "❌ 文本数量和文档ID数量不匹配"
             
-            pipeline = self._get_pipeline(namespace)
+            target_ns = self._normalize_namespace(namespace)
             t0 = time.time()
-            
             total_chunks = 0
             successful_files = []
+            failed_files = []
             
             for i, text in enumerate(texts):
                 if not text or not text.strip():
                     continue
                     
-                doc_id = document_ids[i] if document_ids else f"batch_text_{i}"
-                tmp_path = os.path.join(self.knowledge_base_path, f"{doc_id}.md")
-                
+                doc_id = document_ids[i] if document_ids else self._stable_text_document_id(text)
                 try:
-                    with open(tmp_path, 'w', encoding='utf-8') as f:
-                        f.write(text)
-                    
-                    chunks_added = pipeline["add_documents"](
-                        file_paths=[tmp_path],
+                    chunks_added, _, final_doc_id = self._index_text_document(
+                        text=text,
+                        document_id=doc_id,
+                        namespace=target_ns,
                         chunk_size=chunk_size,
-                        chunk_overlap=chunk_overlap
+                        chunk_overlap=chunk_overlap,
                     )
-                    
                     total_chunks += chunks_added
-                    successful_files.append(doc_id)
-                    
-                finally:
-                    # 清理临时文件
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
+                    if chunks_added > 0:
+                        successful_files.append(final_doc_id)
+                    else:
+                        failed_files.append(f"{final_doc_id}: 未生成有效分块")
+                except Exception as item_error:
+                    failed_files.append(f"{doc_id}: {item_error}")
+                    logger.warning("批量添加文本项失败: %s", doc_id, exc_info=True)
             
-            t1 = time.time()
-            process_ms = int((t1 - t0) * 1000)
-            
-            return (
-                f"✅ 批量添加完成\n"
-                f"📊 成功文件: {len(successful_files)}/{len(texts)}\n"
-                f"📊 总分块数: {total_chunks}\n"
-                f"⏱️ 处理时间: {process_ms}ms"
-            )
+            process_ms = int((time.time() - t0) * 1000)
+            result = [
+                "✅ 批量添加完成",
+                f"📊 成功文件: {len(successful_files)}/{len(texts)}",
+                f"📊 总分块数: {total_chunks}",
+                f"⏱️ 处理时间: {process_ms}ms",
+                f"📝 命名空间: {target_ns}",
+            ]
+            if failed_files:
+                result.append(f"❌ 失败: {len(failed_files)} 个文本")
+                result.extend(failed_files)
+            return "\n".join(result)
             
         except Exception as e:
+            logger.exception("批量添加文本失败")
             return f"❌ 批量添加失败: {str(e)}"
     
-    def clear_all_namespaces(self) -> str:
-        """清空当前工具管理的所有命名空间数据"""
+    def clear_all_namespaces(self, confirm: bool = False) -> str:
+        """清空当前工具管理的所有命名空间数据。"""
+        if not confirm:
+            return (
+                "⚠️ 危险操作：清空所有命名空间将删除当前集合中的全部 RAG 数据！\n"
+                "请传入 confirm=True 确认执行。"
+            )
+
         try:
-            for ns, pipeline in self._pipelines.items():
+            for ns, pipeline in list(self._pipelines.items()):
                 store = pipeline.get("store")
                 if store:
-                    store.clear_collection()
+                    logger.warning("清空 RAG 命名空间: %s", ns)
+                    if hasattr(store, "clear_namespace"):
+                        store.clear_namespace(ns)
+                    else:
+                        store.clear_collection()
             self._pipelines.clear()
-            # 重新初始化默认命名空间
             self._init_components()
-            return "✅ 所有命名空间数据已清空并重新初始化"
+            return "✅ 所有已加载命名空间数据已清空并重新初始化"
         except Exception as e:
+            logger.exception("清空所有命名空间失败")
             return f"❌ 清空所有命名空间失败: {str(e)}"
 
     def shutdown(self) -> None:
         """关闭 RAG 相关连接并释放资源。"""
-        # 关闭各命名空间下的 Qdrant 客户端连接
-        for _, pipeline in list(self._pipelines.items()):
-            store = pipeline.get("store")
-            if not store:
-                continue
-            try:
-                client = getattr(store, "client", None)
-                if client and hasattr(client, "close"):
-                    client.close()
-            except Exception as e:
-                print(f"⚠️ 关闭 RAG store 连接失败: {e}")
-
-        # 清空缓存，避免复用已关闭连接
+        QdrantConnectionManager.close_instances(
+            url=self.qdrant_url,
+            collection_name=self.collection_name,
+        )
         self._pipelines.clear()
     
     # ========================================
@@ -1012,7 +1160,7 @@ class RAGTool(Tool):
             "namespace": namespace
         }).text
     
-    def add_text(self, text: str, namespace: str = "default", document_id: str = None) -> str:
+    def add_text(self, text: str, namespace: str = "default", document_id: Optional[str] = None) -> str:
         """便捷方法：添加文本内容"""
         return self.run({
             "action": "add_text",
@@ -1053,7 +1201,7 @@ class RAGTool(Tool):
         start_time = time.time()
         
         for i, file_path in enumerate(file_paths, 1):
-            print(f"📄 处理文档 {i}/{len(file_paths)}: {os.path.basename(file_path)}")
+            logger.info("处理 RAG 文档 %s/%s: %s", i, len(file_paths), os.path.basename(file_path))
             
             try:
                 result = self.add_document(file_path, namespace)
@@ -1088,52 +1236,10 @@ class RAGTool(Tool):
         return "\n".join(summary)
     
     def add_texts_batch(self, texts: List[str], namespace: str = "default", document_ids: Optional[List[str]] = None) -> str:
-        """批量添加多个文本"""
-        if not texts:
-            return "❌ 文本列表不能为空"
-        
-        if document_ids and len(document_ids) != len(texts):
-            return "❌ 文本数量和文档ID数量不匹配"
-        
-        results = []
-        successful = 0
-        failed = 0
-        total_chunks = 0
-        start_time = time.time()
-        
-        for i, text in enumerate(texts):
-            doc_id = document_ids[i] if document_ids else f"batch_text_{i+1}"
-            print(f"📝 处理文本 {i+1}/{len(texts)}: {doc_id}")
-            
-            try:
-                result = self.add_text(text, namespace, doc_id)
-                if "✅" in result:
-                    successful += 1
-                    # 提取分块数量
-                    if "分块数量:" in result:
-                        chunks = int(result.split("分块数量: ")[1].split("\n")[0])
-                        total_chunks += chunks
-                else:
-                    failed += 1
-                    results.append(f"❌ {doc_id}: 处理失败")
-            except Exception as e:
-                failed += 1
-                results.append(f"❌ {doc_id}: {str(e)}")
-        
-        process_time = int((time.time() - start_time) * 1000)
-        
-        summary = [
-            "📊 **批量文本处理完成**",
-            f"✅ 成功: {successful}/{len(texts)} 个文本",
-            f"📊 总分块数: {total_chunks}",
-            f"⏱️ 总耗时: {process_time}ms",
-            f"📝 命名空间: {namespace}"
-        ]
-        
-        if failed > 0:
-            summary.append(f"❌ 失败: {failed} 个文本")
-            summary.append("\n**失败详情:**")
-            summary.extend(results)
-
-        return "\n".join(summary)
+        """批量添加多个文本。"""
+        return self.batch_add_texts(
+            texts=texts,
+            document_ids=document_ids,
+            namespace=namespace,
+        )
 
