@@ -37,15 +37,18 @@
 Qdrant 适配层，核心职责：
 
 - 初始化客户端与集合（云端或本地）
-- 建立 payload 索引（`memory_type`、`rag_namespace`、`is_rag_data` 等）
+- 建立 payload 索引（`memory_type`、`rag_namespace`、`is_rag_data`、`source_path` 等）
 - 向量写入：`add_vectors`
 - 向量检索：`search_similar`
+- 文档列表：`get_document_list`（scroll 扫描 + 按 `source_path` 聚合）
 - 清理、删除、统计、健康检查
 
 关键点：
 
 - 新旧 API 兼容：优先 `query_points()`，回退 `search()`
 - 检索时 `where` 转换为 Qdrant `Filter(must=[FieldCondition...])`
+- `get_document_list` 使用 Qdrant scroll API 分页遍历 RAG chunk，按 `source_path` 聚合为文档列表（含 chunk 数量与首段预览）
+- `source_path` 已添加 `KEYWORD` payload 索引，确保按文档路径过滤时走索引而非全表扫描
 - 维度不匹配或连接异常时会记录日志并返回空结果（而不是抛出致命异常）
 
 ### 2.3 `src/rag/pipeline.py`
@@ -64,10 +67,11 @@ RAG 核心流程实现，分三段：
      - `search`
      - `search_advanced`
      - `get_stats`
+   - 创建时提前实例化 `CrossEncoder`（`get_cross_encoder()`），避免首次搜索时才懒加载导致延迟
 
 补充能力（目前部分未接入主链路）：
 
-- `rerank_with_cross_encoder`（交叉编码器重排，当前未直接接入主检索返回）
+- `rerank_with_cross_encoder`（交叉编码器重排，已由 `search_vectors_expanded` 在合并后调用）
 - `rank / merge_snippets / compress_ranked_items / tldr_summarize` 等后处理函数
 
 ### 2.4 `src/tools/builtin/rag_tool.py`
@@ -233,6 +237,7 @@ flowchart TD
 - 入库链路：`add_documents` -> `load_and_chunk_texts` -> `index_chunks`
 - 检索链路：`search/search_advanced` -> `search_vectors/search_vectors_expanded`
 - 向量存储：`src/rag/qdrant_store.py` -> `add_vectors/search_similar`
+- **知识库 API**：`src/api/knowledge_base.py` -> `GET /api/knowledge-base/list`、`DELETE /api/knowledge-base/document`
 
 ---
 
@@ -582,4 +587,122 @@ def tldr_summarize(text, bullets=3):
 | 摘要生成 | `tldr_summarize` | ⚠️ 函数已就绪，但未接入主力检索链路 |
 
 > **说明**：带 ⚠️ 标识的函数在 `pipeline.py` 中均已完整实现，但 `create_rag_pipeline()` 返回的高层接口和 `rag_tool.py` 的 `_ask()` / `_search()` 尚未串联这些步骤。若需提升检索精度，可在工具层的检索结果返回前依次调用这些后处理函数。
+
+---
+
+## 11. 知识库 Web 管理界面
+
+前端新增「知识库」页面，允许用户在 Web UI 中浏览、打开和删除已入库的 RAG 文档，无需通过 Agent 命令操作。
+
+### 11.1 功能概述
+
+| 功能 | 说明 |
+|------|------|
+| 文档列表 | 从 Qdrant 按 `source_path` 聚合展示所有已入库文档，含文件名、路径、chunk 数量、首段预览 |
+| 打开文档 | 点击后跳转到聊天页，自动在输入框中插入 `[知识库文档: 文件名](路径)` 引用 |
+| 删除文档 | 带二次确认，按 `source_path` 删除该文档的所有 RAG chunk |
+
+### 11.2 后端变更
+
+#### 11.2.1 API 路由 (`backend/src/api/knowledge_base.py`)
+
+新增 FastAPI `APIRouter`，注册于 `main.py` 的 `/api` 前缀下：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/knowledge-base/list?namespace=` | 获取文档列表，按 `source_path` 聚合，可选 namespace 过滤 |
+| `DELETE` | `/api/knowledge-base/document` | 删除指定文档（body: `{"source_path": "...", "namespace": "default"}`） |
+
+**关键实现细节**：
+
+- `_get_store()` 惰性获取 `QdrantVectorStore` 实例，通过 `QdrantConnectionManager` 复用连接
+- Collection name 由 `QDRANT_COLLECTION_NAME` 环境变量控制，默认 `hello_agents_rag_vectors`，与 RAG pipeline 保持一致
+- 删除操作按 `source_path + memory_type=rag_chunk + is_rag_data=True` 过滤，调用 `store.delete_by_filter()`
+
+#### 11.2.2 Qdrant 存储层新增 (`backend/src/rag/qdrant_store.py`)
+
+- **`get_document_list(namespace)`**：使用 Qdrant scroll API 分页遍历 RAG chunk（`memory_type=rag_chunk`、`is_rag_data=True`），按 `source_path` 聚合为文档字典，每个文档包含 `source_path`、`chunk_count`、`first_content`（首 200 字符预览）、`rag_namespace`
+- **`source_path` 索引**：在 `_ensure_payload_indexes()` 新增 `("source_path", KEYWORD)`，确保按文档路径过滤时走索引
+
+#### 11.2.3 管道优化 (`backend/src/rag/pipeline.py`)
+
+- `create_rag_pipeline()` 中提前调用 `get_cross_encoder()`，在管道创建阶段即加载 CrossEncoder 模型，避免首次搜索时的懒加载延迟
+
+### 11.3 前端变更
+
+#### 11.3.1 API 层 (`frontend/src/api/knowledge-base.ts`)
+
+封装 `knowledgeBaseApi`：
+
+```typescript
+knowledgeBaseApi.list(namespace?)  // GET /api/knowledge-base/list
+knowledgeBaseApi.delete(sourcePath, namespace?)  // DELETE /api/knowledge-base/document
+```
+
+#### 11.3.2 知识库视图 (`frontend/src/views/KnowledgeBaseView.vue`)
+
+以 `SessionsView.vue` 为模板实现：
+
+- 使用 `Card` + `List` 布局展示文档列表
+- 每项显示文件名、完整路径、chunk 数量、首段预览
+- **打开按钮**（`.open-btn`）：`router.push({ name: 'chat', query: { doc: sourcePath } })`，纯前端路由跳转
+- **删除按钮**（`.delete-btn`）：`Popconfirm` 二次确认后调用 `knowledgeBaseApi.delete()` 并刷新列表
+- 空状态显示 `Empty` 组件 + 引导提示
+
+#### 11.3.3 侧边栏 (`frontend/src/App.vue`)
+
+在「会话」和「记忆」之间新增「知识库」菜单项，图标 `FolderOutlined`：
+
+```html
+<Menu.Item key="knowledge-base">
+  <RouterLink to="/knowledge-base">
+    <FolderOutlined />
+    <span>知识库</span>
+  </RouterLink>
+</Menu.Item>
+```
+
+#### 11.3.4 路由 (`frontend/src/router/index.ts`)
+
+新增路由 `/knowledge-base` -> `KnowledgeBaseView.vue`（懒加载）。
+
+#### 11.3.5 聊天页联动 (`frontend/src/views/ChatView.vue`)
+
+新增 `watch(route.query.doc, ..., { immediate: true })`：
+
+- 从知识库页点击「打开」后，ChatView 通过路由 query 参数 `doc` 接收文档路径
+- 格式化为 `[知识库文档: 文件名](路径)` 写入聊天输入框（若输入框已有内容则追加）
+- 自动清除 URL 中的 `doc` 参数，避免刷新后重复插入
+
+### 11.4 数据流
+
+```
+[知识库页面] → 点击「打开」
+  → router.push({ query: { doc: path } })
+  → ChatView watch(doc) immediate:true
+  → inputMessage.value = "[知识库文档: xxx](path)"
+  → 清除 URL doc 参数
+
+[知识库页面] → 点击「删除」
+  → Popconfirm 确认
+  → knowledgeBaseApi.delete(sourcePath)
+  → DELETE /api/knowledge-base/document
+  → store.delete_by_filter({source_path, memory_type, is_rag_data})
+  → 刷新文档列表
+```
+
+### 11.5 文件清单
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `backend/src/api/knowledge_base.py` | 新建 | 文档列表与删除 API |
+| `backend/src/main.py` | 修改 | 注册 `knowledge_base.router` |
+| `backend/src/rag/qdrant_store.py` | 新增方法 | `get_document_list()` + `source_path` 索引 |
+| `backend/src/rag/pipeline.py` | 修改 | `create_rag_pipeline` 中提前加载 CrossEncoder |
+| `backend/src/rag/embedding.py` | 无变更 | CrossEncoder 原为懒加载单例，pipeline 中已提前触发 |
+| `frontend/src/api/knowledge-base.ts` | 新建 | 前端 API 封装 |
+| `frontend/src/views/KnowledgeBaseView.vue` | 新建 | 知识库文档列表页 |
+| `frontend/src/App.vue` | 修改 | 新增「知识库」菜单项 |
+| `frontend/src/router/index.ts` | 修改 | 新增 `/knowledge-base` 路由 |
+| `frontend/src/views/ChatView.vue` | 修改 | 监听 `doc` query 参数写入输入框 |
 
