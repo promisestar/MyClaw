@@ -19,6 +19,11 @@ const router = createRouter({
       component: () => import('../views/KnowledgeBaseView.vue'),
     },
     {
+      path: '/tool-logs',
+      name: 'tool-logs',
+      component: () => import('../views/ToolLogsView.vue'),
+    },
+    {
       path: '/memory',
       name: 'memory',
       component: () => import('../views/MemoryView.vue'),

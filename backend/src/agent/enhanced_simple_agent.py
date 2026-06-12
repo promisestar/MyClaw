@@ -2,6 +2,7 @@
 
 import json
 import asyncio
+import time
 import os
 import re
 from datetime import datetime
@@ -19,6 +20,8 @@ from ..context import ContextManager
 
 # 导入 HelloClaw 专用 LLM（支持流式工具调用）
 from .enhanced_llm import EnhancedHelloAgentsLLM, StreamToolEventType
+
+from ..logging.tool_logger import ToolCallLogger, get_trace_id
 
 if TYPE_CHECKING:
     from hello_agents.tools.registry import ToolRegistry
@@ -249,7 +252,21 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         await asyncio.sleep(0)
 
+        t_start = time.perf_counter()
         exec_result = self._execute_tool_call(tool_name, arguments)
+        duration_ms = (time.perf_counter() - t_start) * 1000
+
+        # 结构化日志：记录工具调用
+        tool_status = "error" if exec_result.startswith("❌") else "done"
+        ToolCallLogger.log(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            args=arguments,
+            result=exec_result,
+            session_id=getattr(self, "_current_session_id", None),
+            status=tool_status,
+            duration_ms=duration_ms,
+        )
         self._maybe_track_temp_file(
             tool_name=tool_name,
             arguments=arguments,

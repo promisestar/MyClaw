@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+from ..logging.tool_logger import set_trace_id, generate_trace_id
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -87,6 +88,9 @@ async def send_message_stream(request: ChatRequest):
 
         lock = get_agent_lock()
         try:
+            # 为本次请求生成 trace_id，贯穿所有工具调用日志
+            set_trace_id(generate_trace_id())
+
             async def _run_stream():
                 async for event in agent.achat(
                     request.message,

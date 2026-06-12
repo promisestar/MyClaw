@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import chat, session, config, memory, upload, knowledge_base
+from .api import chat, session, config, memory, upload, knowledge_base, tool_logs
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
@@ -134,6 +134,7 @@ app.include_router(session.router, prefix="/api")
 app.include_router(config.router, prefix="/api")
 app.include_router(memory.router, prefix="/api")
 app.include_router(knowledge_base.router, prefix="/api")
+app.include_router(tool_logs.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
 
 
