@@ -80,6 +80,8 @@ class ToolCallLogger:
         trace_id: Optional[str] = None,
         status: str = "done",
         duration_ms: float = 0.0,
+        retry_attempt: Optional[int] = None,
+        retry_count: Optional[int] = None,
     ) -> None:
         """写入一条工具调用日志。
 
@@ -90,8 +92,10 @@ class ToolCallLogger:
             result: 返回结果（长结果会被截断到 2000 字符）
             session_id: 会话 ID
             trace_id: 跟踪 ID（不传则自动从 contextvar 读取）
-            status: 执行状态（done / error / timeout）
-            duration_ms: 耗时（毫秒）
+            status: 执行状态（done / error / retry / timeout）
+            duration_ms: 累计耗时（毫秒）
+            retry_attempt: 当前是第几次重试尝试（1-based，仅 status="retry" 时传入）
+            retry_count: 最终记录的总重试次数（仅在最终成功/失败记录时传入）
         """
         trace = trace_id or get_trace_id()
         entry = {
@@ -106,6 +110,10 @@ class ToolCallLogger:
             "status": status,
             "duration_ms": round(duration_ms, 2),
         }
+        if retry_attempt is not None:
+            entry["retry_attempt"] = retry_attempt
+        if retry_count is not None:
+            entry["retry_count"] = retry_count
 
         try:
             line = json.dumps(entry, ensure_ascii=False) + "\n"

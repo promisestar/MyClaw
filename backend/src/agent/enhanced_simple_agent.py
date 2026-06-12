@@ -5,6 +5,7 @@ import asyncio
 import time
 import os
 import re
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Set, Tuple
@@ -25,6 +26,42 @@ from ..logging.tool_logger import ToolCallLogger, get_trace_id
 
 if TYPE_CHECKING:
     from hello_agents.tools.registry import ToolRegistry
+
+# ── 工具调用智能重试 ──────────────────────────────────────────────
+
+# 可重试的错误特征（正则匹配工具返回的错误文本）
+_RETRYABLE_ERROR_PATTERNS: List[re.Pattern] = [
+    # 网络 / HTTP
+    re.compile(r"rate.?limit", re.IGNORECASE),
+    re.compile(r"too\s+many\s+requests", re.IGNORECASE),
+    re.compile(r"429|503|502|504", re.IGNORECASE),
+    re.compile(r"connection\s+(error|refused|reset|timed?\s*out)", re.IGNORECASE),
+    re.compile(r"network\s+(error|unreachable)", re.IGNORECASE),
+    re.compile(r"timeout|timed?\s*out|读取超时|连接超时|请求超时", re.IGNORECASE),
+    re.compile(r"temporar(?:y|ily)\s+(?:unavailable|down)", re.IGNORECASE),
+    re.compile(r"service\s+unavailable", re.IGNORECASE),
+    # MCP
+    re.compile(r"mcp\s+(?:server\s+)?(?:disconnect|connection|transport)", re.IGNORECASE),
+    re.compile(r"mcp\s+error", re.IGNORECASE),
+    re.compile(r"session\s+(?:expired|closed|disconnected)", re.IGNORECASE),
+    # 通用临时性错误
+    re.compile(r"retry|重试", re.IGNORECASE),
+    re.compile(r"try\s+again\s+later", re.IGNORECASE),
+    re.compile(r"internal\s+server\s+error", re.IGNORECASE),
+    re.compile(r"bad\s+gateway", re.IGNORECASE),
+]
+
+# 明确不可重试的错误特征（优先级高于可重试匹配）
+_NON_RETRYABLE_ERROR_PATTERNS: List[re.Pattern] = [
+    re.compile(r"文件(?:不)?存在|file\s+not\s+found|no\s+such\s+file", re.IGNORECASE),
+    re.compile(r"权限|permission\s+denied|access\s+denied", re.IGNORECASE),
+    re.compile(r"参数.*(?:格式|错误|无效)|invalid\s+(?:argument|parameter|input)", re.IGNORECASE),
+    re.compile(r"未找到工具|tool\s+not\s+found", re.IGNORECASE),
+    re.compile(r"json\s*(?:解析|decode|格式)", re.IGNORECASE),
+    re.compile(r"验证失败|validat(?:e|ion)\s+(?:failed|error)", re.IGNORECASE),
+    re.compile(r"not\s+implemented|unsupported", re.IGNORECASE),
+    re.compile(r"quota\s+exceeded|insufficient_quota|billing", re.IGNORECASE),
+]
 
 
 class EnhancedSimpleAgent(SimpleAgent):
@@ -50,6 +87,11 @@ class EnhancedSimpleAgent(SimpleAgent):
         max_tool_iterations: int = 10,
         workspace_root: Optional[str] = None,
         auto_cleanup_temp_files: bool = True,
+        max_tool_retries: int = 2,
+        tool_retry_base_delay: float = 1.0,
+        tool_retry_max_delay: float = 15.0,
+        tool_retry_backoff: float = 2.0,
+        tool_retry_jitter: float = 0.2,
     ):
         """初始化 EnhancedSimpleAgent
 
@@ -63,6 +105,11 @@ class EnhancedSimpleAgent(SimpleAgent):
             max_tool_iterations: 最大工具调用迭代次数
             workspace_root: 工作空间根目录（用于安全清理临时文件）
             auto_cleanup_temp_files: 是否启用临时文件自动清理兜底
+            max_tool_retries: 单次工具调用最大重试次数（默认 2）
+            tool_retry_base_delay: 重试基础延迟（秒，默认 1.0）
+            tool_retry_max_delay: 重试最大延迟上限（秒，默认 15.0）
+            tool_retry_backoff: 指数退避因子（默认 2.0）
+            tool_retry_jitter: 随机抖动比例（0.2 表示 ±20%，默认 0.2）
         """
         super().__init__(
             name=name,
@@ -78,6 +125,13 @@ class EnhancedSimpleAgent(SimpleAgent):
         self._supports_streaming_tools = isinstance(llm, EnhancedHelloAgentsLLM)
         self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
         self.auto_cleanup_temp_files = auto_cleanup_temp_files
+
+        # 工具调用智能重试配置
+        self.max_tool_retries = max(max_tool_retries, 0)
+        self.tool_retry_base_delay = max(tool_retry_base_delay, 0.1)
+        self.tool_retry_max_delay = max(tool_retry_max_delay, 1.0)
+        self.tool_retry_backoff = max(tool_retry_backoff, 1.0)
+        self.tool_retry_jitter = max(min(tool_retry_jitter, 0.5), 0.0)
 
         # 解耦的上下文管理（替代基类 Agent 内嵌的压缩逻辑）
         self.context_manager = ContextManager(
@@ -172,6 +226,140 @@ class EnhancedSimpleAgent(SimpleAgent):
                 failed.append(f"{file_path}: {exc}")
         return deleted_count, failed
 
+    @staticmethod
+    def _is_retryable_error(error_text: str) -> Tuple[bool, str]:
+        """判断工具返回的错误是否可重试。
+
+        基于预定义的正则模式进行分类：
+        - 先检查不可重试特征（文件不存在、权限、参数错误等）
+        - 再检查可重试特征（网络超时、HTTP 5xx、MCP 断连等）
+
+        Args:
+            error_text: 工具返回的错误文本（通常以 ❌ 开头）
+
+        Returns:
+            (is_retryable, reason): 是否可重试及原因简述
+        """
+        if not error_text:
+            return False, "empty result"
+
+        # 非错误结果不重试
+        if not error_text.startswith("❌"):
+            return False, "not an error"
+
+        # 1) 先匹配不可重试特征（优先级更高）
+        for pattern in _NON_RETRYABLE_ERROR_PATTERNS:
+            if pattern.search(error_text):
+                return False, f"non-retryable: {pattern.pattern}"
+
+        # 2) 再匹配可重试特征
+        for pattern in _RETRYABLE_ERROR_PATTERNS:
+            if pattern.search(error_text):
+                return True, f"retryable: {pattern.pattern}"
+
+        # 3) 未命中任何模式 → 保守策略：不重试（避免无意义重试导致延迟）
+        return False, "unknown error (conservative)"
+
+    @staticmethod
+    def _compute_retry_delay(
+        attempt: int,
+        base_delay: float,
+        max_delay: float,
+        backoff: float,
+        jitter: float,
+    ) -> float:
+        """计算第 N 次重试的等待延迟（指数退避 + 随机抖动）。
+
+        delay = min(base_delay * backoff^(attempt-1), max_delay) * (1 ± jitter)
+        """
+        delay = min(base_delay * (backoff ** (attempt - 1)), max_delay)
+        if jitter > 0:
+            delay *= 1.0 + random.uniform(-jitter, jitter)
+        return max(delay, 0.05)
+
+    def _execute_tool_call_with_retry_sync(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: Dict[str, Any],
+        step: int = 0,
+    ) -> str:
+        """同步执行工具调用（含智能重试）。
+
+        与异步路径 _yield_tool_call_execution 使用相同的重试策略，
+        但不 yield 流式事件，适用于 run() 同步对话路径。
+
+        Returns:
+            工具执行结果字符串
+        """
+        exec_result = ""
+        duration_ms = 0.0
+        retry_count = 0
+        max_attempts = 1 + self.max_tool_retries
+
+        for attempt in range(1, max_attempts + 1):
+            t_start = time.perf_counter()
+            exec_result = self._execute_tool_call(tool_name, arguments)
+            duration_ms += (time.perf_counter() - t_start) * 1000
+
+            is_error = exec_result.startswith("❌")
+            is_retryable = False
+
+            if is_error:
+                is_retryable, retry_reason = self._is_retryable_error(exec_result)
+
+                if is_retryable and attempt < max_attempts:
+                    retry_count += 1
+                    delay = self._compute_retry_delay(
+                        attempt=retry_count,
+                        base_delay=self.tool_retry_base_delay,
+                        max_delay=self.tool_retry_max_delay,
+                        backoff=self.tool_retry_backoff,
+                        jitter=self.tool_retry_jitter,
+                    )
+                    result_preview = exec_result[:120] + "..." if len(exec_result) > 120 else exec_result
+                    print(f"🔄 工具 {tool_name} 第 {attempt}/{max_attempts} 次失败 ({retry_reason})，"
+                          f"{delay:.1f}s 后重试… → {result_preview}")
+
+                    # 结构化日志：记录失败尝试
+                    ToolCallLogger.log(
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                        args=arguments,
+                        result=exec_result,
+                        session_id=getattr(self, "_current_session_id", None),
+                        status="retry",
+                        duration_ms=duration_ms,
+                        retry_attempt=retry_count,
+                    )
+
+                    time.sleep(delay)
+                    continue
+
+            # 不再重试
+            break
+
+        # 日志：最终结果
+        final_status = "error" if exec_result.startswith("❌") else "done"
+        ToolCallLogger.log(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            args=arguments,
+            result=exec_result,
+            session_id=getattr(self, "_current_session_id", None),
+            status=final_status,
+            duration_ms=duration_ms,
+            retry_count=retry_count,
+        )
+
+        if retry_count:
+            if final_status == "done":
+                print(f"✅ 工具 {tool_name} 第 {retry_count + 1} 次重试成功")
+            else:
+                print(f"❌ 工具 {tool_name} 已重试 {retry_count} 次，最终失败")
+
+        return exec_result
+
     def _build_messages(self, input_text: str) -> List[Dict[str, Any]]:
         """构建消息列表，并在对话开始前执行上下文管理。"""
         if self.context_manager.maybe_compress_history():
@@ -232,7 +420,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         tool_call_records: List[Dict[str, Any]],
         tool_results_by_id: Dict[str, str],
     ) -> AsyncGenerator[StreamEvent, None]:
-        """执行单个工具调用并 yield 流式事件。"""
+        """执行单个工具调用并 yield 流式事件（含智能重试）。"""
         print(f"🎬 调用工具: {tool_name}({arguments})")
         preexisting_file = False
         raw_path = arguments.get("path")
@@ -252,20 +440,67 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         await asyncio.sleep(0)
 
-        t_start = time.perf_counter()
-        exec_result = self._execute_tool_call(tool_name, arguments)
-        duration_ms = (time.perf_counter() - t_start) * 1000
+        # ── 智能重试循环 ──
+        exec_result = ""
+        duration_ms = 0.0
+        retry_count = 0
+        max_attempts = 1 + self.max_tool_retries
 
-        # 结构化日志：记录工具调用
-        tool_status = "error" if exec_result.startswith("❌") else "done"
+        for attempt in range(1, max_attempts + 1):
+            t_start = time.perf_counter()
+            exec_result = self._execute_tool_call(tool_name, arguments)
+            duration_ms += (time.perf_counter() - t_start) * 1000
+
+            is_error = exec_result.startswith("❌")
+            is_retryable = False
+
+            if is_error:
+                is_retryable, retry_reason = self._is_retryable_error(exec_result)
+
+                if is_retryable and attempt < max_attempts:
+                    retry_count += 1
+                    delay = self._compute_retry_delay(
+                        attempt=retry_count,
+                        base_delay=self.tool_retry_base_delay,
+                        max_delay=self.tool_retry_max_delay,
+                        backoff=self.tool_retry_backoff,
+                        jitter=self.tool_retry_jitter,
+                    )
+                    result_preview = exec_result[:120] + "..." if len(exec_result) > 120 else exec_result
+                    print(f"🔄 工具 {tool_name} 第 {attempt}/{max_attempts} 次失败 ({retry_reason})，"
+                          f"{delay:.1f}s 后重试… → {result_preview}")
+
+                    # 结构化日志：记录本次失败尝试
+                    ToolCallLogger.log(
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                        args=arguments,
+                        result=exec_result,
+                        session_id=getattr(self, "_current_session_id", None),
+                        status="retry",
+                        duration_ms=duration_ms,
+                        retry_attempt=retry_count,
+                    )
+
+                    await asyncio.sleep(delay)
+                    continue  # 进入下一轮重试
+
+            # 不再重试：成功 / 不可重试错误 / 已达最大次数
+            break
+
+        # ── 最终结果 ──
+        final_status = "error" if exec_result.startswith("❌") else "done"
+
+        # 结构化日志：记录最终结果
         ToolCallLogger.log(
             tool_name=tool_name,
             tool_call_id=tool_call_id,
             args=arguments,
             result=exec_result,
             session_id=getattr(self, "_current_session_id", None),
-            status=tool_status,
+            status=final_status,
             duration_ms=duration_ms,
+            retry_count=retry_count,
         )
         self._maybe_track_temp_file(
             tool_name=tool_name,
@@ -277,16 +512,23 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         result_preview = exec_result[:200] + "..." if len(exec_result) > 200 else exec_result
         if exec_result.startswith("❌"):
-            print(f"❌ 工具执行失败: {result_preview}")
+            status_label = f" (已重试 {retry_count} 次)" if retry_count else ""
+            print(f"❌ 工具执行失败{status_label}: {result_preview}")
         else:
-            print(f"👀 观察: {result_preview}")
+            if retry_count:
+                print(f"✅ 工具 {tool_name} 第 {retry_count + 1} 次重试成功")
+            else:
+                print(f"👀 观察: {result_preview}")
 
         yield StreamEvent.create(
             StreamEventType.TOOL_CALL_FINISH,
             self.name,
             tool_name=tool_name,
             tool_call_id=tool_call_id,
-            result=exec_result
+            result=exec_result,
+            metadata={
+                "retry_count": retry_count,
+            } if retry_count else {}
         )
 
         tool_call_records.append({
@@ -294,7 +536,8 @@ class EnhancedSimpleAgent(SimpleAgent):
             "name": tool_name,
             "args": arguments,
             "result": exec_result,
-            "status": "error" if exec_result.startswith("❌") else "done"
+            "status": "error" if exec_result.startswith("❌") else "done",
+            "retry_count": retry_count,
         })
         tool_results_by_id[tool_call_id] = exec_result
 
@@ -518,7 +761,10 @@ class EnhancedSimpleAgent(SimpleAgent):
                         step=current_iteration,
                     )
 
-                result = self._execute_tool_call(tool_name, arguments)
+                # ── 智能重试（同步路径） ──
+                result = self._execute_tool_call_with_retry_sync(
+                    tool_name, tool_call_id, arguments, current_iteration,
+                )
 
                 if trace_logger:
                     trace_logger.log_event(

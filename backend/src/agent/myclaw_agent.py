@@ -39,6 +39,7 @@ class MyClawAgent:
         api_key: str = None,
         base_url: str = None,
         max_tool_iterations: int = 10,
+        max_tool_retries: Optional[int] = None,
     ):
         """初始化 HelloClaw Agent
 
@@ -49,6 +50,7 @@ class MyClawAgent:
             api_key: API Key
             base_url: API Base URL
             max_tool_iterations: 最大工具调用迭代次数
+            max_tool_retries: 工具调用失败最大重试次数（None=从 config.json 读取，默认 2）
         """
         # 确保 workspace_path 正确展开 ~/
         self.workspace_path = os.path.expanduser(workspace_path or "~/.helloclaw/workspace")
@@ -75,6 +77,21 @@ class MyClawAgent:
 
         # 初始化 LLM（从 config.json 读取配置）
         self._init_llm()
+
+        # ── 读取工具重试配置（从 config.json） ──
+        if max_tool_retries is None:
+            global_config = self.workspace.load_global_config()
+            retry_cfg = global_config.get("tool_retry", {})
+            max_tool_retries = retry_cfg.get("max_retries", 2)
+            tool_retry_base_delay = retry_cfg.get("base_delay", 1.0)
+            tool_retry_max_delay = retry_cfg.get("max_delay", 15.0)
+            tool_retry_backoff = retry_cfg.get("backoff", 2.0)
+            tool_retry_jitter = retry_cfg.get("jitter", 0.2)
+        else:
+            tool_retry_base_delay = 1.0
+            tool_retry_max_delay = 15.0
+            tool_retry_backoff = 2.0
+            tool_retry_jitter = 0.2
 
         # 初始化配置
         self.config = Config(
@@ -105,6 +122,11 @@ class MyClawAgent:
             max_tool_iterations=max_tool_iterations,
             workspace_root=self.workspace_path,
             auto_cleanup_temp_files=True,
+            max_tool_retries=max_tool_retries,
+            tool_retry_base_delay=tool_retry_base_delay,
+            tool_retry_max_delay=tool_retry_max_delay,
+            tool_retry_backoff=tool_retry_backoff,
+            tool_retry_jitter=tool_retry_jitter,
         )
 
         # 初始化 Memory Flush 管理器

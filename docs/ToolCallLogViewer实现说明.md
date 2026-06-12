@@ -185,3 +185,155 @@ export const toolLogsApi = {
 - **后端**：Python 3.10+, FastAPI, Pydantic
 - **前端**：Vue 3, TypeScript, Ant Design Vue 4
 - **存储**：本地文件系统 JSONL（`~/.helloclaw/tool_logs/YYYY-MM-DD.jsonl`）
+
+---
+
+## 工具调用智能重试机制
+
+### 概述
+
+当工具执行失败时（返回以 `❌` 开头的结果），系统会自动判断该错误是否可重试，并执行指数退避重试。重试机制同时覆盖异步流式 (`arun_stream_with_tools`) 和同步 (`run`) 两条对话路径。
+
+### 错误分类
+
+#### 可重试错误（自动重试）
+
+| 类别 | 匹配模式示例 |
+|------|-------------|
+| **速率限制** | `rate limit`、`too many requests` |
+| **HTTP 服务端错误** | `429`、`502`、`503`、`504` |
+| **网络连接** | `connection timed out`、`connection refused`、`connection reset` |
+| **网络不可达** | `network error`、`network unreachable` |
+| **服务临时不可用** | `temporarily unavailable`、`service unavailable` |
+| **MCP 断连** | `MCP server disconnected`、`MCP connection error`、`MCP transport error` |
+| **会话过期** | `session expired`、`session closed` |
+| **通用临时错误** | `retry`、`try again later`、`internal server error`、`bad gateway`、`超时`、`连接超时` |
+
+#### 不可重试错误（直接返回失败）
+
+| 类别 | 匹配模式示例 |
+|------|-------------|
+| **文件不存在** | `file not found`、`no such file`、`文件不存在` |
+| **权限拒绝** | `permission denied`、`access denied`、`权限` |
+| **参数错误** | `invalid argument`、`参数格式错误`、`invalid parameter` |
+| **工具未找到** | `tool not found`、`未找到工具` |
+| **JSON 解析失败** | `JSON decode error`、`JSON 格式错误` |
+| **不支持的操作** | `not implemented`、`unsupported` |
+| **配额耗尽** | `quota exceeded`、`insufficient quota`、`billing` |
+
+#### 保守策略
+
+未命中任何已知模式的错误**默认不重试**，避免无意义的延迟。
+
+### 重试策略
+
+采用**指数退避 + 随机抖动**算法：
+
+$$
+\text{delay} = \min(\text{base\_delay} \times \text{backoff}^{\text{attempt}-1},\ \text{max\_delay}) \times (1 \pm \text{jitter})
+$$
+
+### 配置方式
+
+#### 通过 `config.json`（推荐）
+
+在 `~/.helloclaw/config.json` 中添加 `tool_retry` 段：
+
+```json
+{
+  "tool_retry": {
+    "max_retries": 2,
+    "base_delay": 1.0,
+    "max_delay": 15.0,
+    "backoff": 2.0,
+    "jitter": 0.2
+  }
+}
+```
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `max_retries` | int | 2 | 单次工具调用最大重试次数（0=不重试） |
+| `base_delay` | float | 1.0 | 第一次重试的基础延迟（秒） |
+| `max_delay` | float | 15.0 | 单次重试延迟的上限（秒） |
+| `backoff` | float | 2.0 | 指数退避因子（第N次=base×backoff^(N-1)） |
+| `jitter` | float | 0.2 | 随机抖动比例（±20%，避免惊群效应） |
+
+#### 通过代码传参
+
+```python
+agent = MyClawAgent(max_tool_retries=3)  # 覆盖 config.json 中的值
+```
+
+### 重试日志记录
+
+每次重试会在 JSONL 日志中产生两条记录：
+
+**1. 中间重试尝试（`status: "retry"`）**
+
+```json
+{
+  "timestamp": "2026-06-12T10:30:01.500",
+  "trace_id": "a1b2c3d4",
+  "session_id": "abc123",
+  "tool_name": "web_search",
+  "tool_call_id": "call_001",
+  "args": {"query": "latest news"},
+  "result": "❌ 错误 [NETWORK]: connection timed out",
+  "result_len": 45,
+  "status": "retry",
+  "duration_ms": 5120.50,
+  "retry_attempt": 1
+}
+```
+
+**2. 最终结果（`status: "done"` 或 `"error"`，含 `retry_count`）**
+
+```json
+{
+  "timestamp": "2026-06-12T10:30:04.200",
+  "trace_id": "a1b2c3d4",
+  "session_id": "abc123",
+  "tool_name": "web_search",
+  "tool_call_id": "call_001",
+  "args": {"query": "latest news"},
+  "result": "[{\"title\": \"...\"}]",
+  "result_len": 2340,
+  "status": "done",
+  "duration_ms": 7820.50,
+  "retry_count": 1
+}
+```
+
+### 重试流程示意
+
+```
+调用工具 → ❌ 失败 → 判断可重试?
+  ├─ 否 → 直接返回 ❌ (不重试)
+  └─ 是 → 计算退避延迟 → 等待 N 秒
+           ├─ 重试 → ✅ 成功 → 返回结果 (retry_count=N)
+           └─ 重试 → ❌ 失败 → 还有剩余次数?
+                ├─ 是 → 继续重试
+                └─ 否 → 返回 ❌ (retry_count=max_retries)
+```
+
+### 控制台输出示例
+
+```
+🎬 调用工具: web_search({'query': 'latest news'})
+🔄 工具 web_search 第 1/3 次失败 (retryable: connection...timed?\\s*out)，1.1s 后重试… → ❌ 错误 [NETWORK]: connection timed out
+🔄 工具 web_search 第 2/3 次失败 (retryable: rate.?limit)，2.3s 后重试… → ❌ 错误 [RATE_LIMIT]: 429 Too Many Requests
+✅ 工具 web_search 第 3 次重试成功
+
+# 或最终失败时：
+❌ 工具执行失败 (已重试 2 次): ❌ 错误 [NETWORK]: connection refused
+```
+
+### 涉及文件
+
+| 文件 | 说明 |
+|------|------|
+| `backend/src/agent/enhanced_simple_agent.py` | 核心重试逻辑：`_is_retryable_error()`、`_compute_retry_delay()`、异步/同步双路径重试 |
+| `backend/src/agent/myclaw_agent.py` | 从 `config.json` 读取 `tool_retry` 配置并透传 |
+| `backend/src/logging/tool_logger.py` | `log()` 新增 `retry_attempt`、`retry_count` 字段 |
+| `backend/src/workspace/templates/config.json` | 新增 `tool_retry` 配置模板 |
