@@ -228,52 +228,170 @@ const hasVisibleContent = computed(() => {
   border: 1px solid rgba(255, 92, 92, 0.2);
 }
 
-/* Markdown 样式 */
+/* ── Markdown 渲染样式（完整覆盖所有元素） ── */
+
+/* 段落 */
 .message-text :deep(p) {
   margin: 0;
 }
-
 .message-text :deep(p + p) {
   margin-top: 8px;
 }
 
+/* 标题 */
+.message-text :deep(h1) { font-size: 1.4em; font-weight: 700; margin: 16px 0 8px; border-bottom: 1px solid var(--color-border); padding-bottom: 4px; }
+.message-text :deep(h2) { font-size: 1.25em; font-weight: 700; margin: 14px 0 6px; }
+.message-text :deep(h3) { font-size: 1.12em; font-weight: 700; margin: 12px 0 6px; }
+.message-text :deep(h4) { font-size: 1.05em; font-weight: 600; margin: 10px 0 4px; }
+.message-text :deep(h5) { font-size: 1em; font-weight: 600; margin: 8px 0 4px; }
+.message-text :deep(h6) { font-size: 0.95em; font-weight: 600; margin: 6px 0 4px; color: var(--color-text-secondary); }
+
+/* 强调 */
+.message-text :deep(strong) { font-weight: 700; }
+.message-text :deep(em) { font-style: italic; }
+.message-text :deep(del) { text-decoration: line-through; color: var(--color-text-secondary); }
+
+/* 行内代码 */
 .message-text :deep(code) {
-  background-color: rgba(0, 0, 0, 0.05);
+  background-color: rgba(0, 0, 0, 0.06);
   padding: 2px 6px;
   border-radius: 4px;
-  font-size: 13px;
+  font-size: 0.9em;
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', 'Fira Code', Monaco, monospace;
+  color: #d63384;
 }
 
+/* 代码块 */
 .message-text :deep(pre) {
   background-color: #1e1e1e;
   color: #d4d4d4;
-  padding: 12px;
+  padding: 14px 16px;
   border-radius: 8px;
   overflow-x: auto;
-  margin: 8px 0;
+  margin: 10px 0;
+  line-height: 1.5;
+  font-size: 0.88em;
 }
-
 .message-text :deep(pre code) {
   background-color: transparent;
+  color: inherit;
   padding: 0;
+  border-radius: 0;
+  font-size: inherit;
 }
 
+/* 列表 */
 .message-text :deep(ul),
 .message-text :deep(ol) {
-  margin: 8px 0;
-  padding-left: 20px;
+  margin: 6px 0;
+  padding-left: 22px;
+}
+.message-text :deep(li) {
+  margin: 2px 0;
+  line-height: 1.55;
+}
+.message-text :deep(li > ul),
+.message-text :deep(li > ol) {
+  margin: 2px 0;
+}
+.message-text :deep(ol ol) { list-style-type: lower-alpha; }
+.message-text :deep(ol ol ol) { list-style-type: lower-roman; }
+
+/* 分割线 */
+.message-text :deep(hr) {
+  border: none;
+  border-top: 1px solid var(--color-border);
+  margin: 14px 0;
 }
 
+/* 引用块 */
 .message-text :deep(blockquote) {
   border-left: 3px solid var(--color-primary);
-  padding-left: 12px;
+  padding: 6px 12px;
   margin: 8px 0;
   color: var(--color-text-secondary);
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 0 6px 6px 0;
+}
+.message-text :deep(blockquote p:last-child) {
+  margin-bottom: 0;
 }
 
+/* 链接 */
 .message-text :deep(a) {
   color: var(--color-primary);
   text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.message-text :deep(a:hover) {
+  color: var(--color-primary-dark, #d64545);
+}
+
+/* ── 表格 ── */
+.message-text :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 0.94em;
+  overflow: hidden;
+  border-radius: 6px;
+}
+.message-text :deep(thead) {
+  background-color: var(--color-primary);
+  color: #fff;
+}
+.message-text :deep(th) {
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.92em;
+}
+.message-text :deep(td) {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+.message-text :deep(tbody tr:nth-child(even)) {
+  background-color: rgba(0, 0, 0, 0.02);
+}
+.message-text :deep(tbody tr:hover) {
+  background-color: rgba(0, 0, 0, 0.04);
+}
+
+/* ── 任务列表 ── */
+.message-text :deep(input[type="checkbox"]) {
+  margin-right: 6px;
+  accent-color: var(--color-primary);
+  vertical-align: middle;
+}
+
+/* ── 图片 ── */
+.message-text :deep(img) {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  margin: 8px 0;
+}
+
+/* ── 键盘标签 ── */
+.message-text :deep(kbd) {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.85em;
+  font-family: ui-monospace, monospace;
+  box-shadow: 0 1px 0 var(--color-border);
+}
+
+/* 上下标 */
+.message-text :deep(sub),
+.message-text :deep(sup) {
+  font-size: 0.8em;
+}
+
+/* 行内链接卡片补偿 */
+.message-text :deep(a:has(img)) {
+  text-decoration: none;
 }
 
 /* 消息元信息 */
