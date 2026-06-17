@@ -9,6 +9,7 @@ from .enhanced_simple_agent import EnhancedSimpleAgent
 from .enhanced_llm import EnhancedHelloAgentsLLM  # HelloClaw 专用 LLM（支持流式工具调用）
 from ..memory.memory_flush import MemoryFlushManager
 from ..memory.capture import MemoryCaptureManager
+from ..memory.vector_store import MemoryVectorStore
 from hello_agents.tools import (
     ToolRegistry,
     ReadTool,
@@ -108,6 +109,10 @@ class MyClawAgent:
             subagent_enabled=True,  # 启用子 Agent 支持
         )
 
+        # 初始化 MemoryVectorStore（长期记忆的 Qdrant 存储层）
+        # 必须在 _setup_tools() 之前，因为 MemoryTool 依赖它
+        self._memory_store = MemoryVectorStore()
+
         # 初始化工具注册表
         self.tool_registry = self._setup_tools()
 
@@ -137,8 +142,11 @@ class MyClawAgent:
             enabled=True,
         )
 
-        # 初始化 Memory Capture 管理器
-        self._memory_capture_manager = MemoryCaptureManager(self.workspace)
+        # 初始化 Memory Capture 管理器（传入 memory_store）
+        self._memory_capture_manager = MemoryCaptureManager(
+            memory_store=self._memory_store,
+            workspace_manager=self.workspace,  # 过渡期回退
+        )
 
     def _read_identity_name(self) -> str:
         """从 IDENTITY.md 读取助手名称
@@ -255,10 +263,14 @@ class MyClawAgent:
         if soul:
             context_parts.append(f"\n## 人格模板\n{soul}")
 
-        # 长期记忆
-        memory = self.workspace.load_config("MEMORY")
-        if memory:
-            context_parts.append(f"\n## 长期记忆\n{memory}")
+        # 长期记忆使用指引（不做自动检索，由 Agent 按需调用 memory_search）
+        context_parts.append(
+            "\n## 长期记忆\n"
+            "你拥有长期记忆能力，所有历史记忆存储在向量数据库中。"
+            "当需要回忆之前的对话内容、用户偏好、历史决策、个人实体信息时，"
+            "请使用 memory_search 工具进行语义检索。\n"
+            "使用 memory_add 写入新的长期记忆。"
+        )
 
         if context_parts:
             return base_prompt + "\n" + "\n".join(context_parts)
@@ -276,7 +288,10 @@ class MyClawAgent:
         registry.register_tool(CalculatorTool())
 
         # HelloClaw 自定义工具
-        registry.register_tool(MemoryTool(self.workspace))
+        registry.register_tool(MemoryTool(
+            memory_store=self._memory_store,
+            workspace_manager=self.workspace,  # 过渡期回退
+        ))
         registry.register_tool(BashTool(
             allowed_directories=[self.workspace_path],  # 限制在工作空间目录
             default_workdir=self.workspace_path,  # 与 Read/Write 根目录一致，避免 uvicorn CWD 下找不到脚本
@@ -548,8 +563,11 @@ class MyClawAgent:
             user_message: 用户消息
         """
         try:
-            # 使用 MemoryCaptureManager 分析并存储记忆
-            memories = await self._memory_capture_manager.acapture_and_store(user_message)
+            session_id = getattr(self, "_current_session_id", None)
+            # 使用 MemoryCaptureManager 分析并存储记忆到 Qdrant
+            memories = await self._memory_capture_manager.acapture_and_store(
+                user_message, session_id=session_id
+            )
 
             if memories:
                 print(f"📝 自动捕获 {len(memories)} 条记忆")

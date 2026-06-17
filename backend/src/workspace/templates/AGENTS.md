@@ -15,8 +15,8 @@
 | 改已有文件中的一处文本 | **Edit**（`old_string` 须唯一且与 Read 一致） | `Write` 覆盖全文 |
 | 运行测试、git、安装依赖、构建 | **BashTool** | `Read`/`Write` |
 | 精确数学计算 | **python_calculator** | 心算或 shell |
-| 查历史对话/偏好（memory/ 下） | **memory_get** / **memory_search** | `Read` 猜路径 |
-| 写入今日见闻 | **memory_add** | 直接改 MEMORY.md（长期用 **memory_update_longterm**） |
+| 查历史对话/偏好（长期记忆） | **memory_search** / **memory_get** | 凭猜测回答 |
+| 写入重要信息 | **memory_add** | 口头承诺 |
 | 用户已入库文档（PDF 等） | **rag**（`ask` / `search`） | 仅凭记忆或 `Read` 工作区外的库 |
 | 领域标准流程（PDF、专项规范） | **Skill**（先加载再动手） | 凭常识猜步骤 |
 | 外部系统（GitHub、Slack 等） | **MCP 网关**（如 `github`）→ `enable_tools` 披露 → `mcp_*` 子工具 | 编造 API 或直接 `call_tool` 猜参数 |
@@ -25,7 +25,7 @@
 
 **文件三连击**：改代码前 **Read** → 小改用 **Edit** → 新建或全文重写用 **Write**。`Edit` 前必须从 **Read** 复制原文（含缩进与换行）。
 
-**信息三连击**：工作区文件 → **Read**；用户知识库 → **rag**；历史偏好 → **memory_***；公网 → **web_search** / **web_fetch**。
+**信息三连击**：工作区文件 → **Read**；用户知识库 → **rag**；长期记忆/偏好 → **memory_search**；公网 → **web_search** / **web_fetch**。
 
 ---
 
@@ -46,14 +46,13 @@
 
 ## 3. 会话开始（有历史任务时）
 
-下列内容**已注入系统提示词**，无需再 Read：`IDENTITY.md`、`USER.md`、`SOUL.md`、`MEMORY.md`。
+下列内容**已注入系统提示词**，无需再 Read：`IDENTITY.md`、`USER.md`、`SOUL.md`。
 
 仍需按需执行：
 
-1. **memory_get** — 今日与昨日 `memory/YYYY-MM-DD.md`
-2. **memory_search** — 用户问题涉及过往偏好、人名、项目名时
-3. **rag** — 问题依赖「用户上传/入库的资料」时（`ask` 或 `search`）
-4. **Skill** — 任务匹配某领域技能（如 PDF）时，**在写代码或改文件之前**加载
+1. **memory_search** — 用户问题涉及过往偏好、人名、项目名时（语义检索长期记忆）
+2. **rag** — 问题依赖「用户上传/入库的资料」时（`ask` 或 `search`）
+3. **Skill** — 任务匹配某领域技能（如 PDF）时，**在写代码或改文件之前**加载
 5. **MCP 网关**（如 `github`）— 读网关描述选远端工具 → `enable_tools` 披露 → 调用 `mcp_{网关}_*` 子工具
 
 ---
@@ -63,7 +62,7 @@
 | 文件 | 说明 |
 |------|------|
 | AGENTS.md | 本指南 |
-| IDENTITY.md / USER.md / SOUL.md / MEMORY.md | 已注入，更新时用 Edit |
+| IDENTITY.md / USER.md / SOUL.md | 已注入，更新时用 Edit |
 | HEARTBEAT.md | 心跳任务 |
 | BOOTSTRAP.md | 首次初始化 |
 
@@ -80,16 +79,16 @@
 
 ### 5.2 记忆（memory_*）
 
+所有长期记忆存储在 Qdrant 向量数据库中，支持语义检索。Agent 按需调用，无需全量注入提示词。
+
 | 工具 | 何时用 |
 |------|--------|
-| memory_get | 读指定记忆文件或行范围 |
-| memory_search | 关键词搜索全部记忆 |
-| memory_add | 写入今日日记 |
-| memory_update_longterm | 更新长期要点（慎重） |
-| memory_list | 查看有哪些记忆文件 |
-| memory_cleanup | 清理过期每日记忆（需明确意图） |
-
-长期结构化信息在 **MEMORY.md**（已注入）；流水账在 **memory/日期.md**。
+| memory_search | 语义检索长期记忆（偏好、决策、实体等） |
+| memory_get | 按 ID 查询具体记忆 |
+| memory_add | 写入新的长期记忆 |
+| memory_list | 列出最近的记忆 |
+| memory_cleanup | 清理超过 7 天的过期记忆 |
+| memory_delete | 删除指定记忆（按 ID）
 
 ### 5.3 知识库（rag）
 

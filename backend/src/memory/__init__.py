@@ -1,6 +1,7 @@
 """记忆系统模块"""
 
-from .session_summarizer import SessionSummarizer
+from .capture import MemoryCaptureManager
 from .memory_flush import MemoryFlushManager
+from .vector_store import MemoryVectorStore
 
-__all__ = ["SessionSummarizer", "MemoryFlushManager"]
+__all__ = ["MemoryCaptureManager", "MemoryFlushManager", "MemoryVectorStore"]

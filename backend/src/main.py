@@ -53,11 +53,22 @@ async def lifespan(app: FastAPI):
 
     # 设置全局 workspace 实例
     config.set_workspace(workspace)
-    memory.set_workspace(workspace)
 
     # 初始化全局 Agent 实例
     _agent = MyClawAgent(workspace_path=workspace_path)
     print("MyClawAgent initialized")
+
+    # 将 memory_store 传递给 API 模块
+    if hasattr(_agent, "_memory_store") and _agent._memory_store:
+        memory.set_memory_store(_agent._memory_store)
+
+    # 启动时清理过期记忆（遗忘机制）
+    if hasattr(_agent, "_memory_store") and _agent._memory_store:
+        try:
+            deleted = _agent._memory_store.cleanup_expired()
+            print(f"🧹 启动时清理过期记忆: {deleted} 条")
+        except Exception as e:
+            print(f"⚠️ 清理过期记忆失败: {e}")
 
     # 防并发：所有对同一进程内 agent 的调用共享同一把锁
     _agent_lock = asyncio.Lock()

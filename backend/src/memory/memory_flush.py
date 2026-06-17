@@ -1,6 +1,5 @@
 """Memory Flush 管理器 - 在上下文压缩前提醒 Agent 保存记忆"""
 
-from datetime import datetime
 from typing import Optional, Tuple
 
 
@@ -64,15 +63,18 @@ class MemoryFlushManager:
         Returns:
             静默回合的提示词
         """
-        today = datetime.now().strftime("%Y-%m-%d")
-        return f"""Pre-compaction memory flush.
+        return """Pre-compaction memory flush.
 
 The conversation context is about to be compressed. Please save any important memories now.
 
 Guidelines:
-- Use memory_add to save notable facts, decisions, or user preferences to memory/{today}.md
-- Use memory_update_longterm for information that should persist across all sessions
-- Focus on information that would be valuable for future conversations
+- Use memory_add to save notable facts, decisions, user preferences, entity information,
+  plans, or rules into the long-term memory (Qdrant vector database).
+- Summarize key information from this conversation that would be valuable for future sessions.
+- Focus on information that helps personalize future interactions.
+
+All memories are stored as unified long-term memories with semantic retrieval capability.
+Do NOT write to files — use the memory_add tool exclusively.
 
 If nothing important needs to be stored, reply with exactly: [SILENT]"""
 

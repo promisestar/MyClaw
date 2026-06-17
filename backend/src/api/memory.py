@@ -1,22 +1,20 @@
-"""记忆 API 路由"""
+"""记忆 API 路由 — 基于 Qdrant 向量数据库"""
+
 import os
-from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 from typing import Optional, List, Dict
-
-from ..workspace.manager import WorkspaceManager
 
 router = APIRouter(prefix="/memory", tags=["memory"])
 
 
 class MemoryEntry(BaseModel):
     """记忆条目"""
-    date: str
-    filename: str
+    id: str
     content: str
-    preview: str
-    category: Optional[str] = None
+    category: str = "fact"
+    timestamp: int = 0
+    source: str = ""
 
 
 class MemoryListResponse(BaseModel):
@@ -27,16 +25,14 @@ class MemoryListResponse(BaseModel):
 
 class MemoryStatsResponse(BaseModel):
     """记忆统计响应"""
-    total_files: int
-    daily_files: int
-    total_size: int
+    total_count: int
     categories: Dict[str, int]
 
 
 class MemoryCaptureRequest(BaseModel):
     """记忆捕获请求"""
     content: str
-    category: str = "fact"  # preference/decision/entity/fact
+    category: str = "fact"
 
 
 class MemoryCaptureResponse(BaseModel):
@@ -49,207 +45,124 @@ class MemoryCaptureResponse(BaseModel):
 class MemoryCleanupResponse(BaseModel):
     """记忆清理响应"""
     status: str
-    deleted: List[str]
+    deleted: int
     message: str
 
 
-# 全局 workspace 实例（由 main.py 在启动时设置）
-_workspace: Optional[WorkspaceManager] = None
+# 全局 memory_store 实例（由 main.py 在启动时设置）
+_memory_store = None
 
 
-def set_workspace(ws: WorkspaceManager):
-    """设置全局 workspace 实例"""
-    global _workspace
-    _workspace = ws
+def set_memory_store(store):
+    """设置全局 memory_store 实例"""
+    global _memory_store
+    _memory_store = store
 
 
-def get_workspace() -> WorkspaceManager:
-    """获取 workspace 实例"""
-    if _workspace is None:
-        ws = WorkspaceManager(os.getenv("WORKSPACE_PATH", "~/.helloclaw/workspace"))
-        ws.ensure_workspace_exists()
-        set_workspace(ws)
-    return _workspace
+def get_memory_store():
+    """获取 memory_store 实例"""
+    return _memory_store
 
 
-def get_preview(content: str, max_length: int = 100) -> str:
-    """获取内容预览"""
-    # 移除 markdown 标记，获取纯文本预览
-    lines = content.strip().split('\n')
-    for line in lines:
-        line = line.strip()
-        if line and not line.startswith('#'):
-            return line[:max_length] + ('...' if len(line) > max_length else '')
-    return '(空)'
-
-
-# ==================== 静态路由（必须在 /{filename} 之前）====================
+def set_workspace(ws):
+    """兼容旧 API — 不再需要 workspace，保留空实现"""
+    pass
 
 
 @router.get("/list", response_model=MemoryListResponse)
 async def list_memories(
+    keyword: Optional[str] = Query(None, description="搜索关键词"),
     category: Optional[str] = Query(None, description="按分类过滤"),
-    ws: WorkspaceManager = Depends(get_workspace)
+    top_k: int = Query(50, description="返回条数"),
 ):
-    """获取每日记忆列表（支持分类过滤）
+    """获取记忆列表（语义检索或全量列出）"""
+    store = get_memory_store()
+    if not store:
+        return MemoryListResponse(memories=[], total=0)
 
-    Args:
-        category: 分类标签（preference/decision/entity/fact），可选
-    """
-    import re
+    if keyword:
+        results = store.search_memories(query=keyword, top_k=top_k, category=category)
+    else:
+        results = store._list_recent(top_k)
 
-    memories = []
-
-    if os.path.exists(ws.memory_path):
-        files = sorted(
-            [f for f in os.listdir(ws.memory_path) if f.endswith('.md')],
-            reverse=True  # 最新的在前面
+    memories = [
+        MemoryEntry(
+            id=r.get("id", ""),
+            content=r.get("content", ""),
+            category=r.get("category", "fact"),
+            timestamp=r.get("timestamp", 0),
+            source=r.get("source", ""),
         )
-
-        for filename in files:
-            filepath = os.path.join(ws.memory_path, filename)
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # 如果指定了分类，检查是否包含该分类的标签
-            if category:
-                pattern = rf'\[{category}\]'
-                if not re.search(pattern, content, re.IGNORECASE):
-                    continue
-
-            # 从文件名提取日期 (YYYY-MM-DD.md)
-            date = filename.replace('.md', '')
-
-            memories.append(MemoryEntry(
-                date=date,
-                filename=filename,
-                content=content,
-                preview=get_preview(content),
-                category=category
-            ))
+        for r in results
+    ]
 
     return MemoryListResponse(memories=memories, total=len(memories))
 
 
 @router.get("/stats", response_model=MemoryStatsResponse)
-async def get_memory_stats(ws: WorkspaceManager = Depends(get_workspace)):
+async def get_memory_stats():
     """获取记忆统计"""
-    import re
+    store = get_memory_store()
+    if not store:
+        return MemoryStatsResponse(total_count=0, categories={})
 
-    total_files = 0
-    daily_files = 0
-    total_size = 0
-    categories = {
-        "preference": 0,
-        "decision": 0,
-        "entity": 0,
-        "fact": 0,
-    }
-
-    # 统计每日记忆
-    if os.path.exists(ws.memory_path):
-        for filename in os.listdir(ws.memory_path):
-            if filename.endswith('.md'):
-                filepath = os.path.join(ws.memory_path, filename)
-                total_files += 1
-                daily_files += 1
-                total_size += os.path.getsize(filepath)
-
-                # 统计各分类标签数量
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                for cat in categories:
-                    pattern = rf'\[{cat}\]'
-                    count = len(re.findall(pattern, content, re.IGNORECASE))
-                    categories[cat] += count
-
-    # 统计长期记忆
-    longterm_path = ws.get_config_path("MEMORY")
-    if os.path.exists(longterm_path):
-        total_files += 1
-        total_size += os.path.getsize(longterm_path)
-
+    stats = store.get_stats()
     return MemoryStatsResponse(
-        total_files=total_files,
-        daily_files=daily_files,
-        total_size=total_size,
-        categories=categories
+        total_count=stats.get("total_count", 0),
+        categories=stats.get("categories", {}),
     )
-
-
-@router.post("/today")
-async def add_to_today(content: str, ws: WorkspaceManager = Depends(get_workspace)):
-    """添加内容到今日记忆"""
-    ws.append_to_daily_memory(content)
-    return {"status": "ok", "message": "已添加到今日记忆"}
 
 
 @router.post("/capture", response_model=MemoryCaptureResponse)
-async def capture_memory(
-    request: MemoryCaptureRequest,
-    ws: WorkspaceManager = Depends(get_workspace)
-):
+async def capture_memory(request: MemoryCaptureRequest):
     """手动添加记忆（带分类）"""
-    # 验证分类
-    valid_categories = ["preference", "decision", "entity", "fact"]
+    valid_categories = [
+        "preference", "decision", "entity", "fact",
+        "plan", "relationship", "reference", "rule",
+    ]
     if request.category not in valid_categories:
         raise HTTPException(
             status_code=400,
-            detail=f"无效的分类: {request.category}，有效值: {valid_categories}"
+            detail=f"无效的分类: {request.category}，有效值: {valid_categories}",
         )
 
-    # 检查重复
-    if ws.check_duplicate_memory(request.content, threshold=0.7):
-        return MemoryCaptureResponse(
-            status="skipped",
-            message="记忆已存在，跳过",
-            category=request.category
-        )
+    store = get_memory_store()
+    if not store:
+        raise HTTPException(status_code=503, detail="记忆存储未就绪")
 
-    # 存储记忆
-    ws.append_classified_memory(request.content, request.category)
-
-    return MemoryCaptureResponse(
-        status="ok",
-        message=f"已添加 [{request.category}] 记忆",
-        category=request.category
+    memory_id = store.add_memory(
+        content=request.content,
+        category=request.category,
+        source="api",
     )
+
+    if memory_id:
+        return MemoryCaptureResponse(
+            status="ok",
+            message=f"已添加 [{request.category}] 记忆",
+            category=request.category,
+        )
+    else:
+        return MemoryCaptureResponse(
+            status="error",
+            message="记忆写入失败",
+            category=request.category,
+        )
 
 
 @router.post("/cleanup", response_model=MemoryCleanupResponse)
 async def cleanup_memories(
-    days: int = Query(30, description="保留天数"),
-    ws: WorkspaceManager = Depends(get_workspace)
+    days: int = Query(7, description="保留天数"),
 ):
     """清理过期记忆"""
-    deleted = ws.cleanup_old_memories(days)
+    store = get_memory_store()
+    if not store:
+        raise HTTPException(status_code=503, detail="记忆存储未就绪")
+
+    deleted = store.cleanup_expired(days=days)
 
     return MemoryCleanupResponse(
         status="ok",
         deleted=deleted,
-        message=f"已清理 {len(deleted)} 个过期记忆文件"
+        message=f"已清理 {deleted} 条超过 {days} 天的过期记忆",
     )
-
-
-# ==================== 动态路由（必须放在最后）====================
-
-
-@router.get("/{filename}")
-async def get_memory(filename: str, ws: WorkspaceManager = Depends(get_workspace)):
-    """获取指定日期的记忆内容"""
-    if not filename.endswith('.md'):
-        filename += '.md'
-
-    filepath = os.path.join(ws.memory_path, filename)
-
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail=f"记忆文件 {filename} 不存在")
-
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    return {
-        "filename": filename,
-        "date": filename.replace('.md', ''),
-        "content": content
-    }

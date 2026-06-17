@@ -2,7 +2,7 @@
 import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Union, Literal
+from typing import List, Optional, Literal
 
 router = APIRouter(prefix="/session", tags=["session"])
 
@@ -21,29 +21,13 @@ class SessionListResponse(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     """创建会话请求"""
-    summarize_old: bool = False  # 是否总结旧会话
-    old_session_id: Optional[str] = None  # 要总结的旧会话 ID
+    pass
 
 
 class SessionCreateResponse(BaseModel):
     """创建会话响应"""
     session_id: str
     message: str = "Session created successfully"
-    summary_file: Optional[str] = None  # 如果总结了旧会话，返回总结文件名
-
-
-class SessionSummaryInfo(BaseModel):
-    """会话总结信息"""
-    filename: str
-    date: str
-    slug: str
-    size: int
-    updated_at: float
-
-
-class SessionSummaryListResponse(BaseModel):
-    """会话总结列表响应"""
-    summaries: List[SessionSummaryInfo]
 
 
 # ==================== OpenAI 标准消息格式 ====================
@@ -119,35 +103,11 @@ async def list_sessions():
 
 
 @router.post("/create", response_model=SessionCreateResponse)
-async def create_session(request: SessionCreateRequest = None):
-    """创建新会话
-
-    可选参数：
-    - summarize_old: 是否在创建新会话前总结旧会话
-    - old_session_id: 要总结的旧会话 ID（如果不指定，则总结最近一个会话）
-
-    返回新会话的 ID
-    """
+async def create_session():
+    """创建新会话，返回新会话的 ID"""
     agent = get_agent()
     if not agent:
         raise HTTPException(status_code=500, detail="Agent not initialized")
-
-    request = request or SessionCreateRequest()
-    summary_file = None
-
-    # 如果需要总结旧会话
-    if request.summarize_old:
-        old_session_id = request.old_session_id
-
-        # 如果没有指定旧会话，找最近的一个
-        if not old_session_id:
-            sessions = agent.list_sessions()
-            if sessions:
-                old_session_id = sessions[0]["id"]
-
-        # 总结旧会话
-        if old_session_id:
-            summary_file = await _summarize_session(agent, old_session_id)
 
     # 创建新会话并激活到 Agent 内存
     session_id = agent.create_session()
@@ -160,49 +120,8 @@ async def create_session(request: SessionCreateRequest = None):
 
     return SessionCreateResponse(
         session_id=session_id,
-        summary_file=summary_file,
-        message="Session created successfully" + (f", old session summarized to {summary_file}" if summary_file else "")
+        message="Session created successfully",
     )
-
-
-async def _summarize_session(agent, session_id: str) -> Optional[str]:
-    """总结指定会话
-
-    Args:
-        agent: Agent 实例
-        session_id: 会话 ID
-
-    Returns:
-        总结文件名，如果失败返回 None
-    """
-    try:
-        from ..memory import SessionSummarizer
-
-        # 获取会话历史
-        messages = agent.get_session_history(session_id)
-        if not messages:
-            return None
-
-        # 创建总结器
-        summarizer = SessionSummarizer(
-            workspace_manager=agent.workspace,
-            model_id=agent._model_id,
-            api_key=agent._api_key,
-            base_url=agent._base_url,
-        )
-
-        # 执行总结
-        summary_file = await summarizer.summarize_session(
-            messages=messages,
-            last_n=10,
-            session_id=session_id,
-        )
-
-        return summary_file
-
-    except Exception as e:
-        print(f"⚠️ 会话总结失败: {e}")
-        return None
 
 
 @router.get("/{session_id}")
@@ -332,45 +251,3 @@ async def delete_session(session_id: str):
 
     raise HTTPException(status_code=404, detail="Session not found")
 
-
-# ==================== 会话总结 API ====================
-
-@router.get("/summaries/list", response_model=SessionSummaryListResponse)
-async def list_session_summaries():
-    """获取所有会话总结列表
-
-    返回按日期倒序排列的会话总结
-    """
-    agent = get_agent()
-    if not agent:
-        return SessionSummaryListResponse(summaries=[])
-
-    summaries = agent.workspace.list_session_summaries()
-    return SessionSummaryListResponse(summaries=[
-        SessionSummaryInfo(
-            filename=s["filename"],
-            date=s["date"],
-            slug=s["slug"],
-            size=s["size"],
-            updated_at=s["updated_at"]
-        )
-        for s in summaries
-    ])
-
-
-@router.get("/summaries/{filename}")
-async def get_session_summary(filename: str):
-    """获取会话总结内容
-
-    Args:
-        filename: 总结文件名
-    """
-    agent = get_agent()
-    if not agent:
-        raise HTTPException(status_code=500, detail="Agent not initialized")
-
-    content = agent.workspace.load_session_summary(filename)
-    if content is None:
-        raise HTTPException(status_code=404, detail="Summary not found")
-
-    return {"filename": filename, "content": content}

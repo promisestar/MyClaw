@@ -128,7 +128,6 @@ def get_agent():
 @router.post("/reset")
 async def reset_workspace(
     reset_sessions: bool = False,
-    reset_memory: bool = False,
     reset_global_config: bool = False,
     ws: WorkspaceManager = Depends(get_workspace)
 ):
@@ -136,7 +135,6 @@ async def reset_workspace(
 
     Args:
         reset_sessions: 是否清除会话
-        reset_memory: 是否清除每日记忆
         reset_global_config: 是否重置全局配置
 
     警告：这将覆盖所有配置文件！
@@ -144,7 +142,6 @@ async def reset_workspace(
     try:
         ws.reset_to_templates(
             reset_sessions=reset_sessions,
-            reset_memory=reset_memory,
             reset_global_config=reset_global_config
         )
 
@@ -157,8 +154,6 @@ async def reset_workspace(
         messages = ["配置文件已重置"]
         if reset_sessions:
             messages.append("会话已清除")
-        if reset_memory:
-            messages.append("每日记忆已清除")
         if reset_global_config:
             messages.append("全局配置已重置")
 

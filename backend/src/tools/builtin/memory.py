@@ -1,7 +1,15 @@
-"""记忆工具 - 支持记忆检索和更新"""
+"""记忆工具 - 基于 Qdrant 向量数据库的长期记忆管理
+
+子动作：
+- memory_search: 语义检索记忆
+- memory_get: 按 ID 查询记忆
+- memory_add: 写入长期记忆（含 memory_update_longterm 的语义）
+- memory_list: 列出最近记忆
+- memory_cleanup: 清除过期记忆
+- memory_delete: 删除指定记忆
+"""
 
 from typing import List, Dict, Any, Optional
-import re
 
 from hello_agents.tools import Tool, ToolParameter, ToolResponse, tool_action
 
@@ -9,29 +17,34 @@ from hello_agents.tools import Tool, ToolParameter, ToolResponse, tool_action
 class MemoryTool(Tool):
     """记忆管理工具
 
-    可展开为多个子工具：
-    - memory_search: 搜索记忆（返回带行号的上下文）
-    - memory_get: 读取特定记忆文件或行范围
-    - memory_add: 添加每日记忆
-    - memory_update_longterm: 更新长期记忆
-    - memory_list: 列出所有记忆文件
+    所有记忆操作基于 Qdrant 向量数据库，提供语义检索能力。
+    记忆检索由 Agent 按需调用（与 RAGTool 使用方式一致）。
     """
 
-    def __init__(self, workspace_manager):
+    def __init__(self, memory_store=None, workspace_manager=None):
         """初始化记忆工具
 
         Args:
-            workspace_manager: 工作空间管理器实例
+            memory_store: MemoryVectorStore 实例（优先使用）
+            workspace_manager: WorkspaceManager 实例（过渡期回退）
         """
         super().__init__(
             name="memory",
-            description="记忆管理工具，支持搜索、读取、添加和更新记忆",
-            expandable=True
+            description="长期记忆管理工具：支持语义检索(memory_search)、按ID查询(memory_get)、"
+                        "写入记忆(memory_add)、列出近期记忆(memory_list)、清除过期记忆(memory_cleanup)、"
+                        "删除指定记忆(memory_delete)。"
+                        "当需要回忆之前的对话内容、用户偏好、历史决策、个人实体信息时，"
+                        "优先使用 memory_search 进行语义检索。",
+            expandable=True,
         )
-        self.workspace = workspace_manager
+        self.memory_store = memory_store
+        self.workspace = workspace_manager  # 过渡期回退
+
+    def _has_store(self) -> bool:
+        return self.memory_store is not None
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
-        """默认执行：搜索记忆"""
+        """默认执行：语义搜索记忆"""
         keyword = parameters.get("keyword", "")
         return self._search_memory(keyword)
 
@@ -40,196 +53,311 @@ class MemoryTool(Tool):
             ToolParameter(
                 name="keyword",
                 type="string",
-                description="搜索关键词",
-                required=True
+                description="搜索关键词（对记忆进行语义检索）",
+                required=True,
             )
         ]
 
-    def _search_memory(self, keyword: str, context_lines: int = 3) -> ToolResponse:
-        """搜索记忆（增强版，返回带行号的上下文）"""
+    # ── memory_search: 语义检索 ──────────────────────────
+
+    @tool_action("memory_search", "语义检索长期记忆（基于向量相似度）")
+    def _search(
+        self,
+        keyword: str,
+        top_k: int = 5,
+        category: str = None,
+    ) -> ToolResponse:
+        """语义检索记忆
+
+        Args:
+            keyword: 检索关键词或问题
+            top_k: 返回结果数量，默认 5
+            category: 按分类过滤（preference/decision/entity/fact/plan/relationship/reference/rule），可选
+        """
         if not keyword:
             return ToolResponse.error(
                 code="INVALID_INPUT",
-                message="请提供搜索关键词"
+                message="请提供检索关键词",
             )
 
-        # 使用增强搜索
-        results = self.workspace.search_memory_enhanced(
-            keyword,
-            context_lines=context_lines
+        if self._has_store():
+            results = self.memory_store.search_memories(
+                query=keyword,
+                top_k=top_k,
+                category=category,
+            )
+            return self._format_search_results(results, keyword)
+        elif self.workspace:
+            # 回退到旧的文件搜索
+            return self._fallback_file_search(keyword)
+        else:
+            return ToolResponse.error(
+                code="NO_STORE",
+                message="记忆存储未初始化",
+            )
+
+    def _format_search_results(self, results: List[dict], keyword: str) -> ToolResponse:
+        """格式化语义检索结果"""
+        if not results:
+            return ToolResponse.success(
+                text=f"未找到与 '{keyword}' 语义相关的记忆。",
+                data={"results": [], "keyword": keyword, "count": 0},
+            )
+
+        from datetime import datetime
+
+        lines = [f"找到 {len(results)} 条与 '{keyword}' 相关的长期记忆：\n"]
+        for i, r in enumerate(results, 1):
+            score = r.get("score", 0)
+            score_str = f"{score:.3f}" if isinstance(score, float) and score > 0 else "?"
+
+            # 格式化时间
+            ts = r.get("timestamp", 0)
+            time_str = ""
+            if ts:
+                try:
+                    dt = datetime.fromtimestamp(ts)
+                    time_str = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    time_str = ""
+
+            cat = r.get("category", "fact")
+            content = r.get("content", "")
+            mem_id = r.get("id", "?")
+            lines.append(
+                f"### 记忆 {i} [{cat}] (相似度: {score_str})"
+                + (f" ({time_str})" if time_str else "")
+                + f"\nID: `{mem_id}`\n{content}\n"
+            )
+
+        return ToolResponse.success(
+            text="\n".join(lines),
+            data={"results": results, "keyword": keyword, "count": len(results)},
         )
 
+    def _fallback_file_search(self, keyword: str) -> ToolResponse:
+        """回退到旧的文件搜索"""
+        if not self.workspace:
+            return ToolResponse.error(code="NO_STORE", message="记忆存储未初始化")
+
+        results = self.workspace.search_memory_enhanced(keyword, context_lines=3)
         if not results:
             return ToolResponse.success(
                 text=f"未找到与 '{keyword}' 相关的记忆",
-                data={"results": [], "keyword": keyword}
+                data={"results": [], "keyword": keyword},
             )
 
-        # 格式化结果
         formatted_parts = []
         total_matches = 0
-
         for r in results:
             source = r["source"]
             matches = r["matches"]
             total_matches += len(matches)
-
             for m in matches:
                 start = m["start_line"]
                 end = m["end_line"]
                 content = m["content"]
                 line_range = f"行 {start}" if start == end else f"行 {start}-{end}"
-                formatted_parts.append(
-                    f"**{source}** ({line_range}):\n```\n{content}\n```"
-                )
+                formatted_parts.append(f"**{source}** ({line_range}):\n```\n{content}\n```")
 
         return ToolResponse.success(
             text=f"找到 {total_matches} 处匹配 '{keyword}':\n\n" + "\n\n".join(formatted_parts),
-            data={"results": results, "count": total_matches, "keyword": keyword}
+            data={"results": results, "count": total_matches, "keyword": keyword},
         )
 
-    @tool_action("memory_search", "搜索历史记忆")
-    def _search(self, keyword: str, context_lines: int = 3) -> ToolResponse:
-        """搜索记忆
+    # ── memory_get: 按 ID 查询 ──────────────────────────
+
+    @tool_action("memory_get", "按记忆 ID 查询具体内容")
+    def _get_memory(self, memory_id: str) -> ToolResponse:
+        """按记忆 ID 查询具体内容
 
         Args:
-            keyword: 搜索关键词
-            context_lines: 上下文行数，默认 3
+            memory_id: 记忆的唯一标识符（UUID 格式）
         """
-        return self._search_memory(keyword, context_lines)
+        if not memory_id:
+            return ToolResponse.error(code="INVALID_INPUT", message="请提供 memory_id")
 
-    @tool_action("memory_get", "读取特定记忆文件或行范围")
-    def _get_memory(
-        self,
-        filename: str = None,
-        start_line: int = None,
-        end_line: int = None,
-        lines: str = None,
-    ) -> ToolResponse:
-        """读取记忆文件内容
-
-        Args:
-            filename: 文件名（MEMORY.md 或 YYYY-MM-DD.md），默认为今天的日记
-            start_line: 起始行号（从 1 开始）
-            end_line: 结束行号
-            lines: 行范围字符串，如 "10-20" 或 "15"
-        """
-        from datetime import datetime
-
-        # 解析 lines 参数
-        if lines:
-            match = re.match(r"(\d+)(?:\s*-\s*(\d+))?", lines)
-            if match:
-                start_line = int(match.group(1))
-                if match.group(2):
-                    end_line = int(match.group(2))
-
-        # 默认文件名
-        if not filename:
-            filename = datetime.now().strftime("%Y-%m-%d.md")
-
-        # 确保文件名以 .md 结尾
-        if not filename.endswith(".md"):
-            filename += ".md"
-
-        # 读取文件
-        content = self.workspace.read_memory_lines(filename, start_line, end_line)
-
-        if content is None:
-            available = self._list_memory_files_brief()
+        if self._has_store():
+            # 用特定 ID 检索（Qdrant 不支持 batch get by id，用搜索兜底）
+            results = self.memory_store.search_memories(
+                query=memory_id, top_k=20, score_threshold=0.0
+            )
+            for r in results:
+                if r.get("id") == memory_id:
+                    from datetime import datetime
+                    ts = r.get("timestamp", 0)
+                    time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else ""
+                    content = r.get("content", "")
+                    cat = r.get("category", "fact")
+                    return ToolResponse.success(
+                        text=f"### 记忆 [{cat}] ({time_str})\nID: `{memory_id}`\n\n{content}",
+                        data=r,
+                    )
             return ToolResponse.error(
                 code="NOT_FOUND",
-                message=f"文件 '{filename}' 不存在。可用文件:\n{available}"
+                message=f"未找到 ID 为 '{memory_id}' 的记忆",
             )
+        elif self.workspace:
+            # 回退
+            content = self.workspace.read_memory_lines(memory_id)
+            if content:
+                return ToolResponse.success(text=content)
+            return ToolResponse.error(code="NOT_FOUND", message=f"未找到记忆 '{memory_id}'")
 
-        if not content:
-            return ToolResponse.success(text=f"文件 '{filename}' 为空")
+        return ToolResponse.error(code="NO_STORE", message="记忆存储未初始化")
 
-        display_name = filename
-        if start_line or end_line:
-            range_str = f"行 {start_line or 1}"
-            if end_line and end_line != start_line:
-                range_str += f"-{end_line}"
-            display_name += f" ({range_str})"
+    # ── memory_add: 写入长期记忆 ─────────────────────────
 
-        return ToolResponse.success(text=f"**{display_name}**:\n```\n{content}\n```")
-
-    @tool_action("memory_add", "添加内容到今日记忆")
-    def _add_daily(self, content: str, category: str = None) -> ToolResponse:
-        """添加每日记忆
+    @tool_action("memory_add", "写入一条新的长期记忆")
+    def _add_memory(
+        self,
+        content: str,
+        category: str = "fact",
+        session_id: str = None,
+    ) -> ToolResponse:
+        """写入长期记忆（合并了旧 memory_update_longterm 的功能）
 
         Args:
             content: 记忆内容
-            category: 分类标签（preference/decision/entity/fact），可选
+            category: 分类标签（preference/decision/entity/fact/plan/relationship/reference/rule）
+            session_id: 关联的会话 ID（可选）
         """
-        if category:
-            # 使用带分类标签的存储
+        if not content:
+            return ToolResponse.error(code="INVALID_INPUT", message="请提供记忆内容")
+
+        if self._has_store():
+            memory_id = self.memory_store.add_memory(
+                content=content,
+                category=category,
+                session_id=session_id,
+                source="agent",
+            )
+            if memory_id:
+                return ToolResponse.success(
+                    text=f"已写入长期记忆 [{category}]: {content[:80]}...",
+                    data={"memory_id": memory_id, "category": category},
+                )
+            return ToolResponse.error(code="WRITE_FAILED", message="记忆写入失败")
+
+        elif self.workspace:
+            # 回退到旧存储
             self.workspace.append_classified_memory(content, category)
-            return ToolResponse.success(text=f"已添加到今日记忆 [{category}]: {content[:50]}...")
-        else:
-            # 使用原有方法
-            self.workspace.append_to_daily_memory(content)
-            return ToolResponse.success(text=f"已添加到今日记忆: {content[:50]}...")
+            return ToolResponse.success(
+                text=f"已写入记忆 [{category}]: {content[:80]}...",
+            )
 
-    @tool_action("memory_update_longterm", "更新长期记忆")
+        return ToolResponse.error(code="NO_STORE", message="记忆存储未初始化")
+
+    @tool_action(
+        "memory_update_longterm",
+        "更新长期记忆（已弃用，请使用 memory_add 代替）",
+    )
     def _update_longterm(self, content: str) -> ToolResponse:
-        """更新长期记忆
+        """更新长期记忆（已弃用，自动转发到 memory_add）"""
+        return self._add_memory(content=content, category="fact")
+
+    # ── memory_list: 列出近期记忆 ────────────────────────
+
+    @tool_action("memory_list", "列出最近的长期记忆")
+    def _list(self, top_k: int = 20) -> ToolResponse:
+        """列出最近的长期记忆
 
         Args:
-            content: 要添加到长期记忆的内容
+            top_k: 返回条数，默认 20
         """
-        current = self.workspace.load_config("MEMORY") or ""
-        updated = current + f"\n\n## 新增\n\n{content}\n"
-        self.workspace.save_config("MEMORY", updated)
-        return ToolResponse.success(text="已更新长期记忆")
+        if self._has_store():
+            results = self.memory_store._list_recent(top_k)
+            if not results:
+                return ToolResponse.success(text="暂无长期记忆")
 
-    @tool_action("memory_list", "列出所有记忆文件")
-    def _list(self) -> ToolResponse:
-        """列出所有记忆文件"""
-        files = self.workspace.list_memory_files()
+            from datetime import datetime
 
-        if not files:
-            return ToolResponse.success(text="暂无记忆文件")
+            lines = [f"# 最近 {len(results)} 条长期记忆\n"]
+            for i, r in enumerate(results, 1):
+                ts = r.get("timestamp", 0)
+                time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else ""
+                cat = r.get("category", "fact")
+                mem_id = r.get("id", "?")
+                content = r.get("content", "")
+                lines.append(f"### {i}. [{cat}] ({time_str})\nID: `{mem_id}`\n{content}\n")
 
-        lines = ["# 记忆文件列表\n"]
+            return ToolResponse.success(
+                text="\n".join(lines),
+                data={"memories": results, "count": len(results)},
+            )
 
-        # 按类型分组
-        longterm = [f for f in files if f["type"] == "longterm"]
-        daily = [f for f in files if f["type"] == "daily"]
-
-        if longterm:
-            lines.append("## 长期记忆")
-            for f in longterm:
+        elif self.workspace:
+            # 回退
+            files = self.workspace.list_memory_files()
+            if not files:
+                return ToolResponse.success(text="暂无记忆文件")
+            lines = ["# 记忆文件列表\n"]
+            for f in files:
                 size_kb = f["size"] / 1024
-                lines.append(f"- **{f['name']}** ({size_kb:.1f} KB)")
+                lines.append(f"- **{f['name']}** ({f['type']}, {size_kb:.1f} KB)")
+            return ToolResponse.success(text="\n".join(lines))
 
-        if daily:
-            lines.append("\n## 每日记忆")
-            for f in daily:
-                size_kb = f["size"] / 1024
-                lines.append(f"- **{f['name']}** ({size_kb:.1f} KB)")
+        return ToolResponse.error(code="NO_STORE", message="记忆存储未初始化")
 
-        return ToolResponse.success(text="\n".join(lines))
+    # ── memory_cleanup: 清除过期记忆 ─────────────────────
 
-    @tool_action("memory_cleanup", "清理过期的每日记忆")
-    def _cleanup(self, days: int = 30) -> ToolResponse:
-        """清理过期记忆
+    @tool_action("memory_cleanup", "清除超过指定天数的过期长期记忆")
+    def _cleanup(self, days: int = 7) -> ToolResponse:
+        """清除过期的长期记忆（遗忘机制）
 
         Args:
-            days: 保留天数，超过此天数将被清理，默认 30 天
+            days: 保留天数，超过此天数将被清除，默认 7 天
         """
-        deleted = self.workspace.cleanup_old_memories(days)
+        if self._has_store():
+            deleted = self.memory_store.cleanup_expired(days=days)
+            return ToolResponse.success(
+                text=f"已清除 {deleted} 条超过 {days} 天的过期记忆",
+                data={"deleted": deleted, "days": days},
+            )
 
-        if not deleted:
-            return ToolResponse.success(text=f"没有需要清理的记忆（保留最近 {days} 天）")
+        elif self.workspace:
+            # 回退
+            deleted = self.workspace.cleanup_old_memories(days)
+            if not deleted:
+                return ToolResponse.success(text=f"没有需要清理的记忆（保留最近 {days} 天）")
+            return ToolResponse.success(
+                text=f"已清理 {len(deleted)} 个过期记忆文件",
+                data={"deleted": deleted},
+            )
 
-        return ToolResponse.success(
-            text=f"已清理 {len(deleted)} 个过期记忆文件:\n" + "\n".join(f"- {f}" for f in deleted)
-        )
+        return ToolResponse.error(code="NO_STORE", message="记忆存储未初始化")
 
-    def _list_memory_files_brief(self) -> str:
-        """简要列出记忆文件"""
-        files = self.workspace.list_memory_files()
-        if not files:
-            return "无"
-        return "\n".join(f"- {f['name']}" for f in files)
+    # ── memory_delete: 删除指定记忆 ──────────────────────
+
+    @tool_action("memory_delete", "删除指定的长期记忆（按 ID）")
+    def _delete(self, memory_id: str = None, memory_ids: str = None) -> ToolResponse:
+        """删除指定长期记忆
+
+        Args:
+            memory_id: 单个记忆 ID
+            memory_ids: 多个记忆 ID，用逗号分隔
+        """
+        ids: List[str] = []
+        if memory_ids:
+            ids = [i.strip() for i in memory_ids.split(",") if i.strip()]
+        if memory_id:
+            ids.append(memory_id.strip())
+
+        if not ids:
+            return ToolResponse.error(code="INVALID_INPUT", message="请提供要删除的记忆 ID")
+
+        if self._has_store():
+            success = self.memory_store.delete_memories(ids)
+            if success:
+                return ToolResponse.success(
+                    text=f"已删除 {len(ids)} 条记忆",
+                    data={"deleted_ids": ids},
+                )
+            return ToolResponse.error(code="DELETE_FAILED", message="记忆删除失败")
+
+        elif self.workspace:
+            return ToolResponse.success(
+                text="文件存储模式下不支持按 ID 删除，请使用 memory_cleanup 清理过期记忆",
+            )
+
+        return ToolResponse.error(code="NO_STORE", message="记忆存储未初始化")
