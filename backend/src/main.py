@@ -7,8 +7,11 @@ import asyncio
 # 禁用 PYTHONSTARTUP 以避免 I/O 问题
 os.environ.pop("PYTHONSTARTUP", None)
 
-from contextlib import asynccontextmanager
+# 加载环境变量（必须在所有项目 import 之前，因为 vector_store.py 在 import 时读取 env）
 from dotenv import load_dotenv
+load_dotenv()
+
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -16,9 +19,6 @@ from .api import chat, session, config, memory, upload, knowledge_base, tool_log
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
-
-# 加载环境变量
-load_dotenv()
 
 # 全局 Agent 实例
 _agent: MyClawAgent = None
