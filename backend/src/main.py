@@ -62,13 +62,13 @@ async def lifespan(app: FastAPI):
     if hasattr(_agent, "_memory_store") and _agent._memory_store:
         memory.set_memory_store(_agent._memory_store)
 
-    # 启动时清理过期记忆（遗忘机制）
+    # 启动时处理记忆衰减（遗忘机制 - 懒策略）
     if hasattr(_agent, "_memory_store") and _agent._memory_store:
         try:
-            deleted = _agent._memory_store.cleanup_expired()
-            print(f"🧹 启动时清理过期记忆: {deleted} 条")
+            result = _agent._memory_store.process_decay()
+            print(f"🧹 记忆衰减处理: 总计 {result['total']} 条，删除 {result['deleted']} 条，更新 {result['updated']} 条")
         except Exception as e:
-            print(f"⚠️ 清理过期记忆失败: {e}")
+            print(f"⚠️ 记忆衰减处理失败: {e}")
 
     # 防并发：所有对同一进程内 agent 的调用共享同一把锁
     _agent_lock = asyncio.Lock()

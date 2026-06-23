@@ -299,27 +299,28 @@ class MemoryTool(Tool):
 
         return ToolResponse.error(code="NO_STORE", message="记忆存储未初始化")
 
-    # ── memory_cleanup: 清除过期记忆 ─────────────────────
+    # ── memory_cleanup: 衰减处理（删除归零记忆） ──────────
 
-    @tool_action("memory_cleanup", "清除超过指定天数的过期长期记忆")
-    def _cleanup(self, days: int = 7) -> ToolResponse:
-        """清除过期的长期记忆（遗忘机制）
+    @tool_action("memory_cleanup", "处理记忆衰减，删除衰减分数归零的长期记忆")
+    def _cleanup(self) -> ToolResponse:
+        """处理记忆衰减（懒策略）
 
-        Args:
-            days: 保留天数，超过此天数将被清除，默认 7 天
+        遍历所有记忆，根据分类对应的衰减速率计算当前衰减分数。
+        衰减分数归零的记忆被删除，其余记忆更新分数。
+        被检索命中的记忆会重置衰减计时器（访问强化）。
         """
         if self._has_store():
-            deleted = self.memory_store.cleanup_expired(days=days)
+            result = self.memory_store.process_decay()
             return ToolResponse.success(
-                text=f"已清除 {deleted} 条超过 {days} 天的过期记忆",
-                data={"deleted": deleted, "days": days},
+                text=f"衰减处理完成: 总计 {result['total']} 条，删除 {result['deleted']} 条，更新 {result['updated']} 条",
+                data=result,
             )
 
         elif self.workspace:
             # 回退
-            deleted = self.workspace.cleanup_old_memories(days)
+            deleted = self.workspace.cleanup_old_memories(7)
             if not deleted:
-                return ToolResponse.success(text=f"没有需要清理的记忆（保留最近 {days} 天）")
+                return ToolResponse.success(text="没有需要清理的记忆")
             return ToolResponse.success(
                 text=f"已清理 {len(deleted)} 个过期记忆文件",
                 data={"deleted": deleted},

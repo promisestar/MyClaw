@@ -151,18 +151,16 @@ async def capture_memory(request: MemoryCaptureRequest):
 
 
 @router.post("/cleanup", response_model=MemoryCleanupResponse)
-async def cleanup_memories(
-    days: int = Query(7, description="保留天数"),
-):
-    """清理过期记忆"""
+async def cleanup_memories():
+    """处理记忆衰减（懒策略：计算衰减分数，删除归零记忆）"""
     store = get_memory_store()
     if not store:
         raise HTTPException(status_code=503, detail="记忆存储未就绪")
 
-    deleted = store.cleanup_expired(days=days)
+    result = store.process_decay()
 
     return MemoryCleanupResponse(
         status="ok",
-        deleted=deleted,
-        message=f"已清理 {deleted} 条超过 {days} 天的过期记忆",
+        deleted=result["deleted"],
+        message=f"衰减处理完成: 总计 {result['total']} 条，删除 {result['deleted']} 条，更新 {result['updated']} 条",
     )
