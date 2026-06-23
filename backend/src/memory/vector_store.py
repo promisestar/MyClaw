@@ -345,7 +345,8 @@ class MemoryVectorStore:
         if not self.available:
             return {"deleted": 0, "updated": 0, "total": 0}
 
-        from qdrant_client.http.models import PointIdsList
+        from qdrant_client.http.models import PointIdsList, Filter, FieldCondition
+        from qdrant_client.http import models
 
         now_ts = int(datetime.now().timestamp())
         interval_seconds = DECAY_INTERVAL_DAYS * 86400
@@ -357,11 +358,20 @@ class MemoryVectorStore:
         to_delete: list = []
         to_update: list = []  # [(point_id, {"decay_score": float, "last_decay_ts": int}), ...]
 
+        # 仅处理记忆 chunk（memory_type=longterm），不触碰同 collection 中的 RAG chunk
+        memory_filter = Filter(must=[
+            FieldCondition(
+                key="memory_type",
+                match=models.MatchValue(value="longterm"),
+            )
+        ])
+
         try:
             offset = None
             while True:
                 points, next_offset = self._qdrant.client.scroll(
                     collection_name=self.collection_name,
+                    scroll_filter=memory_filter,
                     limit=200,
                     offset=offset,
                     with_payload=True,
@@ -505,10 +515,22 @@ class MemoryVectorStore:
             score_sum = 0.0
 
             try:
+                from qdrant_client.http.models import Filter, FieldCondition
+                from qdrant_client.http import models
+
+                # 仅统计记忆 chunk，不包含 RAG chunk
+                memory_filter = Filter(must=[
+                    FieldCondition(
+                        key="memory_type",
+                        match=models.MatchValue(value="longterm"),
+                    )
+                ])
+
                 offset = None
                 while True:
                     points, next_offset = self._qdrant.client.scroll(
                         collection_name=self.collection_name,
+                        scroll_filter=memory_filter,
                         limit=200,
                         offset=offset,
                         with_payload=True,
