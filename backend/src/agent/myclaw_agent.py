@@ -42,7 +42,7 @@ class MyClawAgent:
         model_id: str = None,
         api_key: str = None,
         base_url: str = None,
-        max_tool_iterations: int = 10,
+        max_tool_iterations: int = 15,
         max_tool_retries: Optional[int] = None,
     ):
         """初始化 HelloClaw Agent
@@ -141,6 +141,7 @@ class MyClawAgent:
             tool_retry_max_delay=tool_retry_max_delay,
             tool_retry_backoff=tool_retry_backoff,
             tool_retry_jitter=tool_retry_jitter,
+            max_tools_per_round=5,
         )
 
         # 初始化 Memory Flush 管理器

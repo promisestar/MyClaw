@@ -92,6 +92,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         tool_retry_max_delay: float = 15.0,
         tool_retry_backoff: float = 2.0,
         tool_retry_jitter: float = 0.2,
+        max_tools_per_round: int = 5,
     ):
         """初始化 EnhancedSimpleAgent
 
@@ -132,6 +133,11 @@ class EnhancedSimpleAgent(SimpleAgent):
         self.tool_retry_max_delay = max(tool_retry_max_delay, 1.0)
         self.tool_retry_backoff = max(tool_retry_backoff, 1.0)
         self.tool_retry_jitter = max(min(tool_retry_jitter, 0.5), 0.0)
+
+        # 每轮工具调用上限 + 去重（防止 LLM 在单个响应中生成过多重复调用）
+        self.max_tools_per_round = max(max_tools_per_round, 1)
+        self._tools_executed_this_round = 0
+        self._tool_call_dedup: Set[str] = set()
 
         # 解耦的上下文管理（替代基类 Agent 内嵌的压缩逻辑）
         self.context_manager = ContextManager(
@@ -549,7 +555,12 @@ class EnhancedSimpleAgent(SimpleAgent):
         tool_results_by_id: Dict[str, str],
         executed_ids: Set[str],
     ) -> AsyncGenerator[StreamEvent, None]:
-        """若工具参数 JSON 已完整，立即执行该工具。"""
+        """若工具参数 JSON 已完整，立即执行该工具。
+
+        包含两个保护机制：
+        1. 去重：同一轮中相同工具 + 相同参数只执行一次
+        2. 限量：每轮最多执行 max_tools_per_round 个工具调用
+        """
         if tc_state.get("executed"):
             return
 
@@ -569,6 +580,70 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         tc_state["executed"] = True
         executed_ids.add(tool_call_id)
+
+        # ── 去重检查：相同工具 + 相同参数只执行一次 ──
+        dedup_key = f"{tool_name}:{args_str}"
+        if dedup_key in self._tool_call_dedup:
+            skip_msg = f"⚠️ 重复调用已跳过（同一轮中已执行过相同参数的 {tool_name}）"
+            tool_results_by_id[tool_call_id] = skip_msg
+            tool_call_records.append({
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "args": arguments,
+                "result": skip_msg,
+                "status": "skipped_dedup"
+            })
+            yield StreamEvent.create(
+                StreamEventType.TOOL_CALL_START,
+                self.name,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                args=arguments,
+            )
+            await asyncio.sleep(0)
+            yield StreamEvent.create(
+                StreamEventType.TOOL_CALL_FINISH,
+                self.name,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                result=skip_msg,
+            )
+            return
+
+        # ── 限量检查：超过本轮上限时跳过 ──
+        if self._tools_executed_this_round >= self.max_tools_per_round:
+            skip_msg = (
+                f"⚠️ 已达到本轮工具调用上限({self.max_tools_per_round})，此调用被跳过。"
+                f"请基于已有工具结果继续分析，不要在同一轮中生成过多工具调用。"
+            )
+            tool_results_by_id[tool_call_id] = skip_msg
+            tool_call_records.append({
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "args": arguments,
+                "result": skip_msg,
+                "status": "skipped_limit"
+            })
+            yield StreamEvent.create(
+                StreamEventType.TOOL_CALL_START,
+                self.name,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                args=arguments,
+            )
+            await asyncio.sleep(0)
+            yield StreamEvent.create(
+                StreamEventType.TOOL_CALL_FINISH,
+                self.name,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                result=skip_msg,
+            )
+            return
+
+        # ── 正常执行 ──
+        self._tool_call_dedup.add(dedup_key)
+        self._tools_executed_this_round += 1
         async for event in self._yield_tool_call_execution(
             tool_name=tool_name,
             tool_call_id=tool_call_id,
@@ -902,6 +977,10 @@ class EnhancedSimpleAgent(SimpleAgent):
                 executed_ids: Set[str] = set()
                 iteration_tool_records: List[Dict[str, Any]] = []
 
+                # 重置每轮工具调用计数器和去重集合
+                self._tools_executed_this_round = 0
+                self._tool_call_dedup = set()
+
                 # 使用 LLM 的流式工具调用方法
                 try:
                     async for event in self.llm.astream_invoke_with_tools(
@@ -1049,6 +1128,36 @@ class EnhancedSimpleAgent(SimpleAgent):
                             yield tool_event
                         continue
 
+                    # 限量检查（兜底路径同样受限）
+                    if self._tools_executed_this_round >= self.max_tools_per_round:
+                        skip_msg = f"⚠️ 已达到本轮工具调用上限({self.max_tools_per_round})，此调用被跳过。"
+                        tool_results_by_id[tool_call_id] = skip_msg
+                        iteration_tool_records.append({
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "args": arguments,
+                            "result": skip_msg,
+                            "status": "skipped_limit"
+                        })
+                        executed_ids.add(tool_call_id)
+                        yield StreamEvent.create(
+                            StreamEventType.TOOL_CALL_START,
+                            self.name,
+                            tool_name=tool_name,
+                            tool_call_id=tool_call_id,
+                            args=arguments,
+                        )
+                        await asyncio.sleep(0)
+                        yield StreamEvent.create(
+                            StreamEventType.TOOL_CALL_FINISH,
+                            self.name,
+                            tool_name=tool_name,
+                            tool_call_id=tool_call_id,
+                            result=skip_msg,
+                        )
+                        continue
+
+                    self._tools_executed_this_round += 1
                     async for tool_event in self._yield_tool_call_execution(
                         tool_name=tool_name,
                         tool_call_id=tool_call_id,

@@ -117,7 +117,7 @@ class SkillTool(Tool):
             # 替换 $ARGUMENTS 占位符
             content = skill.body.replace("$ARGUMENTS", args)
 
-            # 列出可用资源
+            # 列出可用资源（含完整路径）
             resources_hint = self._get_resources_hint(skill)
 
             # 构造完整技能内容
@@ -128,8 +128,9 @@ class SkillTool(Tool):
 
 ✅ 技能已加载：{skill.name}
 📝 描述：{skill.description}
+📁 技能目录：{skill.dir}
 
-请严格遵循上述技能说明来完成用户任务。"""
+⚠️ 上述「可用资源」中已列出所有脚本和文档的完整路径。请直接使用这些路径执行脚本或读取文件，不要搜索文件系统。"""
 
             return ToolResponse.success(
                 text=full_content,
@@ -150,13 +151,13 @@ class SkillTool(Tool):
             )
 
     def _get_resources_hint(self, skill) -> str:
-        """生成资源提示文本
+        """生成资源提示文本（含完整路径）
 
         Args:
             skill: Skill 对象
 
         Returns:
-            格式化的资源提示文本
+            格式化的资源提示文本，每个文件附带绝对路径
         """
         resources = []
 
@@ -168,17 +169,20 @@ class SkillTool(Tool):
         ]:
             folder_path = skill.dir / folder
             if folder_path.exists():
-                files = list(folder_path.glob("*"))
+                files = [f for f in folder_path.rglob("*") if f.is_file()]
                 if files:
-                    file_list = ", ".join(f.name for f in files[:5])
-                    if len(files) > 5:
-                        file_list += f" 等 {len(files)} 个文件"
-                    resources.append(f"  - {label}：{file_list}")
+                    # 列出完整路径，便于 Agent 直接使用
+                    file_list = "\n".join(
+                        f"    - {f}" for f in files[:10]
+                    )
+                    if len(files) > 10:
+                        file_list += f"\n    - ... 等 {len(files)} 个文件"
+                    resources.append(f"  - {label}（{folder_path}）：\n{file_list}")
 
         if not resources:
             return ""
 
-        return "\n\n**可用资源**：\n" + "\n".join(resources)
+        return "\n\n**可用资源**（以下为完整路径，请直接使用）：\n" + "\n".join(resources)
 
     def refresh_description(self):
         """刷新工具描述（技能列表变化时调用）"""
