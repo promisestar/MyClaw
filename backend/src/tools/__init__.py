@@ -6,6 +6,7 @@ from .builtin.web_search import WebSearchTool
 from .builtin.web_fetch import WebFetchTool
 from .builtin.rag_tool import RAGTool
 from .builtin.mcp_tool import MCPTool
+from .builtin.skill_tool import SkillTool
 
 __all__ = [
     "MemoryTool",
@@ -14,4 +15,5 @@ __all__ = [
     "WebFetchTool",
     "RAGTool",
     "MCPTool",
+    "SkillTool",
 ]

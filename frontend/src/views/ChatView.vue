@@ -17,6 +17,7 @@ import { configApi } from '@/api/config'
 import { uploadApi } from '@/api/upload'
 import { renderMarkdown, formatTime } from '@/utils/markdown'
 import { getToolConfig, formatToolArgs, formatToolResult } from '@/utils/toolDisplay'
+import { skillsApi, type SkillInfo } from '@/api/skills'
 import LobsterIcon from '@/assets/lobster.svg'
 
 // localStorage key for saving current session
@@ -72,6 +73,66 @@ const uploading = ref(false)
 const editModalOpen = ref(false)
 const editDraft = ref('')
 const editingUserTurnIndex = ref<number | null>(null)
+
+// 技能触发相关状态
+const skillSuggestions = ref<SkillInfo[]>([])
+const skillDropdownVisible = ref(false)
+const skillSelectedIndex = ref(-1)
+
+const showSkillDropdown = () => {
+  const text = inputMessage.value
+  return text === '/' || /^\/[^\s]*$/.test(text)
+}
+
+const filterSkills = async () => {
+  const text = inputMessage.value
+  if (!text.startsWith('/')) {
+    skillDropdownVisible.value = false
+    return
+  }
+  const query = text.slice(1).toLowerCase()
+  try {
+    const res = await skillsApi.list()
+    skillSuggestions.value = res.skills.filter(
+      (s) => s.enabled && (
+        !query || s.name.toLowerCase().includes(query) || s.description.toLowerCase().includes(query)
+      )
+    )
+    skillDropdownVisible.value = skillSuggestions.value.length > 0
+    skillSelectedIndex.value = -1
+  } catch {
+    skillDropdownVisible.value = false
+  }
+}
+
+const selectSkill = (skill: SkillInfo) => {
+  inputMessage.value = `/${skill.name} `
+  skillDropdownVisible.value = false
+}
+
+const handleSkillKeydown = (e: KeyboardEvent) => {
+  if (!skillDropdownVisible.value) return
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    skillSelectedIndex.value = Math.min(
+      skillSelectedIndex.value + 1,
+      skillSuggestions.value.length - 1
+    )
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    skillSelectedIndex.value = Math.max(skillSelectedIndex.value - 1, -1)
+  } else if (e.key === 'Enter' && skillSelectedIndex.value >= 0) {
+    e.preventDefault()
+    const selected = skillSuggestions.value[skillSelectedIndex.value]
+    if (selected) selectSkill(selected)
+  } else if (e.key === 'Escape') {
+    skillDropdownVisible.value = false
+  } else if (e.key === 'Enter') {
+    // Enter without selection: submit as normal
+    skillDropdownVisible.value = false
+    sendMessage()
+  }
+}
 
 const defaultContextUsage = (): ContextUsage => ({
   session_id: null,
@@ -495,9 +556,22 @@ watch(
   { immediate: true }
 )
 
+// 监听输入框内容，触发技能下拉
+watch(
+  () => inputMessage.value,
+  () => {
+    if (showSkillDropdown()) {
+      filterSkills()
+    } else {
+      skillDropdownVisible.value = false
+    }
+  }
+)
+
 // 组件挂载时初始化会话
 onMounted(async () => {
   await initSession()
+  await scrollToBottom()
   await refreshContextUsage()
 })
 
@@ -681,6 +755,7 @@ interface ChatRequestOptions {
   userTurnIndex?: number
   regenerate?: boolean
   skipInputClear?: boolean
+  skill?: string
 }
 
 const runChatRequest = async (userMessage: string, options: ChatRequestOptions = {}) => {
@@ -696,7 +771,7 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
     messages.value.push({
       id: Date.now(),
       role: 'user',
-      content: userMessage,
+      content: options.skill ? `/${options.skill} ${userMessage}` : userMessage,
       timestamp: new Date(),
       userTurnIndex,
     })
@@ -819,6 +894,7 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
         sessionId: currentSessionId.value,
         userTurnIndex: options.userTurnIndex,
         regenerate: options.regenerate,
+        skill: options.skill,
         signal: abortController.value.signal,
       }
     )
@@ -846,8 +922,22 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
 }
 
 const sendMessage = async () => {
-  if (!inputMessage.value.trim()) return
-  await runChatRequest(inputMessage.value)
+  const text = inputMessage.value.trim()
+  if (!text) return
+
+  // 解析 /技能名 前缀
+  const skillMatch = text.match(/^\/(\S+)\s+([\s\S]*)/)
+  if (skillMatch) {
+    const skillName = skillMatch[1]
+    const userContent = skillMatch[2].trim()
+    if (!userContent) {
+      message.warning('请在技能后输入具体内容')
+      return
+    }
+    await runChatRequest(userContent, { skill: skillName })
+  } else {
+    await runChatRequest(text)
+  }
 }
 
 const createNewSession = async () => {
@@ -1014,6 +1104,30 @@ const createNewSession = async () => {
 
     <!-- 输入区域 -->
     <div class="chat-input-wrapper">
+      <!-- 技能下拉选择器 -->
+      <Transition name="skill-dropdown-fade">
+        <div v-if="skillDropdownVisible" class="skill-dropdown">
+          <div class="skill-dropdown-header">
+            <span>选择技能</span>
+            <span class="skill-dropdown-hint">↑↓ 选择 · Enter 确认 · Esc 取消</span>
+          </div>
+          <div class="skill-dropdown-list">
+            <div
+              v-for="(skill, index) in skillSuggestions"
+              :key="skill.name"
+              :class="['skill-dropdown-item', { active: index === skillSelectedIndex }]"
+              @click="selectSkill(skill)"
+              @mouseenter="skillSelectedIndex = index"
+            >
+              <div class="skill-dropdown-item-icon">⚡</div>
+              <div class="skill-dropdown-item-content">
+                <div class="skill-dropdown-item-name">/{{ skill.name }}</div>
+                <div class="skill-dropdown-item-desc">{{ skill.description }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
       <div class="chat-input">
         <input
           ref="fileInputRef"
@@ -1039,9 +1153,10 @@ const createNewSession = async () => {
         <!-- 输入框 -->
         <Input.TextArea
           v-model:value="inputMessage"
-          placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
+          placeholder="输入 / 使用技能 (Enter 发送, Shift+Enter 换行)"
           :auto-size="{ minRows: 1, maxRows: 4 }"
-          @press-enter="(e: KeyboardEvent) => { if (!e.shiftKey) { e.preventDefault(); sendMessage() } }"
+          @press-enter="(e: KeyboardEvent) => { if (skillDropdownVisible.value) { handleSkillKeydown(e); return; } if (!e.shiftKey) { e.preventDefault(); sendMessage() } }"
+          @keydown="handleSkillKeydown"
         />
         <!-- 按钮区域（固定宽度） -->
         <div class="input-actions">
@@ -1115,6 +1230,7 @@ const createNewSession = async () => {
   width: 100%;
   box-sizing: border-box;
   background-color: var(--color-background);
+  position: relative;
 }
 
 .chat-messages {
@@ -1500,11 +1616,109 @@ const createNewSession = async () => {
   }
 }
 
+/* 技能下拉选择器 */
+.skill-dropdown {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin: 0 0 6px;
+  background: #1e1e2e;
+  border: 1px solid #333;
+  border-radius: 10px;
+  overflow: hidden;
+  z-index: 100;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+}
+
+.skill-dropdown-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  font-size: 12px;
+  color: #999;
+  border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.skill-dropdown-hint {
+  font-size: 11px;
+  color: #666;
+}
+
+.skill-dropdown-list {
+  overflow-y: auto;
+  flex: 1;
+}
+
+.skill-dropdown-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  transition: background-color 0.15s;
+}
+
+.skill-dropdown-item:hover,
+.skill-dropdown-item.active {
+  background: rgba(255, 92, 92, 0.15);
+}
+
+.skill-dropdown-item-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.skill-dropdown-item-content {
+  min-width: 0;
+}
+
+.skill-dropdown-item-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e0e0e0;
+  margin-bottom: 2px;
+}
+
+.skill-dropdown-item-desc {
+  font-size: 12px;
+  color: #888;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 技能下拉淡入动画 */
+.skill-dropdown-fade-enter-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.skill-dropdown-fade-leave-active {
+  transition: opacity 0.1s ease, transform 0.1s ease;
+}
+
+.skill-dropdown-fade-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.skill-dropdown-fade-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
 /* 输入区域 */
 .chat-input-wrapper {
   padding: 16px 24px 32px;
   background-color: var(--color-surface);
   border-top: 1px solid var(--color-border);
+  position: relative;
 }
 
 .chat-input {

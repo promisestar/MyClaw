@@ -14,6 +14,16 @@ const router = createRouter({
       component: () => import('../views/SessionsView.vue'),
     },
     {
+      path: '/skills',
+      name: 'skills',
+      component: () => import('../views/SkillsView.vue'),
+    },
+    {
+      path: '/skills/:name/edit',
+      name: 'skill-editor',
+      component: () => import('../views/SkillEditor.vue'),
+    },
+    {
       path: '/knowledge-base',
       name: 'knowledge-base',
       component: () => import('../views/KnowledgeBaseView.vue'),

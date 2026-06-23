@@ -34,6 +34,8 @@ export interface SendMessageOptions {
   userTurnIndex?: number
   /** 重新生成时传 true（与 userTurnIndex 合用）；编辑后发送传 false */
   regenerate?: boolean
+  /** 用户通过 /技能名 指定的技能名 */
+  skill?: string
   signal?: AbortSignal
 }
 
@@ -61,7 +63,7 @@ export const chatApi = {
     onChunk: StreamCallback,
     options: SendMessageOptions = {}
   ): Promise<ChatResponse> => {
-    const { sessionId, userTurnIndex, regenerate, signal } = options
+    const { sessionId, userTurnIndex, regenerate, skill, signal } = options
     const body: Record<string, unknown> = {
       message,
       session_id: sessionId,
@@ -69,6 +71,9 @@ export const chatApi = {
     if (userTurnIndex !== undefined) {
       body.user_turn_index = userTurnIndex
       body.regenerate = regenerate ?? false
+    }
+    if (skill) {
+      body.skill = skill
     }
 
     const response = await fetch(`${API_BASE}/api/chat/send/stream`, {

@@ -17,6 +17,8 @@ class ChatRequest(BaseModel):
     user_turn_index: Optional[int] = None
     # True：重新生成该轮回复；False：使用编辑后的 message
     regenerate: bool = False
+    # 用户通过 /技能名 方式指定的技能，后端会预加载技能内容注入上下文
+    skill: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -36,6 +38,25 @@ def get_agent_lock():
     return _get_agent_lock()
 
 
+def _inject_skill_context(message: str, skill_name: Optional[str]) -> str:
+    """如果指定了技能名，注入调用提示而不注入 body（避免技能全文出现在会话历史中）"""
+    if not skill_name:
+        return message
+    try:
+        from .skills import get_skill_loader
+        loader = get_skill_loader()
+        skill = loader.get_skill(skill_name)
+        if skill:
+            return (
+                f'用户通过 /{skill_name} 选择了技能「{skill.name}」（{skill.description}）。\n'
+                f'请先调用 Skill 工具加载技能 "{skill_name}"，'
+                f'然后严格遵循技能说明完成以下任务：\n\n{message}'
+            )
+    except Exception:
+        pass
+    return message
+
+
 @router.post("/send/sync", response_model=ChatResponse)
 async def send_message_sync(request: ChatRequest):
     """发送消息并获取同步响应"""
@@ -43,18 +64,19 @@ async def send_message_sync(request: ChatRequest):
     if not agent:
         return ChatResponse(content="Agent not initialized", session_id=request.session_id)
 
+    message = _inject_skill_context(request.message, request.skill)
     lock = get_agent_lock()
     if lock:
         async with lock:
             response = agent.chat(
-                request.message,
+                message,
                 request.session_id,
                 user_turn_index=request.user_turn_index,
                 regenerate=request.regenerate,
             )
     else:
         response = agent.chat(
-            request.message,
+            message,
             request.session_id,
             user_turn_index=request.user_turn_index,
             regenerate=request.regenerate,
@@ -91,9 +113,11 @@ async def send_message_stream(request: ChatRequest):
             # 为本次请求生成 trace_id，贯穿所有工具调用日志
             set_trace_id(generate_trace_id())
 
+            message = _inject_skill_context(request.message, request.skill)
+
             async def _run_stream():
                 async for event in agent.achat(
-                    request.message,
+                    message,
                     request.session_id,
                     user_turn_index=request.user_turn_index,
                     regenerate=request.regenerate,

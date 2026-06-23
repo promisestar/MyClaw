@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import chat, session, config, memory, upload, knowledge_base, tool_logs
+from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
@@ -61,6 +61,11 @@ async def lifespan(app: FastAPI):
     # 将 memory_store 传递给 API 模块
     if hasattr(_agent, "_memory_store") and _agent._memory_store:
         memory.set_memory_store(_agent._memory_store)
+
+    # 将 skill_loader 传递给 skills API 模块
+    if hasattr(_agent, "skill_loader") and _agent.skill_loader:
+        skills.set_skill_loader(_agent.skill_loader)
+        print(f"🔧 Skill 系统已初始化：{_agent.skill_loader.total_count} 个技能，{_agent.skill_loader.enabled_count} 个已启用")
 
     # 启动时处理记忆衰减（遗忘机制 - 懒策略）
     if hasattr(_agent, "_memory_store") and _agent._memory_store:
@@ -146,6 +151,7 @@ app.include_router(config.router, prefix="/api")
 app.include_router(memory.router, prefix="/api")
 app.include_router(knowledge_base.router, prefix="/api")
 app.include_router(tool_logs.router, prefix="/api")
+app.include_router(skills.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
 
 

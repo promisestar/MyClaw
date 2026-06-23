@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import { Menu, ConfigProvider, theme } from 'ant-design-vue'
-import { MessageOutlined, SettingOutlined, HistoryOutlined, BookOutlined, FolderOutlined, FileTextOutlined } from '@ant-design/icons-vue'
+import { MessageOutlined, SettingOutlined, HistoryOutlined, BookOutlined, FolderOutlined, FileTextOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
 import LobsterIcon from '@/assets/lobster.svg'
 
 const route = useRoute()
@@ -41,6 +41,12 @@ const customTheme = {
             <RouterLink to="/sessions">
               <HistoryOutlined />
               <span>会话</span>
+            </RouterLink>
+          </Menu.Item>
+          <Menu.Item key="skills">
+            <RouterLink to="/skills">
+              <ThunderboltOutlined />
+              <span>技能</span>
             </RouterLink>
           </Menu.Item>
           <Menu.Item key="knowledge-base">

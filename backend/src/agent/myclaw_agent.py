@@ -1,6 +1,7 @@
 """HelloClaw Agent - 基于 HelloAgents SimpleAgent 的个性化 AI 助手"""
 
 import os
+from pathlib import Path
 from typing import List, Optional
 
 from hello_agents import Config
@@ -21,6 +22,8 @@ from hello_agents.tools import (
 from ..workspace.manager import WorkspaceManager
 from ..tools import MemoryTool, BashTool, WebSearchTool, WebFetchTool, RAGTool, MCPTool
 from ..tools.builtin.mcp_tool import reset_all_mcp_disclosed_tools
+from ..tools.builtin.skill_tool import SkillTool
+from ..skills.loader import SkillLoader
 
 
 class MyClawAgent:
@@ -103,10 +106,16 @@ class MyClawAgent:
             enable_smart_compression=False,
             context_window=128000,
             trace_enabled=False,
-            skills_enabled=True,
+            skills_enabled=False,  # 使用自实现的 SkillLoader（不依赖 hello_agents）
+            skills_auto_register=False,
             todowrite_enabled=False,
             devlog_enabled=False,
             subagent_enabled=True,  # 启用子 Agent 支持
+        )
+
+        # 初始化自实现的 Skill 系统
+        self.skill_loader = SkillLoader(
+            skills_dir=Path(os.path.join(self.workspace_path, "skills"))
         )
 
         # 初始化 MemoryVectorStore（长期记忆的 Qdrant 存储层）
@@ -301,9 +310,19 @@ class MyClawAgent:
         # MyClaw自定义工具
         registry.register_tool(WebSearchTool())  # 网页搜索工具
         registry.register_tool(RAGTool(workspace_root=self.workspace_path))  # RAG：相对路径相对工作空间根
+
+        # 自实现 Skill 工具
+        self._skill_tool = SkillTool(skill_loader=self.skill_loader)
+        registry.register_tool(self._skill_tool)
+
         self._register_mcp_tools(registry)
 
         return registry
+
+    def refresh_skill_tool(self) -> None:
+        """刷新 SkillTool 的描述（技能列表变化时调用）"""
+        if hasattr(self, '_skill_tool') and self._skill_tool:
+            self._skill_tool.refresh_description()
 
     def _reset_mcp_disclosed_tools(self) -> None:
         """切换会话或关闭时清理 MCP 动态披露的子工具。"""
