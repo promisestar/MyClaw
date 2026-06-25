@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Card, Button, Switch, Empty, message, Popconfirm, Modal, Input, Tabs } from 'ant-design-vue'
+import { Card, Button, Switch, Empty, message, Popconfirm, Modal, Input, Tabs, Tag, Tooltip } from 'ant-design-vue'
 import {
   PlusOutlined,
   EditOutlined,
@@ -9,6 +9,9 @@ import {
   ThunderboltOutlined,
   FolderOpenOutlined,
   GithubOutlined,
+  ReloadOutlined,
+  CheckCircleOutlined,
+  ExclamationCircleOutlined,
 } from '@ant-design/icons-vue'
 import { skillsApi, type SkillInfo } from '@/api/skills'
 
@@ -36,6 +39,27 @@ const loadSkills = async () => {
 
 const toggleLoading = ref<string | null>(null)
 
+/**
+ * 从后端结构化错误中提取用户可读消息
+ * 后端返回格式：{ detail: { code, message, detail } }
+ * 兼容旧格式：{ detail: "字符串" }
+ */
+const extractErrorMessage = (error: unknown, fallback: string): string => {
+  if (typeof error === 'object' && error !== null) {
+    const e = error as { response?: { data?: { detail?: unknown } }; message?: string }
+    const detail = e.response?.data?.detail
+    if (typeof detail === 'object' && detail !== null) {
+      const d = detail as { message?: string; code?: string }
+      if (d.message) {
+        return d.code ? `${d.message}（${d.code}）` : d.message
+      }
+    }
+    if (typeof detail === 'string') return detail
+    if (e.message) return e.message
+  }
+  return fallback
+}
+
 const handleToggle = async (skill: SkillInfo, checked: boolean) => {
   // 乐观更新：立即切换 UI
   const previousEnabled = skill.enabled
@@ -47,7 +71,7 @@ const handleToggle = async (skill: SkillInfo, checked: boolean) => {
     message.success(res.message)
   } catch (error) {
     skill.enabled = previousEnabled  // 失败时恢复
-    message.error('切换状态失败')
+    message.error(extractErrorMessage(error, '切换状态失败'))
   } finally {
     toggleLoading.value = null
   }
@@ -63,7 +87,35 @@ const handleDelete = async (skill: SkillInfo) => {
     message.success(`技能 "${skill.name}" 已删除`)
     await loadSkills()
   } catch (error) {
-    message.error('删除技能失败')
+    message.error(extractErrorMessage(error, '删除技能失败'))
+  }
+}
+
+const installLoading = ref<string | null>(null)
+const installLogModalOpen = ref(false)
+const installLog = ref('')
+const installLogTitle = ref('')
+
+const handleInstallEnv = async (skill: SkillInfo) => {
+  installLoading.value = skill.name
+  message.loading({ content: `正在为「${skill.name}」安装依赖环境...`, key: 'install', duration: 0 })
+  try {
+    const res = await skillsApi.installEnv(skill.name)
+    message.destroy('install')
+    if (res.success) {
+      message.success(`「${skill.name}」环境安装成功`)
+    } else {
+      message.error(`「${skill.name}」环境安装失败`)
+    }
+    installLogTitle.value = `「${skill.name}」环境安装日志`
+    installLog.value = res.log || '（无输出）'
+    installLogModalOpen.value = true
+    await loadSkills()
+  } catch (error) {
+    message.destroy('install')
+    message.error(extractErrorMessage(error, '环境安装请求失败'))
+  } finally {
+    installLoading.value = null
   }
 }
 
@@ -79,9 +131,8 @@ const handleImport = async () => {
     importModalOpen.value = false
     importSource.value = ''
     await loadSkills()
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : '导入失败'
-    message.error(msg)
+  } catch (error) {
+    message.error(extractErrorMessage(error, '导入失败'))
   } finally {
     importLoading.value = false
   }
@@ -135,19 +186,47 @@ onMounted(() => {
               />
             </div>
             <p class="skill-desc">{{ skill.description }}</p>
+            <!-- 环境状态徽标 -->
+            <div class="skill-env-status">
+              <Tooltip v-if="skill.has_venv" :title="skill.python_path || ''">
+                <Tag color="success">
+                  <template #icon><CheckCircleOutlined /></template>
+                  专属环境就绪
+                </Tag>
+              </Tooltip>
+              <Tooltip v-else-if="skill.has_dependencies" title="该技能声明了依赖但未安装专属环境，运行可能失败">
+                <Tag color="warning">
+                  <template #icon><ExclamationCircleOutlined /></template>
+                  依赖未安装
+                </Tag>
+              </Tooltip>
+              <Tag v-else color="default">无依赖</Tag>
+            </div>
             <div class="skill-dir">
               <FolderOpenOutlined />
               <span>{{ skill.dir }}</span>
             </div>
           </div>
           <div class="skill-card-actions">
+            <Tooltip :title="skill.has_venv ? '重新安装依赖到专属环境' : '为该技能创建专属环境并安装依赖'">
+              <Button
+                v-if="skill.has_dependencies"
+                size="small"
+                type="text"
+                :loading="installLoading === skill.name"
+                @click.stop="handleInstallEnv(skill)"
+              >
+                <template #icon><ReloadOutlined /></template>
+                {{ skill.has_venv ? '重装依赖' : '安装依赖' }}
+              </Button>
+            </Tooltip>
             <Button size="small" type="text" @click.stop="handleEdit(skill)">
               <template #icon><EditOutlined /></template>
               编辑
             </Button>
             <Popconfirm
               title="确定要删除此技能吗？"
-              :description="`将删除「${skill.name}」对应的整个目录`"
+              :description="`将删除「${skill.name}」对应的整个目录（含专属环境）`"
               ok-text="删除"
               cancel-text="取消"
               ok-type="danger"
@@ -201,6 +280,20 @@ onMounted(() => {
           </div>
         </Tabs.TabPane>
       </Tabs>
+      <div class="import-deps-hint">
+        💡 如果技能包含 <code>requirements.txt</code> 或在 SKILL.md frontmatter 中声明了
+        <code>dependencies</code>，系统将自动为该技能创建专属 venv 并安装依赖（可能需要 1-5 分钟，依赖量大时更久）。
+      </div>
+    </Modal>
+
+    <!-- 安装日志 Modal -->
+    <Modal
+      v-model:open="installLogModalOpen"
+      :title="installLogTitle"
+      :footer="null"
+      width="720px"
+    >
+      <pre class="install-log">{{ installLog }}</pre>
     </Modal>
   </div>
 </template>
@@ -309,6 +402,12 @@ onMounted(() => {
   overflow: hidden;
 }
 
+.skill-env-status {
+  display: flex;
+  gap: 6px;
+  margin: 6px 0 8px;
+}
+
 .skill-dir {
   font-size: 12px;
   color: #bbb;
@@ -342,5 +441,37 @@ onMounted(() => {
   color: #999;
   margin: 0 0 12px 0;
   line-height: 1.5;
+}
+
+.import-deps-hint {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #389e0d;
+  line-height: 1.6;
+}
+
+.import-deps-hint code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11.5px;
+}
+
+.install-log {
+  max-height: 480px;
+  overflow: auto;
+  background: #1e1e2e;
+  color: #d4d4d4;
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 </style>

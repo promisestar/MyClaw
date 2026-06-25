@@ -11,9 +11,28 @@
 
 from .loader import SkillLoader, Skill
 from .state_manager import SkillStateManager
+from .exceptions import (
+    SkillError,
+    SkillImportError,
+    SkillLoadError,
+    SkillNameError,
+    SkillConflictError,
+    SkillNotFoundError,
+)
+from .validators import validate_skill_name, ensure_valid_skill_name
 
 __all__ = [
     "SkillLoader",
     "Skill",
     "SkillStateManager",
+    # 异常
+    "SkillError",
+    "SkillImportError",
+    "SkillLoadError",
+    "SkillNameError",
+    "SkillConflictError",
+    "SkillNotFoundError",
+    # 校验
+    "validate_skill_name",
+    "ensure_valid_skill_name",
 ]

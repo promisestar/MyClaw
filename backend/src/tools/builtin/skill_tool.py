@@ -120,6 +120,9 @@ class SkillTool(Tool):
             # 列出可用资源（含完整路径）
             resources_hint = self._get_resources_hint(skill)
 
+            # 构造执行环境提示
+            python_hint = self._get_python_hint(skill)
+
             # 构造完整技能内容
             full_content = f"""<skill-loaded name="{skill_name}">
 {content}
@@ -129,8 +132,12 @@ class SkillTool(Tool):
 ✅ 技能已加载：{skill.name}
 📝 描述：{skill.description}
 📁 技能目录：{skill.dir}
+{python_hint}
 
-⚠️ 上述「可用资源」中已列出所有脚本和文档的完整路径。请直接使用这些路径执行脚本或读取文件，不要搜索文件系统。"""
+⚠️ 执行规则（必须遵守）：
+1. 「可用资源」中已列出所有脚本和文档的完整路径，请直接使用这些路径，不要搜索文件系统。
+2. 执行 Python 脚本时，**必须使用上方指定的 Python 解释器**，不要用 `python` 或 `python3` 这种依赖 PATH 的写法。
+3. 如果脚本报 ModuleNotFoundError，说明依赖未安装到本技能的专属环境，请告知用户而不是自行 pip install。"""
 
             return ToolResponse.success(
                 text=full_content,
@@ -140,6 +147,7 @@ class SkillTool(Tool):
                     "loaded": True,
                     "token_estimate": len(full_content),
                     "has_resources": bool(resources_hint),
+                    "python_path": str(skill.python_path) if skill.python_path else None,
                 },
             )
 
@@ -149,6 +157,28 @@ class SkillTool(Tool):
                 message=f"加载技能失败：{str(e)}",
                 context={"params_input": parameters, "error": str(e)},
             )
+
+    def _get_python_hint(self, skill) -> str:
+        """生成 Python 解释器使用提示
+
+        Args:
+            skill: Skill 对象
+
+        Returns:
+            提示文本（含完整解释器路径或回退说明）
+        """
+        if skill.python_path:
+            return (
+                f"🐍 专属 Python 解释器（已安装该技能所需依赖）：\n"
+                f"    {skill.python_path}\n"
+                f"    执行示例：\"{skill.python_path}\" \"{skill.dir}\\scripts\\<脚本名>.py\" [参数]"
+            )
+        if skill.has_dependencies:
+            return (
+                "⚠️ 该技能声明了依赖但未安装专属环境。\n"
+                "    请通知用户调用技能管理页面的「重装依赖」按钮，或使用系统 Python 但可能缺少依赖。"
+            )
+        return "🐍 该技能未声明依赖，可使用系统 Python 执行（命令：python 或 python3）。"
 
     def _get_resources_hint(self, skill) -> str:
         """生成资源提示文本（含完整路径）

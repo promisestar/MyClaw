@@ -5,6 +5,16 @@ export interface SkillInfo {
   description: string
   enabled: boolean
   dir: string
+  has_venv?: boolean
+  has_dependencies?: boolean
+  python_path?: string | null
+}
+
+export interface InstallEnvResponse {
+  success: boolean
+  message: string
+  python_path?: string | null
+  log: string
 }
 
 export interface SkillListResponse {
@@ -26,6 +36,12 @@ export interface SkillContent {
   content: string
 }
 
+export interface SkillContentUpdateResponse {
+  message: string
+  name: string
+  renamed: boolean
+}
+
 export const skillsApi = {
   list: async () => {
     return api.get<SkillListResponse>('/skills')
@@ -40,7 +56,10 @@ export const skillsApi = {
   },
 
   updateContent: async (name: string, content: string) => {
-    return api.put(`/skills/${encodeURIComponent(name)}/content`, { content })
+    return api.put<SkillContentUpdateResponse>(
+      `/skills/${encodeURIComponent(name)}/content`,
+      { content },
+    )
   },
 
   toggle: async (name: string) => {
@@ -56,5 +75,9 @@ export const skillsApi = {
       source_type: sourceType,
       source,
     })
+  },
+
+  installEnv: async (name: string) => {
+    return api.post<InstallEnvResponse>(`/skills/${encodeURIComponent(name)}/install-env`)
   },
 }

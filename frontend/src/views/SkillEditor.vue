@@ -7,7 +7,8 @@ import { skillsApi } from '@/api/skills'
 
 const route = useRoute()
 const router = useRouter()
-const skillName = route.params.name as string
+// 当前编辑的技能名（用 ref 以便改名后更新页面标题）
+const skillName = ref(route.params.name as string)
 
 const content = ref('')
 const originalContent = ref('')
@@ -15,14 +16,31 @@ const loading = ref(false)
 const saving = ref(false)
 const hasChanges = ref(false)
 
+/** 从后端结构化错误中提取用户可读消息 */
+const extractErrorMessage = (error: unknown, fallback: string): string => {
+  if (typeof error === 'object' && error !== null) {
+    const e = error as { response?: { data?: { detail?: unknown } }; message?: string }
+    const detail = e.response?.data?.detail
+    if (typeof detail === 'object' && detail !== null) {
+      const d = detail as { message?: string; code?: string }
+      if (d.message) {
+        return d.code ? `${d.message}（${d.code}）` : d.message
+      }
+    }
+    if (typeof detail === 'string') return detail
+    if (e.message) return e.message
+  }
+  return fallback
+}
+
 const loadContent = async () => {
   loading.value = true
   try {
-    const res = await skillsApi.getContent(skillName)
+    const res = await skillsApi.getContent(skillName.value)
     content.value = res.content
     originalContent.value = res.content
   } catch (error) {
-    message.error('加载技能内容失败')
+    message.error(extractErrorMessage(error, '加载技能内容失败'))
     router.push({ name: 'skills' })
   } finally {
     loading.value = false
@@ -36,12 +54,20 @@ const handleInput = () => {
 const handleSave = async () => {
   saving.value = true
   try {
-    await skillsApi.updateContent(skillName, content.value)
+    const res = await skillsApi.updateContent(skillName.value, content.value)
     originalContent.value = content.value
     hasChanges.value = false
-    message.success('技能内容已保存')
+    if (res.renamed && res.name !== skillName.value) {
+      message.success(`技能已重命名为「${res.name}」并保存`)
+      // 路由参数更新，避免刷新后 404
+      const newName = res.name
+      skillName.value = newName
+      router.replace({ name: 'skill-editor', params: { name: newName } })
+    } else {
+      message.success('技能内容已保存')
+    }
   } catch (error) {
-    message.error('保存失败')
+    message.error(extractErrorMessage(error, '保存失败'))
   } finally {
     saving.value = false
   }
