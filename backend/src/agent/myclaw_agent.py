@@ -144,6 +144,13 @@ class MyClawAgent:
             max_tools_per_round=5,
         )
 
+        # 注入模型信息到 ContextManager，启用精确 token 统计
+        if hasattr(self._agent, "context_manager") and self._agent.context_manager:
+            self._agent.context_manager.set_model_context(
+                model=self._model_id,
+                base_url=self._base_url,
+            )
+
         # 初始化 Memory Flush 管理器
         self._memory_flush_manager = MemoryFlushManager(
             context_window=self.config.context_window,
@@ -151,6 +158,10 @@ class MyClawAgent:
             soft_threshold_tokens=4000,
             enabled=True,
         )
+
+        # 此时 config / ContextManager / MemoryFlushManager 均已就绪，
+        # 同步动态上下文窗口（覆盖 _init_llm 中因 config 尚未创建而跳过的首次调用）
+        self._sync_context_window()
 
         # 初始化 Memory Capture 管理器（传入 memory_store）
         self._memory_capture_manager = MemoryCaptureManager(
@@ -196,6 +207,9 @@ class MyClawAgent:
             base_url=self._base_url,
         )
 
+        # 动态感知模型的实际上下文窗口
+        self._sync_context_window()
+
     def _reload_llm_if_changed(self) -> bool:
         """检查配置变化并重新加载 LLM
 
@@ -230,8 +244,56 @@ class MyClawAgent:
             if hasattr(self, '_agent'):
                 self._agent.llm = self._llm
 
+            # 同步 tokenizer 模型信息
+            if hasattr(self._agent, "context_manager") and self._agent.context_manager:
+                self._agent.context_manager.set_model_context(
+                    model=self._model_id,
+                    base_url=self._base_url,
+                )
+
+            # 动态感知新模型的上下文窗口
+            self._sync_context_window()
+
             return True
         return False
+
+    def _sync_context_window(self):
+        """根据当前 LLM 模型动态感知上下文窗口大小。
+
+        调用 tokenizer.get_context_window() 查询模型注册表，
+        将结果同步到 Config、ContextManager 和 MemoryFlushManager。
+
+        可在 Agent 生命周期的任何阶段调用（初始化/热加载后均安全）。
+        """
+        from ..context.tokenizer import get_context_window
+
+        # 首次调用时 config 可能尚未创建，用默认值
+        default_window = (
+            self.config.context_window
+            if hasattr(self, "config") and self.config
+            else 128_000
+        )
+
+        new_window = get_context_window(
+            model=self._model_id,
+            base_url=self._base_url,
+            default=default_window,
+        )
+
+        # 更新 Config（dataclass，直接赋值）
+        if hasattr(self, "config") and self.config:
+            old_window = self.config.context_window
+            if new_window != old_window:
+                self.config.context_window = new_window
+                print(f"📐 模型 '{self._model_id}' 上下文窗口: {old_window:,} → {new_window:,} tokens")
+
+        # 同步到 ContextManager（更新压缩阈值）— 仅在 _agent 已创建时
+        if hasattr(self, "_agent") and hasattr(self._agent, "context_manager") and self._agent.context_manager:
+            self._agent.context_manager.update_context_window(new_window)
+
+        # 同步到 MemoryFlushManager（更新 flush 触发点）— 仅在已创建时
+        if hasattr(self, "_memory_flush_manager") and self._memory_flush_manager:
+            self._memory_flush_manager.context_window = new_window
 
     def _build_system_prompt(self) -> str:
         """构建系统提示词

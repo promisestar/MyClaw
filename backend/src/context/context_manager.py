@@ -16,13 +16,23 @@ from hello_agents.core.message import Message
 from hello_agents.context.history import HistoryManager
 from hello_agents.context.token_counter import TokenCounter
 
+from .tokenizer import count_tokens, count_messages
+
 if TYPE_CHECKING:
     from hello_agents.core.llm import HelloAgentsLLM
 
 
 def _approx_tokens(text: str) -> int:
-    """粗略 token 估算（混合中英文约 3 字符/token）。"""
-    return len(text) // 3
+    """粗略 token 估算（回退，仅在无 tokenizer 信息时使用）。
+
+    改进版区分中英文：
+    - 中文 ~0.5 token/字     英文 ~0.25 token/字符
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if 0x4E00 <= ord(ch) <= 0x9FFF)
+    latin = len(text) - cjk
+    return max(1, int(cjk * 0.5 + latin * 0.25))
 
 
 def estimate_dict_messages_tokens(messages: List[Dict[str, Any]]) -> int:
@@ -60,6 +70,11 @@ class ContextManager:
         self.hard_retain_rounds = hard_retain_rounds
         self.tool_snip_chars = tool_snip_chars
 
+        # 压缩比例（保存以便 update_context_window 重算阈值时使用）
+        self._snip_ratio = snip_ratio
+        self._summarize_ratio = summarize_ratio
+        self._collapse_ratio = collapse_ratio
+
         self.max_tokens = config.context_window
         self._snip_at = int(self.max_tokens * snip_ratio)
         self._summarize_at = int(self.max_tokens * summarize_ratio)
@@ -67,6 +82,52 @@ class ContextManager:
 
         self._history_token_count = 0
         self._summary_llm: Optional["HelloAgentsLLM"] = None
+
+        # 精确 token 统计所需的模型信息
+        self._token_model: Optional[str] = None
+        self._token_base_url: Optional[str] = None
+
+    def set_model_context(self, model: str, base_url: Optional[str] = None):
+        """注入当前模型信息以启用精确 token 统计。
+
+        由 MyClawAgent 在初始化 LLM 后调用。
+
+        Args:
+            model: 模型名称（如 "glm-4", "gpt-4o"）
+            base_url: API 服务地址
+        """
+        self._token_model = model
+        self._token_base_url = base_url
+
+    def update_context_window(self, new_max_tokens: int):
+        """动态更新上下文窗口大小及所有压缩阈值。
+
+        当 LLM 模型切换导致上下文窗口变化时调用。
+
+        Args:
+            new_max_tokens: 新的上下文窗口大小（token 数）
+        """
+        if new_max_tokens <= 0:
+            return
+
+        old = self.max_tokens
+        self.max_tokens = new_max_tokens
+        self._snip_at = int(self.max_tokens * self._snip_ratio)
+        self._summarize_at = int(self.max_tokens * self._summarize_ratio)
+        self._collapse_at = int(self.max_tokens * self._collapse_ratio)
+
+        if old != new_max_tokens:
+            print(
+                f"📐 上下文窗口已更新: {old:,} → {new_max_tokens:,} tokens "
+                f"(snip={self._snip_at:,}, summarize={self._summarize_at:,}, "
+                f"collapse={self._collapse_at:,})"
+            )
+
+    def count_tokens(self, text: str) -> int:
+        """精确 token 计数（优先 tiktoken，降级估算）"""
+        if self._token_model is not None:
+            return count_tokens(text, self._token_model, self._token_base_url)
+        return _approx_tokens(text)
 
     # ------------------------------------------------------------------ #
     # Token 追踪
@@ -82,9 +143,23 @@ class ContextManager:
         self.token_counter.clear_cache()
 
     def recalculate_history_tokens(self) -> int:
-        """全量重算历史 token（压缩后调用）。"""
-        history = self.history_manager.get_history()
-        self._history_token_count = self.token_counter.count_messages(history)
+        """全量重算历史 token（压缩后调用）。优先精确计数。"""
+        if self._token_model:
+            history = self.history_manager.get_history()
+            # 转换为 dict 格式以使用精确计数
+            messages = []
+            for msg in history:
+                item = {"role": msg.role, "content": msg.content or ""}
+                metadata = getattr(msg, "metadata", None) or {}
+                if msg.role == "assistant" and metadata.get("tool_calls"):
+                    item["tool_calls"] = metadata["tool_calls"]
+                messages.append(item)
+            self._history_token_count = count_messages(
+                messages, self._token_model, self._token_base_url
+            )
+        else:
+            history = self.history_manager.get_history()
+            self._history_token_count = self.token_counter.count_messages(history)
         return self._history_token_count
 
     def on_message_added(self, message: Message) -> bool:
@@ -97,10 +172,13 @@ class ContextManager:
         messages: List[Dict[str, Any]],
         system_prompt: Optional[str] = None,
     ) -> int:
-        """估算本轮 LLM 调用的总 token（含 system）。"""
-        total = estimate_dict_messages_tokens(messages)
+        """估算本轮 LLM 调用的总 token（含 system）。优先精确计数。"""
+        if self._token_model:
+            total = count_messages(messages, self._token_model, self._token_base_url)
+        else:
+            total = estimate_dict_messages_tokens(messages)
         if system_prompt and not any(m.get("role") == "system" for m in messages):
-            total += _approx_tokens(system_prompt)
+            total += self.count_tokens(system_prompt)
         return total
 
     # ------------------------------------------------------------------ #
