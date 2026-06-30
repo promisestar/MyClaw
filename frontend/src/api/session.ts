@@ -18,11 +18,19 @@ export interface ToolCall {
   function: ToolCallFunction
 }
 
+/** 历史消息中由后端从 list-content 提取的附件元数据（当前仅图片，data URL 或公网 URL） */
+export interface HistoryAttachmentMeta {
+  kind: 'image'
+  url: string
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'tool'
   content?: string
   tool_calls?: ToolCall[]
   tool_call_id?: string
+  /** 多模态附件（由后端 MyClawAgent.get_session_history 注入；仅用户消息可能存在） */
+  attachments?: HistoryAttachmentMeta[]
 }
 
 export interface SessionHistory {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, computed, nextTick, onMounted } from 'vue'
+import { ref, watch, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { Input, Button, message, Tag, Tooltip, Modal, Progress } from 'ant-design-vue'
 import {
   SendOutlined,
@@ -12,13 +12,48 @@ import {
 } from '@ant-design/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { sessionApi, type ContextUsage } from '@/api/session'
-import { chatApi } from '@/api/chat'
+import { chatApi, type ChatAttachment } from '@/api/chat'
 import { configApi } from '@/api/config'
-import { uploadApi } from '@/api/upload'
+import { uploadApi, type UploadResponse } from '@/api/upload'
 import { renderMarkdown, formatTime } from '@/utils/markdown'
 import { getToolConfig, formatToolArgs, formatToolResult } from '@/utils/toolDisplay'
 import { skillsApi, type SkillInfo } from '@/api/skills'
+import AttachmentChip from '@/components/AttachmentChip.vue'
+import UserMessageContent from '@/components/UserMessageContent.vue'
 import LobsterIcon from '@/assets/lobster.svg'
+
+// 单文档大小硬上限（与后端 MULTIMODAL_DOC_MAX_BYTES 保持一致；超过即拒绝，不发起上传请求）
+const DOC_MAX_BYTES = 10 * 1024 * 1024
+// 单图片大小上限（与后端 MULTIMODAL_MAX_IMAGE_MB 保持一致的默认 10MB）
+const IMAGE_MAX_BYTES = 10 * 1024 * 1024
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'tif']
+const DOC_EXTS = [
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+  'txt', 'md', 'markdown', 'csv', 'tsv',
+  'json', 'xml', 'yaml', 'yml', 'toml',
+  'html', 'htm', 'log', 'conf', 'ini', 'cfg',
+]
+
+function classifyKindByName(filename: string): 'image' | 'doc' | 'other' {
+  const m = /\.([a-z0-9]+)$/i.exec(filename)
+  const ext = (m?.[1] || '').toLowerCase()
+  if (IMAGE_EXTS.includes(ext)) return 'image'
+  if (DOC_EXTS.includes(ext)) return 'doc'
+  return 'other'
+}
+
+interface PendingAttachment {
+  /** 本地 id，用于 v-for key */
+  id: string
+  /** 后端返回的 stored_path（相对工作空间根） */
+  storedPath: string
+  filename: string
+  size: number
+  mimeType: string
+  kind: 'image' | 'doc' | 'other'
+  /** 本地 ObjectURL（仅 kind=image 时存在；用于预览） */
+  previewUrl?: string
+}
 
 // localStorage key for saving current session
 const SESSION_STORAGE_KEY = 'helloclaw.lastSessionId'
@@ -44,6 +79,16 @@ interface ToolSegment {
 
 type MessageSegment = TextSegment | ToolSegment
 
+/** 单条用户消息携带的附件展示信息（来自历史或刚发送时的快照） */
+interface MessageAttachment {
+  filename: string
+  kind: 'image' | 'doc' | 'other'
+  storedPath?: string
+  size?: number
+  /** 仅 kind=image 时存在：可能是后端返回的 url，也可能是本地 ObjectURL */
+  imageUrl?: string
+}
+
 interface Message {
   id: number
   role: 'user' | 'assistant'
@@ -52,6 +97,8 @@ interface Message {
   segments?: MessageSegment[]  // 用于流式消息的分段
   /** 会话中第几条用户消息（0 起），用于编辑/重新生成 */
   userTurnIndex?: number
+  /** 用户消息携带的附件（仅 role=user 时存在） */
+  attachments?: MessageAttachment[]
 }
 
 interface MessageGroup {
@@ -73,6 +120,24 @@ const uploading = ref(false)
 const editModalOpen = ref(false)
 const editDraft = ref('')
 const editingUserTurnIndex = ref<number | null>(null)
+/** 编辑时剥离出的 `<file>...</file>` 原文，提交时原样拼回，保证文档内容不丢失 */
+const editStrippedFileBlocks = ref('')
+
+/** 与 UserMessageContent 一致的正则：用于剥离 user content 中的 file 块 */
+const USER_FILE_BLOCK_RE = /<file\s+name="[^"]*"\s+kind="[^"]*">[\s\S]*?<\/file>/g
+
+/** 把 user content 拆为 { userText, fileBlocks }；fileBlocks 已用 `\n\n` 连接好 */
+function splitUserContent(content: string): { userText: string; fileBlocks: string } {
+  if (!content) return { userText: '', fileBlocks: '' }
+  const blocks: string[] = []
+  const re = new RegExp(USER_FILE_BLOCK_RE.source, 'g')
+  let m: RegExpExecArray | null
+  while ((m = re.exec(content)) !== null) {
+    blocks.push(m[0])
+  }
+  const userText = content.replace(re, '').replace(/\n{3,}/g, '\n\n').trim()
+  return { userText, fileBlocks: blocks.join('\n\n') }
+}
 
 // 技能触发相关状态
 const skillSuggestions = ref<SkillInfo[]>([])
@@ -182,45 +247,111 @@ const applyContextUsage = (usage: ContextUsage | undefined) => {
   }
 }
 
-/** 上传到服务端工作空间 uploads 目录，并把相对路径插入输入框供助手处理 */
+/** 多模态附件：聊天框旁上传图片/文档（单文档 ≤10MB），发送时随消息一并提交 */
 const UPLOAD_TOOLTIP =
-  '上传本地文件：文件会保存到服务端工作空间，并把相对路径插入输入框；你可补充说明再发送，助手可按路径读取或调用 RAG 等能力。'
+  '上传图片或文档（单文档 ≤10MB）。图片走视觉模型识别，文档自动抽取文本注入到本轮对话。'
+
+/** 当前等待发送的附件列表 */
+const pendingAttachments = ref<PendingAttachment[]>([])
 
 const triggerFileSelect = () => {
   if (uploading.value || loading.value) return
   fileInputRef.value?.click()
 }
 
+/** 在调用上传 API 前的前端预校验：大小 + 类型；返回原因或 null（合法） */
+function precheckFile(file: File): string | null {
+  const kind = classifyKindByName(file.name)
+  if (kind === 'doc' && file.size > DOC_MAX_BYTES) {
+    return `文档大小 ${(file.size / 1024 / 1024).toFixed(1)}MB 超过 10MB 上限`
+  }
+  if (kind === 'image' && file.size > IMAGE_MAX_BYTES) {
+    return `图片大小 ${(file.size / 1024 / 1024).toFixed(1)}MB 超过 10MB 上限`
+  }
+  return null
+}
+
+function uploadResponseToPending(res: UploadResponse, localFile: File): PendingAttachment {
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    storedPath: res.stored_path,
+    filename: res.filename,
+    size: res.size,
+    mimeType: res.mime_type,
+    kind: res.kind,
+    previewUrl: res.kind === 'image' ? URL.createObjectURL(localFile) : undefined,
+  }
+}
+
+function removePendingAttachment(id: string) {
+  const idx = pendingAttachments.value.findIndex(a => a.id === id)
+  if (idx >= 0) {
+    const att = pendingAttachments.value[idx]
+    if (att?.previewUrl) {
+      try { URL.revokeObjectURL(att.previewUrl) } catch { /* ignore */ }
+    }
+    pendingAttachments.value.splice(idx, 1)
+  }
+}
+
+function clearPendingAttachments() {
+  for (const a of pendingAttachments.value) {
+    if (a.previewUrl) {
+      try { URL.revokeObjectURL(a.previewUrl) } catch { /* ignore */ }
+    }
+  }
+  pendingAttachments.value = []
+}
+
+async function uploadFilesAsAttachments(files: File[]) {
+  if (!files.length) return
+  uploading.value = true
+  try {
+    for (const file of files) {
+      const err = precheckFile(file)
+      if (err) {
+        message.warning(`${file.name}：${err}`)
+        continue
+      }
+      try {
+        const res = await uploadApi.uploadFile(file, currentSessionId.value)
+        pendingAttachments.value.push(uploadResponseToPending(res, file))
+      } catch (err2) {
+        const text = err2 instanceof Error ? err2.message : String(err2)
+        message.error(`${file.name} 上传失败：${text}`)
+      }
+    }
+  } finally {
+    uploading.value = false
+  }
+}
+
 const onFileInputChange = async (e: Event) => {
   const el = e.target as HTMLInputElement
   const files = el.files
   if (!files?.length) return
+  await uploadFilesAsAttachments(Array.from(files))
+  el.value = ''
+}
 
-  uploading.value = true
-  const lines: string[] = []
-  try {
-    for (const file of Array.from(files)) {
-      try {
-        const res = await uploadApi.uploadFile(file, currentSessionId.value)
-        lines.push(`[附件: ${res.stored_path}（${res.filename}）]`)
-      } catch (err) {
-        const text = err instanceof Error ? err.message : String(err)
-        message.error(`${file.name} 上传失败：${text}`)
-      }
-    }
-    if (lines.length > 0) {
-      const block = lines.join('\n')
-      if (inputMessage.value.trim()) {
-        inputMessage.value = `${inputMessage.value.trim()}\n${block}`
-      } else {
-        inputMessage.value = block
-      }
-      message.success(`已上传 ${lines.length} 个文件，路径已插入输入框`)
-    }
-  } finally {
-    uploading.value = false
-    el.value = ''
+/** 拖拽落区：聊天输入区接收文件 */
+const dragOver = ref(false)
+const onDropFiles = async (e: DragEvent) => {
+  e.preventDefault()
+  dragOver.value = false
+  if (uploading.value || loading.value) return
+  const files = Array.from(e.dataTransfer?.files || [])
+  if (files.length) {
+    await uploadFilesAsAttachments(files)
   }
+}
+const onDragOverInput = (e: DragEvent) => {
+  if (uploading.value || loading.value) return
+  e.preventDefault()
+  dragOver.value = true
+}
+const onDragLeaveInput = () => {
+  dragOver.value = false
 }
 const collapsedTools = ref<Set<number>>(new Set())
 // 默认所有工具都是展开的（用于新建的工具）
@@ -351,6 +482,14 @@ const loadSessionHistory = async (sessionId: string) => {
           displayMessages.push(pendingAssistant)
           pendingAssistant = null
         }
+        // 把后端返回的附件元数据（仅图片）转为 UI MessageAttachment
+        const restoredAtts: MessageAttachment[] = (msg.attachments || [])
+          .filter(a => a.kind === 'image' && a.url)
+          .map(a => ({
+            filename: '',  // 历史中未保存文件名，气泡渲染时 fallback 到"图片"
+            kind: 'image',
+            imageUrl: a.url,
+          }))
         // 添加 user 消息
         displayMessages.push({
           id: Date.now() + i,
@@ -358,6 +497,7 @@ const loadSessionHistory = async (sessionId: string) => {
           content: msg.content || '',
           timestamp: new Date(),
           userTurnIndex: userTurnCounter,
+          attachments: restoredAtts.length > 0 ? restoredAtts : undefined,
         })
         userTurnCounter += 1
       }
@@ -575,6 +715,11 @@ onMounted(async () => {
   await refreshContextUsage()
 })
 
+// 组件卸载：清理未发送附件的 ObjectURL
+onBeforeUnmount(() => {
+  clearPendingAttachments()
+})
+
 watch(currentSessionId, () => {
   void refreshContextUsage()
 })
@@ -702,7 +847,11 @@ const splitMessagesAtUserTurn = (turn: number) => {
   }
 }
 
-const replaceUserTurnInUi = (turn: number, newContent: string) => {
+const replaceUserTurnInUi = (
+  turn: number,
+  newContent: string,
+  attachments?: MessageAttachment[],
+) => {
   const split = splitMessagesAtUserTurn(turn)
   if (!split) return null
 
@@ -712,6 +861,7 @@ const replaceUserTurnInUi = (turn: number, newContent: string) => {
     content: newContent,
     timestamp: new Date(),
     userTurnIndex: turn,
+    attachments: attachments && attachments.length > 0 ? attachments : undefined,
   }
 
   messages.value = [...split.prefix, userMsg, ...split.suffix]
@@ -729,8 +879,28 @@ const getLastUserMessage = (): Message | undefined => {
 const openEditUserMessage = (msg: Message) => {
   if (loading.value || msg.userTurnIndex === undefined) return
   editingUserTurnIndex.value = msg.userTurnIndex
-  editDraft.value = msg.content
+  // 编辑框只显示用户原文，剥离出的文档块（<file>...</file>）保留下来，
+  // 提交时原样拼回，确保文档内容在重发时不丢失。
+  const { userText, fileBlocks } = splitUserContent(msg.content || '')
+  editDraft.value = userText
+  editStrippedFileBlocks.value = fileBlocks
   editModalOpen.value = true
+}
+
+/** 从历史 Message 的 attachments 还原回 PendingAttachment（仅保留可访问字段） */
+function messageAttachmentsToPending(atts?: MessageAttachment[]): PendingAttachment[] {
+  if (!atts || atts.length === 0) return []
+  return atts
+    .filter(a => !!a.storedPath)
+    .map<PendingAttachment>(a => ({
+      id: `restore-${a.storedPath}-${Math.random().toString(36).slice(2, 6)}`,
+      storedPath: a.storedPath!,
+      filename: a.filename,
+      size: a.size ?? 0,
+      mimeType: '',
+      kind: a.kind,
+      previewUrl: a.imageUrl,
+    }))
 }
 
 const submitEditUserMessage = async () => {
@@ -739,15 +909,33 @@ const submitEditUserMessage = async () => {
   editModalOpen.value = false
   const turn = editingUserTurnIndex.value
   editingUserTurnIndex.value = null
-  await runChatRequest(text, { userTurnIndex: turn, regenerate: false })
+  // 找到原用户消息以回填附件
+  const original = messages.value.find(m => m.role === 'user' && m.userTurnIndex === turn)
+  const restoredAtts = messageAttachmentsToPending(original?.attachments)
+  // 把剥离的文档块原样拼回，避免重发时丢失文档内容
+  const fileBlocks = editStrippedFileBlocks.value
+  editStrippedFileBlocks.value = ''
+  const finalText = fileBlocks ? `${text}\n\n${fileBlocks}` : text
+  await runChatRequest(finalText, {
+    userTurnIndex: turn,
+    regenerate: false,
+    attachments: restoredAtts,
+    skipAttachmentsClear: true,
+  })
 }
 
 const regenerateLastResponse = async () => {
   const lastUser = getLastUserMessage()
   if (!lastUser || lastUser.userTurnIndex === undefined || loading.value) return
+  const restoredAtts = messageAttachmentsToPending(lastUser.attachments)
+  // 重发时原样使用历史 content（已包含 <file> 块），后端不会重复注入
+  // （因为 restoredAtts 中只有图片，build_user_content 仅会重新构造 image_url part，
+  //  文档全文以历史 content 文本形式透传给 LLM）
   await runChatRequest(lastUser.content, {
     userTurnIndex: lastUser.userTurnIndex,
     regenerate: true,
+    attachments: restoredAtts,
+    skipAttachmentsClear: true,
   })
 }
 
@@ -756,16 +944,33 @@ interface ChatRequestOptions {
   regenerate?: boolean
   skipInputClear?: boolean
   skill?: string
+  /** 显式传入附件（编辑/重发时回填用）；为空时使用 pendingAttachments */
+  attachments?: PendingAttachment[]
+  /** 跳过自动清空 pendingAttachments（编辑/重发场景不要清掉当前输入框中的附件） */
+  skipAttachmentsClear?: boolean
 }
 
 const runChatRequest = async (userMessage: string, options: ChatRequestOptions = {}) => {
-  if (!userMessage.trim() || loading.value) return
+  // 允许「仅附件」无文字提交：当 options.attachments 或 pendingAttachments 非空时也放行
+  const hasAtt = (options.attachments?.length || pendingAttachments.value.length) > 0
+  if ((!userMessage.trim() && !hasAtt) || loading.value) return
 
   const isResend = options.userTurnIndex !== undefined
   let assistantInsertAt: number | undefined
 
+  // 决定本轮使用的附件：显式传入优先，否则用输入框旁的 pending 列表
+  const turnAttachments: PendingAttachment[] =
+    options.attachments ?? pendingAttachments.value.slice()
+  const attachmentsSnapshot: MessageAttachment[] = turnAttachments.map(a => ({
+    filename: a.filename,
+    kind: a.kind,
+    storedPath: a.storedPath,
+    size: a.size,
+    imageUrl: a.previewUrl,
+  }))
+
   if (isResend) {
-    assistantInsertAt = replaceUserTurnInUi(options.userTurnIndex!, userMessage) ?? undefined
+    assistantInsertAt = replaceUserTurnInUi(options.userTurnIndex!, userMessage, attachmentsSnapshot) ?? undefined
   } else {
     const userTurnIndex = countUserMessages()
     messages.value.push({
@@ -774,11 +979,17 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
       content: options.skill ? `/${options.skill} ${userMessage}` : userMessage,
       timestamp: new Date(),
       userTurnIndex,
+      attachments: attachmentsSnapshot.length > 0 ? attachmentsSnapshot : undefined,
     })
   }
 
   if (!options.skipInputClear) {
     inputMessage.value = ''
+  }
+  if (!options.skipAttachmentsClear && options.attachments === undefined) {
+    // 普通发送：本轮 pending 已转入消息快照，清空待发送区
+    // 注意：不 revoke ObjectURL，因为消息气泡仍在引用；走单独的 onBeforeUnmount 兜底
+    pendingAttachments.value = []
   }
   loading.value = true
 
@@ -895,6 +1106,15 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
         userTurnIndex: options.userTurnIndex,
         regenerate: options.regenerate,
         skill: options.skill,
+        attachments: turnAttachments.length > 0
+          ? turnAttachments.map<ChatAttachment>(a => ({
+              stored_path: a.storedPath,
+              filename: a.filename,
+              mime_type: a.mimeType,
+              kind: a.kind,
+              size: a.size,
+            }))
+          : undefined,
         signal: abortController.value.signal,
       }
     )
@@ -923,10 +1143,12 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
 
 const sendMessage = async () => {
   const text = inputMessage.value.trim()
-  if (!text) return
+  // 允许「无文字、仅附件」发送
+  if (!text && pendingAttachments.value.length === 0) return
+  const effectiveText = text || '请基于附件回答。'
 
   // 解析 /技能名 前缀
-  const skillMatch = text.match(/^\/(\S+)\s+([\s\S]*)/)
+  const skillMatch = effectiveText.match(/^\/(\S+)\s+([\s\S]*)/)
   if (skillMatch) {
     const skillName = skillMatch[1]
     const userContent = skillMatch[2].trim()
@@ -936,7 +1158,7 @@ const sendMessage = async () => {
     }
     await runChatRequest(userContent, { skill: skillName })
   } else {
-    await runChatRequest(text)
+    await runChatRequest(effectiveText)
   }
 }
 
@@ -979,6 +1201,20 @@ const createNewSession = async () => {
           <div class="group-content">
             <!-- 遍历每条消息 -->
             <template v-for="(msg, msgIndex) in group.messages" :key="msg.id">
+              <!-- 用户附件展示（在文本气泡之前） -->
+              <div
+                v-if="group.role === 'user' && msg.attachments && msg.attachments.length > 0"
+                class="message-attachments"
+              >
+                <AttachmentChip
+                  v-for="(att, attIdx) in msg.attachments"
+                  :key="`${msg.id}-att-${attIdx}`"
+                  :filename="att.filename || (att.kind === 'image' ? '图片' : '文件')"
+                  :kind="att.kind"
+                  :size="att.size"
+                  :image-url="att.imageUrl"
+                />
+              </div>
               <!-- 如果有分段，按分段显示 -->
               <template v-if="msg.segments && msg.segments.length > 0">
                 <template v-for="segment in msg.segments" :key="segment.id">
@@ -1038,7 +1274,14 @@ const createNewSession = async () => {
                 :class="{ 'user-editable': group.role === 'user' && !loading }"
                 @click="group.role === 'user' && !loading && openEditUserMessage(msg)"
               >
+                <!-- 用户消息：可能包含 <file>...</file> 文档块，需要折叠展示 -->
+                <UserMessageContent
+                  v-if="group.role === 'user'"
+                  :content="msg.content"
+                />
+                <!-- 助手消息：直接渲染 markdown -->
                 <div
+                  v-else
                   class="message-text"
                   v-html="renderMarkdown(msg.content)"
                 ></div>
@@ -1128,7 +1371,29 @@ const createNewSession = async () => {
           </div>
         </div>
       </Transition>
-      <div class="chat-input">
+      <!-- 附件预览条（待发送） -->
+      <div
+        v-if="pendingAttachments.length > 0"
+        class="chat-attachments-preview"
+      >
+        <AttachmentChip
+          v-for="att in pendingAttachments"
+          :key="att.id"
+          :filename="att.filename"
+          :kind="att.kind"
+          :size="att.size"
+          :image-url="att.previewUrl"
+          removable
+          @remove="removePendingAttachment(att.id)"
+        />
+      </div>
+      <div
+        class="chat-input"
+        :class="{ 'is-drag-over': dragOver }"
+        @dragover="onDragOverInput"
+        @dragleave="onDragLeaveInput"
+        @drop="onDropFiles"
+      >
         <input
           ref="fileInputRef"
           type="file"
@@ -1731,6 +1996,37 @@ const createNewSession = async () => {
 
 .chat-file-input {
   display: none;
+}
+
+/* 附件预览条（输入框上方） */
+.chat-attachments-preview {
+  max-width: 800px;
+  margin: 0 auto 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 0;
+}
+
+/* 拖拽落区高亮 */
+.chat-input.is-drag-over {
+  outline: 2px dashed var(--color-primary);
+  outline-offset: 4px;
+  border-radius: 12px;
+  background: var(--color-primary-light, rgba(255, 92, 92, 0.04));
+}
+
+/* 消息气泡内的附件展示 */
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 6px;
+  max-width: 100%;
+}
+
+.message-group.user .message-attachments {
+  justify-content: flex-end;
 }
 
 .chat-input-attach {

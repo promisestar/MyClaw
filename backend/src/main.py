@@ -12,8 +12,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills
 from .workspace.manager import WorkspaceManager
@@ -160,6 +162,29 @@ app.include_router(knowledge_base.router, prefix="/api")
 app.include_router(tool_logs.router, prefix="/api")
 app.include_router(skills.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
+
+
+# 多模态：当 MULTIMODAL_IMAGE_MODE=url 时挂载 /files 静态资源，仅暴露 workspace/uploads
+def _mount_uploads_static(application: FastAPI) -> None:
+    mode = (os.getenv("MULTIMODAL_IMAGE_MODE", "base64").strip().lower())
+    if mode != "url":
+        return
+    public_base_url = (os.getenv("MULTIMODAL_PUBLIC_BASE_URL", "").strip())
+    if not public_base_url:
+        print("⚠️ MULTIMODAL_IMAGE_MODE=url 但未配置 MULTIMODAL_PUBLIC_BASE_URL，跳过 /files 挂载")
+        return
+    workspace_path = os.path.expanduser(os.getenv("WORKSPACE_PATH", "~/.helloclaw/workspace"))
+    uploads_dir = Path(workspace_path) / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    application.mount(
+        "/files",
+        StaticFiles(directory=str(uploads_dir), check_dir=False),
+        name="uploads",
+    )
+    print(f"📁 多模态静态资源已挂载: /files → {uploads_dir}")
+
+
+_mount_uploads_static(app)
 
 
 @app.get("/api")

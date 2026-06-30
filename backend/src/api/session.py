@@ -45,12 +45,22 @@ class ToolCall(BaseModel):
     function: ToolCallFunction
 
 
+class HistoryAttachmentMeta(BaseModel):
+    """历史消息附件元数据（由 MyClawAgent.get_session_history 从 list-content 中提取）。
+
+    当前仅图片需要在前端回显缩略图（文档已在发送时抽文本注入到 user 文本，回放时不再单独渲染）。
+    """
+    kind: Literal["image"] = "image"
+    url: str  # data:image/...;base64,xxx 或 http(s)://...
+
+
 class ChatMessage(BaseModel):
-    """聊天消息（OpenAI 标准格式）"""
+    """聊天消息（OpenAI 标准格式 + 多模态附件）"""
     role: Literal["user", "assistant", "tool"]
     content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None  # assistant 消息中的工具调用
     tool_call_id: Optional[str] = None  # tool 消息中的调用 ID
+    attachments: Optional[List[HistoryAttachmentMeta]] = None  # 多模态附件（仅 user 消息可能存在）
 
 
 class SessionHistoryResponse(BaseModel):
@@ -194,7 +204,19 @@ async def get_session_history(session_id: str):
         metadata = m.get("metadata", {})
 
         if role == "user":
-            chat_messages.append(ChatMessage(role="user", content=content))
+            # 透传多模态附件元数据（图片缩略图）
+            raw_atts = m.get("attachments") or []
+            atts: Optional[List[HistoryAttachmentMeta]] = None
+            if raw_atts:
+                atts = []
+                for a in raw_atts:
+                    if not isinstance(a, dict):
+                        continue
+                    if a.get("kind") == "image" and a.get("url"):
+                        atts.append(HistoryAttachmentMeta(kind="image", url=a["url"]))
+                if not atts:
+                    atts = None
+            chat_messages.append(ChatMessage(role="user", content=content, attachments=atts))
 
         elif role == "assistant":
             tool_calls_data = metadata.get("tool_calls")

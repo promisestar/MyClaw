@@ -2,15 +2,25 @@
 
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from hello_agents import Config
 from hello_agents.core.message import Message
 from .enhanced_simple_agent import EnhancedSimpleAgent
 from .enhanced_llm import EnhancedHelloAgentsLLM  # HelloClaw 专用 LLM（支持流式工具调用）
+from .multimodal_bridge import (
+    encode_multimodal_content,
+    decode_multimodal_content,
+    is_encoded_multimodal,
+    install_simple_agent_multimodal_patch,
+)
 from ..memory.memory_flush import MemoryFlushManager
 from ..memory.capture import MemoryCaptureManager
 from ..memory.vector_store import MemoryVectorStore
+from ..multimodal import MultimodalConfig, build_user_content
+
+# 安装一次性 patch：让 EnhancedSimpleAgent 在 _build_messages 时解码多模态内容
+install_simple_agent_multimodal_patch()
 from hello_agents.tools import (
     ToolRegistry,
     ReadTool,
@@ -521,6 +531,74 @@ class MyClawAgent:
         self._agent._history = history + suffix
         self._resend_suffix = []
 
+    def _build_multimodal_config(self) -> MultimodalConfig:
+        """从环境变量构造多模态配置（每轮对话读取一次，便于热改 env）。"""
+        image_mode = (os.getenv("MULTIMODAL_IMAGE_MODE", "base64").strip().lower()
+                      or "base64")
+        if image_mode not in ("base64", "url"):
+            image_mode = "base64"
+        try:
+            max_image_mb = float(os.getenv("MULTIMODAL_MAX_IMAGE_MB", "5"))
+        except ValueError:
+            max_image_mb = 5.0
+        uploads_root = os.path.join(self.workspace_path, "uploads")
+        return MultimodalConfig(
+            image_mode=image_mode,  # type: ignore[arg-type]
+            public_base_url=(os.getenv("MULTIMODAL_PUBLIC_BASE_URL") or None),
+            uploads_root=uploads_root,
+            max_image_mb=max_image_mb,
+        )
+
+    def _materialize_image_ref_for_display(self, url: str) -> str:
+        """会话历史中的 image_url 反序列化为前端可显示的 URL。
+
+        历史中 image_url 以三种形式存在：
+        - ``@FILE:<abs_path>``：base64 模式下的路径引用，需要即时读盘构造 data URL
+        - ``http(s)://...``：URL 模式直接透传
+        - ``data:...``：极少见的旧数据 / 用户手动注入；原样返回
+
+        文件已被删除时返回空串（调用方据此跳过该附件项）。
+        """
+        if not isinstance(url, str) or not url:
+            return ""
+        if url.startswith("@FILE:"):
+            local_path = url[len("@FILE:"):]
+            if not os.path.isfile(local_path):
+                return ""
+            try:
+                from ..multimodal.image import load_image_as_data_url
+                # 复用上传配置中的图片大小上限，保持与首轮一致
+                cfg = self._build_multimodal_config()
+                return load_image_as_data_url(local_path, max_mb=cfg.max_image_mb)
+            except Exception as exc:
+                print(f"⚠️ 历史图片还原失败 path={local_path} err={exc}")
+                return ""
+        return url
+
+    def _prepare_message_with_attachments(
+        self,
+        message: str,
+        attachments: Optional[List[Dict[str, Any]]],
+    ) -> str:
+        """构造发给底层 Agent 的输入。
+
+        - 无附件：原样返回字符串
+        - 有附件：构造 OpenAI 多模态 list-content，再用 encode_multimodal_content
+          包装成可放入 hello_agents.Message 的字符串。
+        """
+        if not attachments:
+            return message
+        cfg = self._build_multimodal_config()
+        content = build_user_content(
+            message,
+            attachments,
+            workspace_root=self.workspace_path,
+            config=cfg,
+        )
+        if isinstance(content, str):
+            return content
+        return encode_multimodal_content(content)
+
     def chat(
         self,
         message: str,
@@ -528,6 +606,7 @@ class MyClawAgent:
         *,
         user_turn_index: Optional[int] = None,
         regenerate: bool = False,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """同步聊天"""
         # 热加载配置（检测 config.json 变化）
@@ -551,8 +630,9 @@ class MyClawAgent:
             "presence_penalty": 0.3,   # 鼓励谈论新话题
         }
 
-        # 运行 Agent
-        response = self._agent.run(message, **llm_kwargs)
+        # 构造（可能含多模态附件）输入并运行 Agent
+        agent_input = self._prepare_message_with_attachments(message, attachments)
+        response = self._agent.run(agent_input, **llm_kwargs)
         self._finalize_turn_replace_if_needed()
 
         # 保存会话
@@ -571,6 +651,7 @@ class MyClawAgent:
         *,
         user_turn_index: Optional[int] = None,
         regenerate: bool = False,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ):
         """异步聊天（支持流式输出）
 
@@ -624,7 +705,10 @@ class MyClawAgent:
         print(f"[⏱️ {t_llm:.3f}] 开始调用 LLM ({self._model_id})...")
         first_chunk = True
 
-        async for event in self._agent.arun_stream_with_tools(message, **llm_kwargs):
+        # 构造（可能含多模态附件）输入
+        agent_input = self._prepare_message_with_attachments(message, attachments)
+
+        async for event in self._agent.arun_stream_with_tools(agent_input, **llm_kwargs):
             if first_chunk and event.type.value == "llm_chunk":
                 print(f"[⏱️ {time.time():.3f}] 首个 token 到达 (LLM 延迟: {time.time()-t_llm:.3f}s)")
                 first_chunk = False
@@ -845,7 +929,16 @@ class MyClawAgent:
         return False
 
     def get_session_history(self, session_id: str) -> List[dict]:
-        """获取会话历史消息"""
+        """获取会话历史消息（兼容多模态 list-content 与编码字符串形式）。
+
+        返回结构：
+            [
+                {"role": "user", "content": "文本", "attachments": [...], "metadata": {...}},
+                ...
+            ]
+        其中 ``attachments`` 仅在该条消息含图片 part 时存在，元素形如
+        ``{"kind": "image", "url": "<data:...|http://...>"}``，便于前端直接渲染缩略图。
+        """
         import json
         filepath = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
         if not os.path.exists(filepath):
@@ -860,24 +953,42 @@ class MyClawAgent:
             for msg in raw_history:
                 role = msg.get("role", "")
                 # 支持 user, assistant, tool 三种角色
-                if role in ("user", "assistant", "tool"):
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        content = "\n".join(text_parts)
+                if role not in ("user", "assistant", "tool"):
+                    continue
 
-                    # 构建消息对象，包含 metadata
-                    message_obj: dict = {"role": role, "content": content}
-                    # 保留 metadata（包含 tool_calls 或 tool_call_id）
-                    if "metadata" in msg:
-                        message_obj["metadata"] = msg["metadata"]
+                content = msg.get("content", "")
 
-                    messages.append(message_obj)
+                # 1) 编码字符串：先解码回 list-content
+                if is_encoded_multimodal(content):
+                    content = decode_multimodal_content(content)
+
+                # 2) list-content：拍平为文本 + 提取附件元数据
+                #    image_url 在历史中以 @FILE:<abs_path> 引用形式保存，
+                #    这里按需即时读盘构造 data URL 供前端缩略图渲染；URL 模式保持原样。
+                attachments_meta: List[dict] = []
+                if isinstance(content, list):
+                    text_parts: List[str] = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            ptype = part.get("type")
+                            if ptype == "text":
+                                text_parts.append(part.get("text") or "")
+                            elif ptype == "image_url":
+                                url = (part.get("image_url") or {}).get("url") or ""
+                                display_url = self._materialize_image_ref_for_display(url)
+                                if display_url:
+                                    attachments_meta.append({"kind": "image", "url": display_url})
+                        elif isinstance(part, str):
+                            text_parts.append(part)
+                    content = "\n".join(text_parts)
+
+                message_obj: dict = {"role": role, "content": content}
+                if attachments_meta:
+                    message_obj["attachments"] = attachments_meta
+                if "metadata" in msg:
+                    message_obj["metadata"] = msg["metadata"]
+
+                messages.append(message_obj)
 
             return messages
         except Exception as e:

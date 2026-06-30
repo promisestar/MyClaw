@@ -910,7 +910,29 @@ class EnhancedSimpleAgent(SimpleAgent):
             input_text=input_text
         )
 
-        print(f"\n🤖 {self.name} 开始处理问题（流式）: {input_text}")
+        # 日志展示：若 input_text 是多模态编码字符串，拆出友好提示，避免打印 base64 / 编码乱码
+        try:
+            from .multimodal_bridge import is_encoded_multimodal, decode_multimodal_content
+            from ..multimodal import flatten_content_to_text
+            if is_encoded_multimodal(input_text):
+                decoded = decode_multimodal_content(input_text)
+                _display = flatten_content_to_text(decoded)
+                if len(_display) > 200:
+                    _display = _display[:200] + "..."
+                # 统计附件数量，方便排查多模态链路
+                _att_count = (
+                    sum(1 for p in decoded if isinstance(p, dict) and p.get("type") == "image_url")
+                    if isinstance(decoded, list)
+                    else 0
+                )
+                _suffix = f"  [📎 图片附件 x{_att_count}]" if _att_count else ""
+                print(f"\n🤖 {self.name} 开始处理问题（流式）: {_display}{_suffix}")
+            else:
+                _display = input_text if len(input_text) <= 200 else input_text[:200] + "..."
+                print(f"\n🤖 {self.name} 开始处理问题（流式）: {_display}")
+        except Exception:
+            # 任意异常都不应阻塞主流程，回退到原日志
+            print(f"\n🤖 {self.name} 开始处理问题（流式）: {input_text[:200]}")
         tracked_temp_files: Set[Path] = set()
 
         try:

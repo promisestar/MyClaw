@@ -15,6 +15,7 @@
 | Web UI | Vue 3 配置、记忆、会话管理 |
 | 外部通道 | WebSocket Bridge（含飞书等适配）；HTTP 与 Bridge 共用 Agent 锁串行处理 |
 | 文件上传 | 保存至工作空间 `uploads/`，可在对话中引用路径或入库 RAG |
+| 多模态输入 | 聊天直传图片（VLM `image_url`，base64/URL 双模式）与文档（PDF/DOCX/XLSX/TXT 抽文本注入，单文档 ≤10MB） |
 
 ## 技术栈
 
@@ -74,7 +75,7 @@ EXTERNAL_BRIDGE_ALLOW_FROM=*
 
 | 来源 | 内容 |
 |------|------|
-| `backend/.env` | LLM、端口、工作空间、Bridge、上传大小等 |
+| `backend/.env` | LLM、端口、工作空间、Bridge、上传大小、**多模态（`MULTIMODAL_*`）** 等 |
 | `~/.helloclaw/config.json` | 全局 LLM / **MCP**（Web 配置页可改） |
 | `~/.helloclaw/workspace/` | Agent 工作区：`IDENTITY.md`、`MEMORY.md`、`memory/`、`sessions/` 等 |
 
@@ -117,6 +118,7 @@ LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
 | [docs/前端实现说明.md](docs/前端实现说明.md) | 前端架构与页面 |
 | [docs/Memory实现与功能说明.md](docs/Memory实现与功能说明.md) | 记忆系统 |
 | [docs/Bridge实现与功能说明.md](docs/Bridge实现与功能说明.md) | Bridge 架构 |
+| [docs/多模态实现说明.md](docs/多模态实现说明.md) | 多模态输入（图片 + 文档）协议与实现 |
 | [backend/README.md](backend/README.md) | 后端补充说明 |
 
 ## 许可证

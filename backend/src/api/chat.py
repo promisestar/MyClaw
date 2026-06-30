@@ -1,12 +1,22 @@
 """聊天 API 路由"""
 import json
-from typing import Optional
+from typing import List, Literal, Optional
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from ..logging.tool_logger import set_trace_id, generate_trace_id
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+class Attachment(BaseModel):
+    """对话附件元数据（与 /upload/file 返回的 UploadResponse 对齐）。"""
+
+    stored_path: str = Field(description="相对于工作空间根的 POSIX 路径")
+    filename: str = Field(description="原始文件名（用于在 LLM 提示中标注）")
+    mime_type: str = Field(default="application/octet-stream")
+    kind: Literal["image", "doc", "other"] = Field(default="other")
+    size: int = Field(default=0, description="字节数")
 
 
 class ChatRequest(BaseModel):
@@ -19,6 +29,8 @@ class ChatRequest(BaseModel):
     regenerate: bool = False
     # 用户通过 /技能名 方式指定的技能，后端会预加载技能内容注入上下文
     skill: Optional[str] = None
+    # 多模态附件列表（图片走 VLM image_url；文档抽取为 text 注入）
+    attachments: List[Attachment] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
@@ -65,6 +77,7 @@ async def send_message_sync(request: ChatRequest):
         return ChatResponse(content="Agent not initialized", session_id=request.session_id)
 
     message = _inject_skill_context(request.message, request.skill)
+    attachments = [att.model_dump() for att in request.attachments]
     lock = get_agent_lock()
     if lock:
         async with lock:
@@ -73,6 +86,7 @@ async def send_message_sync(request: ChatRequest):
                 request.session_id,
                 user_turn_index=request.user_turn_index,
                 regenerate=request.regenerate,
+                attachments=attachments,
             )
     else:
         response = agent.chat(
@@ -80,6 +94,7 @@ async def send_message_sync(request: ChatRequest):
             request.session_id,
             user_turn_index=request.user_turn_index,
             regenerate=request.regenerate,
+            attachments=attachments,
         )
     return ChatResponse(content=response, session_id=request.session_id)
 
@@ -114,6 +129,7 @@ async def send_message_stream(request: ChatRequest):
             set_trace_id(generate_trace_id())
 
             message = _inject_skill_context(request.message, request.skill)
+            attachments = [att.model_dump() for att in request.attachments]
 
             async def _run_stream():
                 async for event in agent.achat(
@@ -121,6 +137,7 @@ async def send_message_stream(request: ChatRequest):
                     request.session_id,
                     user_turn_index=request.user_turn_index,
                     regenerate=request.regenerate,
+                    attachments=attachments,
                 ):
                     event_type = event.type.value
                     event_data = event.data

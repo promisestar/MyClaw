@@ -19,6 +19,7 @@ dependencies = [
     "google-search-results==2.4.2",
     "serpapi==1.0.2",
     "markitdown[all]==0.1.5",
+    "Pillow>=10.0.0",
     "langdetect==1.0.9",
     "qdrant-client>=1.6.0",
     "sentence-transformers>=3.0.0",

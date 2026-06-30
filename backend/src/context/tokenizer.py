@@ -260,10 +260,29 @@ def count_messages(
         if not isinstance(msg, dict):
             continue
 
-        # 消息内容
+        # 消息内容（兼容多模态 list-content：把 text part 拼起来；
+        # image_url 按估算固定 1024 tokens/张占位）
         content = msg.get("content")
         if isinstance(content, str) and content:
             total += count_tokens(content, model, base_url)
+        elif isinstance(content, list):
+            text_buf: list[str] = []
+            image_count = 0
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        t = part.get("text") or ""
+                        if t:
+                            text_buf.append(t)
+                    elif part.get("type") == "image_url":
+                        image_count += 1
+                elif isinstance(part, str):
+                    text_buf.append(part)
+            joined = "".join(text_buf)
+            if joined:
+                total += count_tokens(joined, model, base_url)
+            if image_count:
+                total += image_count * 1024  # 视觉模型按图片块计费的近似占位
 
         # 工具调用（OpenAI 格式）
         tool_calls = msg.get("tool_calls")

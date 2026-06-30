@@ -8,6 +8,15 @@ export interface ChatMessage {
   content: string
 }
 
+/** 与后端 src/api/chat.py 的 Attachment 对齐 */
+export interface ChatAttachment {
+  stored_path: string
+  filename: string
+  mime_type: string
+  kind: 'image' | 'doc' | 'other'
+  size: number
+}
+
 export interface ChatResponse {
   content: string
   session_id: string | null
@@ -36,6 +45,8 @@ export interface SendMessageOptions {
   regenerate?: boolean
   /** 用户通过 /技能名 指定的技能名 */
   skill?: string
+  /** 多模态附件列表（已通过 /upload/file 上传得到 stored_path） */
+  attachments?: ChatAttachment[]
   signal?: AbortSignal
 }
 
@@ -63,7 +74,7 @@ export const chatApi = {
     onChunk: StreamCallback,
     options: SendMessageOptions = {}
   ): Promise<ChatResponse> => {
-    const { sessionId, userTurnIndex, regenerate, skill, signal } = options
+    const { sessionId, userTurnIndex, regenerate, skill, attachments, signal } = options
     const body: Record<string, unknown> = {
       message,
       session_id: sessionId,
@@ -74,6 +85,9 @@ export const chatApi = {
     }
     if (skill) {
       body.skill = skill
+    }
+    if (attachments && attachments.length > 0) {
+      body.attachments = attachments
     }
 
     const response = await fetch(`${API_BASE}/api/chat/send/stream`, {

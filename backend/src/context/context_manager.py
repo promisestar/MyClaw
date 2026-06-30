@@ -394,9 +394,20 @@ class ContextManager:
 
     @staticmethod
     def _format_history_for_summary(history: List[Message]) -> str:
+        # 延迟导入，避免循环依赖
+        from ..agent.multimodal_bridge import (
+            decode_multimodal_content,
+            is_encoded_multimodal,
+        )
+        from ..multimodal import flatten_content_to_text
+
         lines = []
         for msg in history:
-            content = msg.content[:500] if len(msg.content) > 500 else msg.content
+            raw = msg.content
+            if is_encoded_multimodal(raw):
+                raw = decode_multimodal_content(raw)
+            text = flatten_content_to_text(raw) if not isinstance(raw, str) else raw
+            content = text[:500] if len(text) > 500 else text
             lines.append(f"[{msg.role}]: {content}")
         return "\n\n".join(lines)
 
