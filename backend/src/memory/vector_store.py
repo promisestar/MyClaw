@@ -1,14 +1,32 @@
 """MemoryVectorStore - 记忆专用 Qdrant 向量存储封装
 
 统一的长期记忆存储层，基于 Qdrant 向量数据库 + embedding 语义检索。
-支持写入、检索、删除、过期清理。
+支持写入、检索、删除、过期清理，并在写入路径上做两层去重：
+
+- **L1 字面去重（默认启用）**：写入前用 ``content_hash``（sha1 of
+  normalized content）+ ``category`` 精确匹配。命中则直接强化旧记忆
+  （重置 ``last_decay_ts`` + ``access_count`` 累加）并复用其 memory_id。
+  零误判，专门拦截"反复说同一句话"类重复。
+
+- **L2 语义去重（默认关闭）**：用新内容 embedding 在同分类范围内查
+  top-1，若相似度 ≥ ``MEMORY_DEDUPE_THRESHOLD`` 判定为重复 → 强化旧记忆，
+  不新建。
+
+  默认 ``MEMORY_DEDUPE_THRESHOLD=1.0`` 关闭，因为当前默认 embedding
+  ``all-MiniLM-L6-v2`` 对中文的反义/同义判别力不足（实测反义对相似度
+  有时反高于同义对），无法用固定阈值兼顾"接受同义 + 拒绝反义"。
+  换用 ``BAAI/bge-small-zh-v1.5`` 等中文 embedding 后，把阈值调到
+  0.90~0.93 即可启用。
+
+两层去重均不抛异常，失败时回退为正常写入，不会阻塞主对话流程。
 """
 
+import hashlib
 import logging
 import os
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 from ..rag.qdrant_store import QdrantConnectionManager, QdrantVectorStore
 from ..rag.embedding import get_text_embedder, get_dimension
@@ -39,6 +57,52 @@ CATEGORY_DECAY_RATES: Dict[str, float] = {
     "fact": 0.25,          # 事实 → 标准衰减
     "reference": 0.30,     # URL、路径 → 快衰减
 }
+
+# ── 写入路径去重配置 ───────────────────────────────────
+# L2 语义去重相似度阈值：余弦相似度 ≥ 阈值则判定为重复，强化旧记忆而非新建。
+#
+# 默认 1.0 = **关闭 L2**。原因：当前默认 embedding 模型 ``all-MiniLM-L6-v2``
+# 对中文的语义场判别力不足，实测反义对（"喜欢" vs "讨厌"）的余弦相似度
+# 反而高于同义改写对，无法用固定阈值同时满足"接受同义 + 拒绝反义"。
+# 因此默认只启用 L1 字面去重（完全无误判）。
+#
+# 启用 L2 的前提：换用对中文友好的 embedding 模型（如 ``BAAI/bge-small-zh-v1.5``
+# 或 ``text-embedding-3-small``）。届时把阈值降到 0.90~0.93 即可生效。
+#
+# 经验值参考（bge-small-zh-v1.5）：
+#   - "我喜欢简洁回复" vs "我偏好简洁的回复风格"  ~0.93-0.96
+#   - "我喜欢简洁回复" vs "我喜欢长篇大论详细回复" ~0.82-0.88
+try:
+    MEMORY_DEDUPE_THRESHOLD = float(os.getenv("MEMORY_DEDUPE_THRESHOLD", "1.0"))
+except ValueError:
+    MEMORY_DEDUPE_THRESHOLD = 1.0
+
+# L2 是否启用：阈值 >= 1.0 视为关闭（任何余弦相似度都不可能命中）
+_L2_ENABLED = MEMORY_DEDUPE_THRESHOLD < 1.0
+
+
+def _normalize_content(content: str) -> str:
+    """归一化文本用于 L1 字面去重的 hash 计算。
+
+    规则：
+    - 转小写
+    - strip 两端空白
+    - 内部连续空白合并为单个空格
+
+    这样"我喜欢简洁回复"和"我喜欢简洁回复 "在 hash 上等价。
+    """
+    if not content:
+        return ""
+    return " ".join(content.lower().split())
+
+
+def _compute_content_hash(content: str) -> str:
+    """计算归一化后内容的 sha1[:16]，用作 Qdrant payload 中的 content_hash 字段。
+
+    截取前 16 个字符（64 bit）即可：记忆库总量预期 << 2^32，碰撞概率可忽略。
+    """
+    norm = _normalize_content(content)
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
 
 
 class MemoryVectorStore:
@@ -101,12 +165,48 @@ class MemoryVectorStore:
                 "MemoryVectorStore 初始化完成: collection=%s dim=%d forget_days=%d",
                 collection_name, self._dimension, forget_days,
             )
+            # 确保去重路径所需的 payload index 存在（Qdrant 云端服务要求
+            # 所有用于 filter 的字段都必须建立 keyword index，否则 search/scroll
+            # 会返回 400 Bad Request）
+            self._ensure_dedupe_indexes()
         except Exception as e:
             logger.warning(
                 "⚠️ Qdrant 连接失败，记忆向量存储不可用，将回退到文件模式: %s", e
             )
             self._qdrant = None
             self._available = False
+
+    def _ensure_dedupe_indexes(self) -> None:
+        """为 L1/L2 去重所需的 payload 字段创建 keyword index。
+
+        共享的 ``QdrantVectorStore._ensure_payload_indexes`` 已经覆盖了 memory_type
+        / memory_id / source 等通用字段，但没有 ``category`` 与 ``content_hash``——
+        这两个是 MemoryVectorStore 独有的过滤字段，需要在这里补建。
+
+        重复调用安全：``create_payload_index`` 在索引已存在时会抛异常，被静默忽略。
+        """
+        if not self._qdrant or not self._qdrant.client:
+            return
+        try:
+            from qdrant_client.http import models as qmodels
+        except Exception:
+            return
+
+        fields = [
+            ("category", qmodels.PayloadSchemaType.KEYWORD),
+            ("content_hash", qmodels.PayloadSchemaType.KEYWORD),
+        ]
+        for field_name, schema_type in fields:
+            try:
+                self._qdrant.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema=schema_type,
+                )
+                logger.debug("payload index 已创建: %s", field_name)
+            except Exception as ie:
+                # 索引已存在 → 抛错，安全忽略
+                logger.debug("payload index %s 已存在或创建失败: %s", field_name, ie)
 
     @property
     def available(self) -> bool:
@@ -122,7 +222,24 @@ class MemoryVectorStore:
         session_id: Optional[str] = None,
         source: str = "capture",
     ) -> Optional[str]:
-        """向量化并写入一条长期记忆
+        """向量化并写入一条长期记忆，写入前自动做 L1（+L2，可选）去重。
+
+        写入流程：
+
+        1. **L1 字面去重（默认启用）**：把归一化后的 ``content`` 求 sha1，
+           按 ``content_hash`` + ``category`` 在 Qdrant 中精确匹配；命中
+           则强化旧记忆并返回其 memory_id（**不新建**）。
+        2. **L2 语义去重（仅当 MEMORY_DEDUPE_THRESHOLD < 1.0 时启用）**：
+           L1 未命中时，用 ``content`` 的 embedding 在 ``memory_type=longterm``
+           + 同 ``category`` 范围内查 top-1，若相似度 ≥ 阈值则强化旧记忆并
+           返回其 memory_id（**不新建**）。默认阈值 1.0 即关闭——见模块
+           docstring 中的说明。
+        3. 以上都未命中 → 正常写入新记忆。
+
+        强化策略（B 策略）：重置 ``last_decay_ts`` 为当前时间 +
+        ``access_count`` 累加。**不写 aliases / 不合并内容**。
+
+        去重检查失败（Qdrant 异常）时静默回退到普通写入，不阻塞主流程。
 
         Args:
             content: 记忆文本内容
@@ -131,26 +248,59 @@ class MemoryVectorStore:
             source: 来源（capture/agent/flush）
 
         Returns:
-            memory_id 字符串，失败返回 None
+            memory_id 字符串（可能是复用的旧 ID），失败返回 None
         """
         if not self.available:
             logger.warning("Qdrant 不可用，跳过记忆写入")
             return None
 
+        if not content or not content.strip():
+            return None
+
         try:
-            # 向量化
+            # ── L1：字面去重（sha1 精确匹配，限定同分类） ────
+            # 跨分类即使字面相同也应作为两条独立记忆（preference 与 fact 下
+            # 的 "我喜欢简洁回复" 语义指向不同——前者是偏好声明，后者是事实记录）
+            content_hash = _compute_content_hash(content)
+            dup_id = self._find_by_hash(content_hash, category=category)
+            if dup_id:
+                self._reinforce_single(dup_id)
+                logger.info(
+                    "L1 字面去重命中：复用旧记忆 id=%s category=%s",
+                    dup_id, category,
+                )
+                return dup_id
+
+            # 向量化（正常写入路径用；若启用 L2 则也会复用同一份向量）
             vector = self._embedder.encode(content)
             if hasattr(vector, "tolist"):
                 vector = vector.tolist()
 
-            # 生成唯一 memory_id
-            memory_id = str(uuid.uuid4())
+            # ── L2：语义去重（同分类内 top-1 相似度判定） ────
+            # 仅在 MEMORY_DEDUPE_THRESHOLD < 1.0 时启用——默认配置下 L2 关闭，
+            # 这里短路跳过，避免每次写入都白做一次 Qdrant 查询。
+            if _L2_ENABLED:
+                dup_id, dup_score = self._find_semantic_duplicate(
+                    vector=vector,
+                    category=category,
+                    threshold=MEMORY_DEDUPE_THRESHOLD,
+                )
+                if dup_id:
+                    self._reinforce_single(dup_id)
+                    logger.info(
+                        "L2 语义去重命中：复用旧记忆 id=%s score=%.3f category=%s "
+                        "new='%s'",
+                        dup_id, dup_score, category, content[:60],
+                    )
+                    return dup_id
 
-            # 构建 payload
+            # ── 正常写入 ─────────────────────────────────
+            memory_id = str(uuid.uuid4())
             now = datetime.now()
             now_ts = int(now.timestamp())
             payload = {
                 "content": content,
+                "content_hash": content_hash,
                 "category": category,
                 "memory_type": "longterm",
                 "memory_id": memory_id,
@@ -159,6 +309,7 @@ class MemoryVectorStore:
                 "source": source,
                 "decay_score": 1.0,           # 衰减分数：初始满分
                 "last_decay_ts": now_ts,       # 上次衰减计算时间戳
+                "access_count": 0,             # 命中复用计数（每次去重命中 +1）
             }
             if session_id:
                 payload["session_id"] = session_id
@@ -180,6 +331,126 @@ class MemoryVectorStore:
         except Exception as e:
             logger.error("记忆写入异常: %s", e, exc_info=True)
             return None
+
+    # ── 内部：写入路径去重辅助方法 ────────────────────────
+
+    def _find_by_hash(
+        self,
+        content_hash: str,
+        category: Optional[str] = None,
+    ) -> Optional[str]:
+        """L1：按 content_hash + category 精确匹配查找已有记忆。
+
+        使用 Qdrant 的 scroll + filter 实现（不需要向量），开销 < 10ms。
+        失败时返回 None，不抛异常，保证主流程可继续走 L2 / 正常写入。
+
+        Args:
+            content_hash: 待查 hash
+            category: 限定分类，None 表示跨分类查找（一般不用）
+
+        Returns:
+            命中时返回 memory_id（即 point id），未命中返回 None
+        """
+        if not self.available or not content_hash:
+            return None
+        try:
+            from qdrant_client.http.models import Filter, FieldCondition
+            from qdrant_client.http import models as qmodels
+
+            must = [
+                FieldCondition(
+                    key="content_hash",
+                    match=qmodels.MatchValue(value=content_hash),
+                ),
+                FieldCondition(
+                    key="memory_type",
+                    match=qmodels.MatchValue(value="longterm"),
+                ),
+            ]
+            if category:
+                must.append(FieldCondition(
+                    key="category",
+                    match=qmodels.MatchValue(value=category),
+                ))
+
+            points, _ = self._qdrant.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(must=must),
+                limit=1,
+                with_payload=False,
+                with_vectors=False,
+            )
+            if points:
+                # point.id 即 memory_id（写入时使用同一 UUID）
+                return str(points[0].id)
+            return None
+        except Exception as exc:
+            logger.warning("L1 字面去重查询失败（回退到正常写入）: %s", exc)
+            return None
+
+    def _find_semantic_duplicate(
+        self,
+        vector: List[float],
+        category: str,
+        threshold: float,
+    ) -> Tuple[Optional[str], float]:
+        """L2：在同分类内做向量 top-1 检索，相似度 ≥ threshold 视为重复。
+
+        Returns:
+            (memory_id, score) — 未命中时返回 (None, 0.0)。
+        """
+        if not self.available:
+            return (None, 0.0)
+        try:
+            hits = self._qdrant.search_similar(
+                query_vector=vector,
+                limit=1,
+                score_threshold=threshold,
+                where={"category": category, "memory_type": "longterm"},
+            )
+            if hits:
+                top = hits[0]
+                return (str(top.get("id")), float(top.get("score", 0.0)))
+            return (None, 0.0)
+        except Exception as exc:
+            logger.warning("L2 语义去重查询失败（回退到正常写入）: %s", exc)
+            return (None, 0.0)
+
+    def _reinforce_single(self, memory_id: str) -> None:
+        """命中去重时强化单条记忆：重置 last_decay_ts + access_count++。
+
+        采用 read-modify-write 模式：先 retrieve 当前 access_count，
+        再 set_payload 写回。失败仅记录日志，不影响调用方。
+        """
+        if not self.available or not memory_id:
+            return
+        try:
+            now_ts = int(datetime.now().timestamp())
+            # 读取当前 access_count
+            current_count = 0
+            try:
+                points = self._qdrant.client.retrieve(
+                    collection_name=self.collection_name,
+                    ids=[memory_id],
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if points:
+                    current_count = int((points[0].payload or {}).get("access_count", 0))
+            except Exception:
+                # 读取失败仍尝试写入（access_count 起算为 1）
+                pass
+
+            self._qdrant.client.set_payload(
+                collection_name=self.collection_name,
+                payload={
+                    "last_decay_ts": now_ts,
+                    "access_count": current_count + 1,
+                },
+                points=[memory_id],
+            )
+        except Exception as exc:
+            logger.warning("强化记忆 %s 失败: %s", memory_id, exc)
 
     # ── 检索 ────────────────────────────────────────────
 

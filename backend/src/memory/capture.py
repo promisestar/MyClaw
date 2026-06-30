@@ -129,13 +129,11 @@ class MemoryCaptureManager:
             if not content:
                 continue
 
-            # 去重检查
+            # 单次 capture() 内字面去重（同句被多个 trigger 命中时只保留一份）
+            # 注：跨次 capture 与跨会话的去重统一由 MemoryVectorStore.add_memory
+            # 写入路径上的 L1 字面去重 + L2 语义去重负责
             content_key = content.lower().strip()
             if content_key in seen_contents:
-                continue
-
-            # 去重检查（有 workspace 时才做文件去重）
-            if self.workspace and self.workspace.check_duplicate_memory(content, threshold=0.7):
                 continue
 
             seen_contents.add(content_key)
