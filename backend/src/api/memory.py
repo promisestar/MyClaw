@@ -1,7 +1,15 @@
-"""记忆 API 路由 — 基于 Qdrant 向量数据库"""
+"""记忆 API 路由 — 基于 Qdrant 向量数据库
+
+性能说明：
+- 本路由的核心操作（search_memories / get_stats / add_memory / process_decay）
+  均为同步阻塞调用：embedding 计算 + Qdrant HTTP 请求，单次耗时数百 ms 到数秒。
+- 为避免阻塞 FastAPI 事件循环（进而拖累其它接口），所有同步 Qdrant 调用通过
+  ``starlette.concurrency.run_in_threadpool`` 派发到线程池执行。
+"""
 
 import os
 from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 
@@ -80,10 +88,13 @@ async def list_memories(
     if not store:
         return MemoryListResponse(memories=[], total=0)
 
+    # 同步 Qdrant 调用派发到线程池，避免阻塞事件循环
     if keyword:
-        results = store.search_memories(query=keyword, top_k=top_k, category=category)
+        results = await run_in_threadpool(
+            store.search_memories, query=keyword, top_k=top_k, category=category
+        )
     else:
-        results = store._list_recent(top_k)
+        results = await run_in_threadpool(store._list_recent, top_k)
 
     memories = [
         MemoryEntry(
@@ -106,7 +117,7 @@ async def get_memory_stats():
     if not store:
         return MemoryStatsResponse(total_count=0, categories={})
 
-    stats = store.get_stats()
+    stats = await run_in_threadpool(store.get_stats)
     return MemoryStatsResponse(
         total_count=stats.get("total_count", 0),
         categories=stats.get("categories", {}),
@@ -130,7 +141,8 @@ async def capture_memory(request: MemoryCaptureRequest):
     if not store:
         raise HTTPException(status_code=503, detail="记忆存储未就绪")
 
-    memory_id = store.add_memory(
+    memory_id = await run_in_threadpool(
+        store.add_memory,
         content=request.content,
         category=request.category,
         source="api",
@@ -157,7 +169,8 @@ async def cleanup_memories():
     if not store:
         raise HTTPException(status_code=503, detail="记忆存储未就绪")
 
-    result = store.process_decay()
+    # process_decay 可能很重（scroll + batch update），必须放线程池
+    result = await run_in_threadpool(store.process_decay)
 
     return MemoryCleanupResponse(
         status="ok",

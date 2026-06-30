@@ -1,6 +1,12 @@
-"""知识库 API 路由"""
+"""知识库 API 路由
+
+性能说明：``QdrantVectorStore.get_document_list`` / ``delete_by_filter`` 是同步
+阻塞 HTTP 调用，统一通过 ``run_in_threadpool`` 派发到线程池执行，避免阻塞
+FastAPI 事件循环（否则点击知识库菜单时其他接口会一起卡死）。
+"""
 import os
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -56,7 +62,8 @@ async def list_documents(namespace: Optional[str] = Query(default=None)):
         namespace: 可选，限定 RAG 命名空间（默认扫描全部）
     """
     store = _get_store()
-    docs = store.get_document_list(namespace=namespace)
+    # 同步 Qdrant 调用派发到线程池，避免阻塞事件循环
+    docs = await run_in_threadpool(store.get_document_list, namespace=namespace)
     return KnowledgeBaseListResponse(
         documents=[DocumentInfo(**d) for d in docs],
         total=len(docs),
@@ -83,7 +90,7 @@ async def delete_document(request: DeleteDocumentRequest):
     if request.namespace and request.namespace.strip():
         conditions["rag_namespace"] = request.namespace.strip()
 
-    success = store.delete_by_filter(conditions)
+    success = await run_in_threadpool(store.delete_by_filter, conditions)
     if not success:
         raise HTTPException(status_code=500, detail="删除文档失败")
 

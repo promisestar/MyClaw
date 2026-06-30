@@ -1,8 +1,13 @@
-"""工具调用日志 API 路由"""
+"""工具调用日志 API 路由
+
+性能说明：本地文件 IO 通常 < 100ms，但大文件读取（>10MB 日志）仍会阻塞事件循环，
+为安全起见 ``get_log_file`` 也用 ``run_in_threadpool`` 派发读取。
+"""
 import re
 import json
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from typing import Optional
 
 router = APIRouter(prefix="/tool-logs", tags=["tool-logs"])
@@ -53,8 +58,8 @@ async def get_log_file(date_str: str, limit: Optional[int] = None):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"日志文件不存在: {date_str}.jsonl")
 
-    entries: list[dict] = []
-    try:
+    def _read_log() -> list[dict]:
+        entries: list[dict] = []
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -64,6 +69,10 @@ async def get_log_file(date_str: str, limit: Optional[int] = None):
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
+        return entries
+
+    try:
+        entries = await run_in_threadpool(_read_log)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"读取日志文件失败: {e}")
 
