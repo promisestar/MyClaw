@@ -57,6 +57,13 @@ class MemoryCleanupResponse(BaseModel):
     message: str
 
 
+class MemoryDeleteResponse(BaseModel):
+    """单条记忆删除响应"""
+    status: str
+    memory_id: str
+    message: str
+
+
 # 全局 memory_store 实例（由 main.py 在启动时设置）
 _memory_store = None
 
@@ -176,4 +183,33 @@ async def cleanup_memories():
         status="ok",
         deleted=result["deleted"],
         message=f"衰减处理完成: 总计 {result['total']} 条，删除 {result['deleted']} 条，更新 {result['updated']} 条",
+    )
+
+
+@router.delete("/{memory_id}", response_model=MemoryDeleteResponse)
+async def delete_memory(memory_id: str):
+    """按 memory_id 删除单条记忆（直接从 Qdrant 向量库中移除）。
+
+    - 404：``memory_store`` 未初始化或记忆不存在
+    - 500：Qdrant 删除失败
+
+    与 MemoryTool 的 ``memory_delete`` 共用底层 ``MemoryVectorStore.delete_memories``。
+    """
+    memory_id = (memory_id or "").strip()
+    if not memory_id:
+        raise HTTPException(status_code=400, detail="memory_id 不能为空")
+
+    store = get_memory_store()
+    if not store:
+        raise HTTPException(status_code=503, detail="记忆存储未就绪")
+
+    # 同步 Qdrant 删除调用派发到线程池，避免阻塞事件循环
+    success = await run_in_threadpool(store.delete_memories, [memory_id])
+    if not success:
+        raise HTTPException(status_code=500, detail="记忆删除失败")
+
+    return MemoryDeleteResponse(
+        status="ok",
+        memory_id=memory_id,
+        message="记忆已删除",
     )

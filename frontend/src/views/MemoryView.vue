@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { Card, Input, Tag, Empty, message, Spin, Tooltip, Button } from 'ant-design-vue'
+import { Card, Input, Tag, Empty, message, Spin, Tooltip, Button, Popconfirm } from 'ant-design-vue'
 import {
   SearchOutlined,
   ReloadOutlined,
   ClockCircleOutlined,
   TagOutlined,
   InfoCircleOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons-vue'
 import { memoryApi, type MemoryEntry, type MemoryCategory } from '@/api/memory'
 
@@ -91,6 +92,39 @@ const selectMemory = (m: MemoryEntry) => {
 const selectCategory = (cat: string | null) => {
   activeCategory.value = activeCategory.value === cat ? null : cat
   search()
+}
+
+// 记录正在删除的 memory_id，用于 loading / 防重复点击
+const deletingId = ref<string | null>(null)
+
+const deleteMemory = async (m: MemoryEntry) => {
+  if (!m.id) {
+    message.warning('记忆 ID 缺失，无法删除')
+    return
+  }
+  if (deletingId.value) return
+  deletingId.value = m.id
+  try {
+    await memoryApi.delete(m.id)
+    message.success('记忆已删除')
+
+    // 本地乐观更新（避免再发起一次列表请求）
+    memories.value = memories.value.filter(x => x.id !== m.id)
+    total.value = Math.max(0, total.value - 1)
+    if (selectedMemory.value?.id === m.id) {
+      selectedMemory.value = null
+    }
+    // 同步分类计数（仅在该分类计数已知时调整）
+    const cat = m.category
+    if (cat && typeof stats.value[cat] === 'number') {
+      stats.value = { ...stats.value, [cat]: Math.max(0, stats.value[cat] - 1) }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '删除记忆失败'
+    message.error(msg)
+  } finally {
+    deletingId.value = null
+  }
 }
 
 // ── format ──
@@ -192,10 +226,34 @@ onMounted(loadData)
                 <Tag :color="colorMap[m.category] || '#999'">
                   {{ iconMap[m.category] || '📝' }}&nbsp;{{ labelMap[m.category] || m.category }}
                 </Tag>
-                <span class="item-time">
-                  <ClockCircleOutlined style="margin-right: 4px" />
-                  {{ fmtRelative(m.timestamp) }}
-                </span>
+                <div class="item-top-right">
+                  <span class="item-time">
+                    <ClockCircleOutlined style="margin-right: 4px" />
+                    {{ fmtRelative(m.timestamp) }}
+                  </span>
+                  <Popconfirm
+                    title="确定删除这条记忆？"
+                    description="删除后该记忆将立即从向量库中移除，不可恢复"
+                    ok-text="删除"
+                    cancel-text="取消"
+                    placement="topRight"
+                    @confirm="deleteMemory(m)"
+                  >
+                    <Tooltip title="删除记忆">
+                      <Button
+                        type="text"
+                        size="small"
+                        class="item-delete-btn"
+                        :loading="deletingId === m.id"
+                        :disabled="!!deletingId && deletingId !== m.id"
+                        aria-label="删除记忆"
+                        @click.stop
+                      >
+                        <template #icon><DeleteOutlined /></template>
+                      </Button>
+                    </Tooltip>
+                  </Popconfirm>
+                </div>
               </div>
               <div class="item-content">{{ m.content.length > 120 ? m.content.slice(0, 120) + '…' : m.content }}</div>
             </div>
@@ -211,9 +269,28 @@ onMounted(loadData)
               <Tag :color="colorMap[selectedMemory.category] || '#999'">
                 {{ iconMap[selectedMemory.category] || '📝' }}&nbsp;{{ labelMap[selectedMemory.category] || selectedMemory.category }}
               </Tag>
-              <span class="detail-time">
-                <ClockCircleOutlined /> {{ fmtTime(selectedMemory.timestamp) }}
-              </span>
+              <div class="detail-header-right">
+                <span class="detail-time">
+                  <ClockCircleOutlined /> {{ fmtTime(selectedMemory.timestamp) }}
+                </span>
+                <Popconfirm
+                  title="确定删除这条记忆？"
+                  description="删除后该记忆将立即从向量库中移除，不可恢复"
+                  ok-text="删除"
+                  cancel-text="取消"
+                  placement="topRight"
+                  @confirm="selectedMemory && deleteMemory(selectedMemory)"
+                >
+                  <Button
+                    danger
+                    size="small"
+                    :loading="deletingId === selectedMemory.id"
+                  >
+                    <template #icon><DeleteOutlined /></template>
+                    删除
+                  </Button>
+                </Popconfirm>
+              </div>
             </div>
           </template>
           <div class="detail-body">
@@ -386,10 +463,28 @@ onMounted(loadData)
   margin-bottom: 6px;
 }
 
+.item-top-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .item-time {
   font-size: 12px;
   color: #bbb;
   white-space: nowrap;
+}
+
+/* 删除按钮：默认低饱和、hover 时变红，避免抢占视觉焦点 */
+.item-delete-btn {
+  color: #bbb !important;
+  padding: 0 6px !important;
+  height: 24px !important;
+}
+
+.item-delete-btn:hover {
+  color: #ff4d4f !important;
+  background: rgba(255, 77, 79, 0.08) !important;
 }
 
 .item-content {
@@ -429,6 +524,13 @@ onMounted(loadData)
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+}
+
+.detail-header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .detail-time {

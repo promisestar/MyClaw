@@ -42,6 +42,12 @@ export interface MemoryCleanupResponse {
   message: string
 }
 
+export interface MemoryDeleteResponse {
+  status: string
+  memory_id: string
+  message: string
+}
+
 export interface MemoryListParams {
   keyword?: string
   category?: string
@@ -63,5 +69,10 @@ export const memoryApi = {
 
   cleanup: async () => {
     return api.post<MemoryCleanupResponse>('/memory/cleanup')
+  },
+
+  /** 按 memory_id 删除单条记忆（直接从 Qdrant 向量库移除） */
+  delete: async (memoryId: string) => {
+    return api.delete<MemoryDeleteResponse>(`/memory/${encodeURIComponent(memoryId)}`)
   },
 }
