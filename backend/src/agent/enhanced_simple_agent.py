@@ -93,6 +93,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         tool_retry_backoff: float = 2.0,
         tool_retry_jitter: float = 0.2,
         max_tools_per_round: int = 5,
+        subagent_orchestrator=None,   # SubAgentOrchestrator 引用（可选）
     ):
         """初始化 EnhancedSimpleAgent
 
@@ -111,6 +112,7 @@ class EnhancedSimpleAgent(SimpleAgent):
             tool_retry_max_delay: 重试最大延迟上限（秒，默认 15.0）
             tool_retry_backoff: 指数退避因子（默认 2.0）
             tool_retry_jitter: 随机抖动比例（0.2 表示 ±20%，默认 0.2）
+            subagent_orchestrator: SubAgentOrchestrator 引用（可选，供子代理使用）
         """
         super().__init__(
             name=name,
@@ -138,6 +140,8 @@ class EnhancedSimpleAgent(SimpleAgent):
         self.max_tools_per_round = max(max_tools_per_round, 1)
         self._tools_executed_this_round = 0
         self._tool_call_dedup: Set[str] = set()
+
+        self._subagent_orchestrator = subagent_orchestrator
 
         # 解耦的上下文管理（替代基类 Agent 内嵌的压缩逻辑）
         self.context_manager = ContextManager(

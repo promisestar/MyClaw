@@ -109,6 +109,14 @@ async def lifespan(app: FastAPI):
     finally:
         # 关闭时清理
         print("HelloClaw Backend shutting down...")
+        # 持久化任务追踪器
+        if _agent and hasattr(_agent, '_task_tracker'):
+            try:
+                session_id = getattr(_agent, '_current_session_id', None)
+                if session_id:
+                    _agent._task_tracker.save(session_id)
+            except Exception:
+                pass
         try:
             if _agent is not None and hasattr(_agent, "shutdown"):
                 _agent.shutdown()

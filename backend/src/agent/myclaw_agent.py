@@ -35,6 +35,12 @@ from ..tools.builtin.mcp_tool import reset_all_mcp_disclosed_tools
 from ..tools.builtin.skill_tool import SkillTool
 from ..skills.loader import SkillLoader
 
+# SubAgent 编排器 + 任务追踪器
+from .subagent_orchestrator import SubAgentOrchestrator, SubAgentTask, SubAgentResultMode
+from .task_tracker import TaskTracker
+from ..tools.builtin.subagent_tool import SubAgentTool
+from ..tools.builtin.task_tool import TaskTool
+
 
 class MyClawAgent:
     """HelloClaw Agent - 个性化 AI 助手
@@ -120,7 +126,7 @@ class MyClawAgent:
             skills_auto_register=False,
             todowrite_enabled=False,
             devlog_enabled=False,
-            subagent_enabled=True,  # 启用子 Agent 支持
+            subagent_enabled=False,  # 使用自实现的 SubAgentOrchestrator（不依赖 hello_agents）
         )
 
         # 初始化自实现的 Skill 系统
@@ -131,6 +137,13 @@ class MyClawAgent:
         # 初始化 MemoryVectorStore（长期记忆的 Qdrant 存储层）
         # 必须在 _setup_tools() 之前，因为 MemoryTool 依赖它
         self._memory_store = MemoryVectorStore()
+
+        # 初始化子代理编排器（延迟创建，在 _setup_tools 中实例化）
+        self._subagent_orchestrator = None
+
+        # 初始化任务追踪器（带持久化）
+        tasks_dir = os.path.join(self.workspace_path, "tasks")
+        self._task_tracker = TaskTracker(persist_dir=tasks_dir)
 
         # 初始化工具注册表
         self.tool_registry = self._setup_tools()
@@ -354,6 +367,36 @@ class MyClawAgent:
             "使用 memory_add 写入新的长期记忆。"
         )
 
+        # ══════════════════════════════════════════════════════════
+        # 子代理使用指引
+        # ══════════════════════════════════════════════════════════
+        context_parts.append(
+            "\n## 子代理（SubAgent）\n"
+            "你拥有启动子代理的能力（subagent 工具）。子代理在隔离的上下文中"
+            "独立完成任务，它们的工具输出不会污染你的主上下文。\n\n"
+            "**使用原则**：\n"
+            "1. 需要搜索/读取大量文件 → 委托给子代理（用 execute_command + read_file）\n"
+            "2. 需要多步数据处理 → 委托给子代理\n"
+            "3. 多个可并行的独立子任务 → 用 parallel_spawn 并行启动\n"
+            "4. 简单的单次工具调用（读一个小文件、一次计算）→ 不用子代理，直接调用\n\n"
+            "**注意**：子代理的结果以摘要形式返回。如果需要看原始数据，"
+            "可以要求子代理将结果写入文件，然后用 read_file 读取。"
+        )
+
+        # ══════════════════════════════════════════════════════════
+        # 任务管理指引
+        # ══════════════════════════════════════════════════════════
+        context_parts.append(
+            "\n## 任务管理\n"
+            "对于包含 3 个以上独立步骤的复杂请求，你必须：\n"
+            "1. 用 task_create 创建任务列表（每个步骤一个任务）\n"
+            "2. 用 task_start 标记当前正在做的任务\n"
+            "3. 用 task_complete 标记已完成的任务\n"
+            "4. 如果某个任务依赖其他任务的输出，在创建时指定 depends_on\n"
+            "5. 完成任务后自动检查 task_list，推进下一个可开始的任务\n\n"
+            "这能确保你不会遗漏任何步骤。"
+        )
+
         if context_parts:
             return base_prompt + "\n" + "\n".join(context_parts)
 
@@ -389,6 +432,22 @@ class MyClawAgent:
         registry.register_tool(self._skill_tool)
 
         self._register_mcp_tools(registry)
+
+        # ══════════════════════════════════════════════════════════
+        # 子代理编排器（延迟初始化，因为此时 LLM 已就绪）
+        # ══════════════════════════════════════════════════════════
+        if self._subagent_orchestrator is None:
+            self._subagent_orchestrator = SubAgentOrchestrator(
+                llm=self._llm,
+                master_tool_registry=registry,
+                workspace_path=self.workspace_path,
+            )
+
+        # 注册 SubAgent 工具
+        registry.register_tool(SubAgentTool(orchestrator=self._subagent_orchestrator))
+
+        # 注册 Task 管理工具
+        registry.register_tool(TaskTool(tracker=self._task_tracker))
 
         return registry
 
@@ -510,6 +569,10 @@ class MyClawAgent:
         if getattr(self, "_current_session_id", None) == session_id:
             return
         self._reset_mcp_disclosed_tools()
+        # 尝试加载该会话的任务列表
+        if hasattr(self, '_task_tracker') and self._task_tracker:
+            self._task_tracker.clear()
+            self._task_tracker.load(session_id)
         session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
         self._resend_suffix = []
         if os.path.exists(session_file):
@@ -890,6 +953,9 @@ class MyClawAgent:
         if hasattr(self, '_current_session_id') and self._current_session_id:
             try:
                 self._agent.save_session(self._current_session_id)
+                # 持久化任务追踪器
+                if hasattr(self, '_task_tracker') and self._task_tracker:
+                    self._task_tracker.save(self._current_session_id)
                 return self._current_session_id
             except Exception as e:
                 print(f"⚠️ 保存会话失败: {e}")

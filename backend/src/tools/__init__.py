@@ -7,6 +7,8 @@ from .builtin.web_fetch import WebFetchTool
 from .builtin.rag_tool import RAGTool
 from .builtin.mcp_tool import MCPTool
 from .builtin.skill_tool import SkillTool
+from .builtin.subagent_tool import SubAgentTool
+from .builtin.task_tool import TaskTool
 
 __all__ = [
     "MemoryTool",
@@ -16,4 +18,6 @@ __all__ = [
     "RAGTool",
     "MCPTool",
     "SkillTool",
+    "SubAgentTool",
+    "TaskTool",
 ]

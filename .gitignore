@@ -30,6 +30,10 @@ build/
 npm-debug.log*
 logs/
 
+# WorkBuddy / CodeBuddy
+.codebuddy/
+.workbuddy/
+
 # OS
 .DS_Store
 Thumbs.db
