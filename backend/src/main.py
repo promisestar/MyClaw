@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills
+from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
@@ -63,6 +63,9 @@ async def lifespan(app: FastAPI):
     # 将 memory_store 传递给 API 模块
     if hasattr(_agent, "_memory_store") and _agent._memory_store:
         memory.set_memory_store(_agent._memory_store)
+
+    # 将 agent 引用传递给 agent API 模块
+    agent.set_agent(_agent)
 
     # 将 skill_loader 传递给 skills API 模块
     if hasattr(_agent, "skill_loader") and _agent.skill_loader:
@@ -169,6 +172,7 @@ app.include_router(memory.router, prefix="/api")
 app.include_router(knowledge_base.router, prefix="/api")
 app.include_router(tool_logs.router, prefix="/api")
 app.include_router(skills.router, prefix="/api")
+app.include_router(agent.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
 
 

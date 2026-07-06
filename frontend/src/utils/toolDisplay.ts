@@ -30,6 +30,10 @@ export const TOOL_DISPLAY_CONFIG: Record<string, ToolDisplayConfig> = {
 
   // 任务工具
   Task: { name: '子任务', icon: '📋' },
+  task: { name: '任务管理', icon: '📋' },
+
+  // 子代理工具
+  subagent: { name: '子代理', icon: '🤖' },
 
   // 命令执行工具
   execute_command: { name: '执行命令', icon: '💻' },

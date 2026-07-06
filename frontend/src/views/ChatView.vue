@@ -20,6 +20,8 @@ import { getToolConfig, formatToolArgs, formatToolResult } from '@/utils/toolDis
 import { skillsApi, type SkillInfo } from '@/api/skills'
 import AttachmentChip from '@/components/AttachmentChip.vue'
 import UserMessageContent from '@/components/UserMessageContent.vue'
+import TaskCard from '@/components/TaskCard.vue'
+import TaskPanel from '@/components/TaskPanel.vue'
 import LobsterIcon from '@/assets/lobster.svg'
 
 // 单文档大小硬上限（与后端 MULTIMODAL_DOC_MAX_BYTES 保持一致；超过即拒绝，不发起上传请求）
@@ -120,6 +122,9 @@ const uploading = ref(false)
 const editModalOpen = ref(false)
 const editDraft = ref('')
 const editingUserTurnIndex = ref<number | null>(null)
+
+/** TaskPanel 组件引用（用于工具调用结束后刷新任务进度） */
+const taskPanelRef = ref<InstanceType<typeof TaskPanel> | null>(null)
 /** 编辑时剥离出的 `<file>...</file>` 原文，提交时原样拼回，保证文档内容不丢失 */
 const editStrippedFileBlocks = ref('')
 
@@ -1082,6 +1087,19 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
             })
           }
           updateMessageSegments(assistantMsgIndex, currentSegments)
+
+          // 通知 TaskPanel 更新任务进度（task 工具调用后）
+          if (event.tool === 'task' && taskPanelRef.value) {
+            const seg = lastToolSegment || currentSegments[currentSegments.length - 1]
+            if (seg && seg.type === 'tool') {
+              taskPanelRef.value.updateFromToolResult(
+                seg.tool,
+                seg.args || {},
+                seg.result || ''
+              )
+            }
+          }
+
           scrollToBottom()
         } else if (event.type === 'done') {
           // 完成
@@ -1226,45 +1244,57 @@ const createNewSession = async () => {
                     ></div>
                   </div>
                   <!-- 工具调用段 - 只显示非隐藏的工具 -->
-                  <div
-                    v-if="segment.type === 'tool' && !getToolConfig(segment.tool).hidden"
-                    :class="['tool-card', segment.status]"
-                  >
+                  <template v-if="segment.type === 'tool' && !getToolConfig(segment.tool).hidden">
+                    <!-- task 工具：专用 TaskCard -->
+                    <TaskCard
+                      v-if="segment.tool === 'task'"
+                      :args="segment.args"
+                      :result="segment.result"
+                      :status="segment.status"
+                      :expanded="isToolExpanded(segment.id)"
+                      @toggle="toggleToolCollapse(segment.id)"
+                    />
+                    <!-- 其他工具：通用 tool-card -->
                     <div
-                      class="tool-header"
-                      @click="segment.status !== 'running' && toggleToolCollapse(segment.id)"
+                      v-else
+                      :class="['tool-card', segment.status]"
                     >
-                      <span class="tool-icon">{{ getToolConfig(segment.tool).icon }}</span>
-                      <span class="tool-name">
-                        <template v-if="!isToolExpanded(segment.id)">使用了</template>
-                        {{ getToolConfig(segment.tool).name }}
-                      </span>
-                      <Tag v-if="segment.status === 'running'" color="processing" class="tool-tag">
-                        <LoadingOutlined /> 执行中
-                      </Tag>
-                      <Tag v-else-if="segment.status === 'done'" color="success" class="tool-tag">完成</Tag>
-                      <Tag v-else-if="segment.status === 'error'" color="error" class="tool-tag">失败</Tag>
-                      <span
-                        v-if="segment.status !== 'running'"
-                        class="collapse-indicator"
+                      <div
+                        class="tool-header"
+                        @click="segment.status !== 'running' && toggleToolCollapse(segment.id)"
                       >
-                        {{ isToolExpanded(segment.id) ? '▼' : '▶' }}
-                      </span>
-                    </div>
-                    <!-- 展开后显示入参和结果 -->
-                    <div v-if="isToolExpanded(segment.id)" class="tool-details">
-                      <!-- 入参 -->
-                      <div v-if="segment.args && Object.keys(segment.args).length > 0" class="tool-args">
-                        <div class="tool-detail-label">入参</div>
-                        <pre class="tool-detail-content">{{ formatToolArgs(segment.args) }}</pre>
+                        <span class="tool-icon">{{ getToolConfig(segment.tool).icon }}</span>
+                        <span class="tool-name">
+                          <template v-if="!isToolExpanded(segment.id)">使用了</template>
+                          {{ getToolConfig(segment.tool).name }}
+                        </span>
+                        <Tag v-if="segment.status === 'running'" color="processing" class="tool-tag">
+                          <LoadingOutlined /> 执行中
+                        </Tag>
+                        <Tag v-else-if="segment.status === 'done'" color="success" class="tool-tag">完成</Tag>
+                        <Tag v-else-if="segment.status === 'error'" color="error" class="tool-tag">失败</Tag>
+                        <span
+                          v-if="segment.status !== 'running'"
+                          class="collapse-indicator"
+                        >
+                          {{ isToolExpanded(segment.id) ? '▼' : '▶' }}
+                        </span>
                       </div>
-                      <!-- 结果 -->
-                      <div v-if="segment.result" class="tool-result-wrapper">
-                        <div class="tool-detail-label">结果</div>
-                        <pre class="tool-detail-content">{{ formatToolResult(segment.result) }}</pre>
+                      <!-- 展开后显示入参和结果 -->
+                      <div v-if="isToolExpanded(segment.id)" class="tool-details">
+                        <!-- 入参 -->
+                        <div v-if="segment.args && Object.keys(segment.args).length > 0" class="tool-args">
+                          <div class="tool-detail-label">入参</div>
+                          <pre class="tool-detail-content">{{ formatToolArgs(segment.args) }}</pre>
+                        </div>
+                        <!-- 结果 -->
+                        <div v-if="segment.result" class="tool-result-wrapper">
+                          <div class="tool-detail-label">结果</div>
+                          <pre class="tool-detail-content">{{ formatToolResult(segment.result) }}</pre>
+                        </div>
                       </div>
                     </div>
-                  </div>
+                  </template>
                 </template>
               </template>
               <!-- 如果没有分段，显示普通内容（历史消息） -->
@@ -1347,6 +1377,13 @@ const createNewSession = async () => {
 
     <!-- 输入区域 -->
     <div class="chat-input-wrapper">
+      <!-- 任务进度面板（浮动在输入框上方） -->
+      <TaskPanel
+        ref="taskPanelRef"
+        :session-id="currentSessionId"
+        :loading="loading"
+      />
+
       <!-- 技能下拉选择器 -->
       <Transition name="skill-dropdown-fade">
         <div v-if="skillDropdownVisible" class="skill-dropdown">
