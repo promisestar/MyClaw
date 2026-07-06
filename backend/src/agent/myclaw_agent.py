@@ -165,6 +165,7 @@ class MyClawAgent:
             tool_retry_backoff=tool_retry_backoff,
             tool_retry_jitter=tool_retry_jitter,
             max_tools_per_round=5,
+            subagent_orchestrator=self._subagent_orchestrator,
         )
 
         # 注入模型信息到 ContextManager，启用精确 token 统计

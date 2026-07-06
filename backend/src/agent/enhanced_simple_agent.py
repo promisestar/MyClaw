@@ -18,6 +18,7 @@ from hello_agents.core.message import Message
 from hello_agents.core.streaming import StreamEvent, StreamEventType
 
 from ..context import ContextManager
+from ..context.context_guard import ContextGuard
 
 # 导入 HelloClaw 专用 LLM（支持流式工具调用）
 from .enhanced_llm import EnhancedHelloAgentsLLM, StreamToolEventType
@@ -142,6 +143,9 @@ class EnhancedSimpleAgent(SimpleAgent):
         self._tool_call_dedup: Set[str] = set()
 
         self._subagent_orchestrator = subagent_orchestrator
+
+        # 上下文守卫 —— 工具执行前预判输出大小，决定 inline/snip/delegate
+        self._context_guard = ContextGuard(orchestrator=subagent_orchestrator)
 
         # 解耦的上下文管理（替代基类 Agent 内嵌的压缩逻辑）
         self.context_manager = ContextManager(
@@ -644,6 +648,53 @@ class EnhancedSimpleAgent(SimpleAgent):
                 result=skip_msg,
             )
             return
+
+        # ── 上下文守卫：预判输出大小，大工具自动委托给子代理 ──
+        if (
+            self._context_guard is not None
+            and self._context_guard.should_delegate(tool_name)
+        ):
+            try:
+                delegated_result = await self._context_guard.delegate_tool(
+                    tool_name, arguments
+                )
+            except Exception as exc:
+                # 委托失败 → 降级为直接执行
+                print(f"⚠️ 自动委托失败 ({tool_name})，降级为直接执行: {exc}")
+                delegated_result = None
+
+            if delegated_result is not None:
+                self._tool_call_dedup.add(dedup_key)
+                self._tools_executed_this_round += 1
+
+                print(f"🔄 自动委托子代理: {tool_name}({arguments})")
+                yield StreamEvent.create(
+                    StreamEventType.TOOL_CALL_START,
+                    self.name,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    args=arguments,
+                    metadata={"delegated": True},
+                )
+                await asyncio.sleep(0)
+
+                yield StreamEvent.create(
+                    StreamEventType.TOOL_CALL_FINISH,
+                    self.name,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    result=delegated_result,
+                )
+
+                tool_call_records.append({
+                    "tool_call_id": tool_call_id,
+                    "name": tool_name,
+                    "args": arguments,
+                    "result": delegated_result,
+                    "status": "delegated",
+                })
+                tool_results_by_id[tool_call_id] = delegated_result
+                return
 
         # ── 正常执行 ──
         self._tool_call_dedup.add(dedup_key)

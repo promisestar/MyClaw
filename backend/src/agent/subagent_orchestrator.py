@@ -23,7 +23,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Union
 
 from hello_agents.tools import ToolRegistry
 
@@ -123,25 +123,6 @@ class SubAgentOrchestrator:
             )
         )
     """
-
-    # ---- 工具名 → 预估值（tokens）----
-    # 用于 context_guard 的智能路由判断
-    TOOL_OUTPUT_ESTIMATES: Dict[str, int] = {
-        "read_file": 5000,
-        "write_file": 500,
-        "edit_file": 800,
-        "execute_command": 3000,
-        "web_search": 4000,
-        "web_fetch": 8000,
-        "memory_search": 1000,
-        "memory_add": 200,
-        "memory_list": 1500,
-        "calculator": 100,
-        "Skill": 2000,
-        "mcp": 5000,
-        "rag_ask": 4000,
-        # 默认：2000
-    }
 
     def __init__(
         self,
@@ -273,7 +254,7 @@ class SubAgentOrchestrator:
         Returns:
             与输入 tasks 顺序一致的结果列表（失败也包含）
         """
-        results: List[SubAgentResult] = await asyncio.gather(
+        results: List[Union[SubAgentResult, BaseException]] = await asyncio.gather(
             *(self.run_task(t) for t in tasks),
             return_exceptions=True,
         )
@@ -405,42 +386,3 @@ class SubAgentOrchestrator:
             if metadata.get("tool_calls"):
                 count += 1
         return count
-
-
-# ============================================================================
-# 工具输出预估（供 context_guard 使用）
-# ============================================================================
-
-_LARGE_OUTPUT_TOOLS: Set[str] = {
-    "read_file",
-    "web_search",
-    "web_fetch",
-    "rag_ask",
-}
-
-_SMALL_OUTPUT_TOOLS: Set[str] = {
-    "memory_add",
-    "memory_list",
-    "calculator",
-}
-
-
-def estimate_tool_output_tokens(tool_name: str) -> int:
-    """估算工具输出大小（tokens），用于 context_guard 路由决策。
-
-    Returns:
-        预估 token 数，未知工具默认 2000
-    """
-    return SubAgentOrchestrator.TOOL_OUTPUT_ESTIMATES.get(tool_name, 2000)
-
-
-def should_delegate_to_subagent(tool_name: str, threshold_tokens: int = 5000) -> bool:
-    """判断某个工具调用是否应该委托给子代理。
-
-    判断逻辑：
-    - 预估输出 > threshold: 建议委托（避免臃肿数据进主上下文）
-    - 预估输出 <= threshold: 直接执行（小数据放进主上下文没问题）
-
-    注意：这只是一个建议函数，最终委托决策由主 Agent 的 LLM 自行判断。
-    """
-    return estimate_tool_output_tokens(tool_name) > threshold_tokens
