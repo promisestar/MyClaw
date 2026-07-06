@@ -616,3 +616,57 @@ sequenceDiagram
 ---
 
 以上为当前 SubAgent 与 Task 系统的实现与功能说明；若后续调整 `SubAgentTask` 参数、`TaskTool` 动作、`max_iterations` 默认值或生命周期钩子，请以对应源码为准。
+
+---
+
+## 15. 变更记录
+
+### 64900cf — 增加对是否使用子代理的预判（2026-07-06）
+
+> **作者**：promisestar
+> **范围**：4 个文件，+285 行 / -60 行
+
+本次提交完成了 SubAgent 系统的 **Phase 2——Context Guard 自动路由**，将"建议式委托"升级为"强制式拦截"。
+
+**核心变化**：
+
+| 维度 | 改动前 | 改动后 |
+|------|--------|--------|
+| 子代理触发 | LLM 自主判断（建议式） | Context Guard 在工具执行前强制拦截 |
+| 工具输出预估 | 散落在 `subagent_orchestrator.py` 中的辅助函数 | 统一收敛到 `context/context_guard.py` |
+| 副作用保护 | 无 | `NO_DELEGATE_TOOLS` 黑名单阻止副作用工具被委托 |
+| 路由策略 | 二元（委托 / 不委托） | 三级：`inline`（直接执行）/ `snip`（执行+截断）/ `delegate`（委托子代理） |
+
+**文件变更详情**：
+
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `context/context_guard.py` | **新建**（+231 行） | `ContextGuard` 类：三级路由引擎 + 工具输出预估表 + 委托执行器 + 任务描述格式化器 |
+| `agent/enhanced_simple_agent.py` | **修改**（+51 行） | 在 `_try_execute_ready_tool` 中注入 Context Guard 拦截逻辑：工具执行前先调用 `should_delegate()`，命中则自动委托子代理并返回摘要 |
+| `agent/myclaw_agent.py` | **修改**（+1 行） | 将 `self._subagent_orchestrator` 传递给 `EnhancedSimpleAgent` 构造函数，使 Context Guard 可用 |
+| `agent/subagent_orchestrator.py` | **修改**（-60 行） | 移除冗余的 `TOOL_OUTPUT_ESTIMATES`、`estimate_tool_output_tokens()`、`should_delegate_to_subagent()`；修复 `parallel_run` 的 `asyncio.gather(return_exceptions=True)` 类型注解 |
+
+**Context Guard 三级路由规则**：
+
+```
+工具调用
+  ├── NO_DELEGATE_TOOLS 中的工具 → inline/snip（无论如何不委托）
+  │     write_file, edit_file, memory_add, memory_delete, calculator, task, subagent, Skill
+  │
+  ├── 预估输出 < 2000 tokens → inline（直接执行，结果放入主上下文）
+  │     calculator(100), memory_add(200), write_file(500), memory_delete(200)
+  │
+  ├── 预估输出 2000~8000 tokens → snip（正常执行，输出由 ContextManager 截断）
+  │     execute_command(3000), Skill(2000), memory_list(1500), memory_search(1000)
+  │
+  └── 预估输出 > 8000 tokens → delegate（委托子代理，主上下文只收到摘要）
+        web_fetch(8000), read_file(5000), web_search(4000), mcp(5000), rag_ask(5000)
+```
+
+**降级策略**：当 `orchestrator` 不可用或委托执行失败时，`delegate` 自动降级为 `snip`（直接执行但输出截断），保证功能不中断。
+
+**设计要点**：
+- 拦截插入点在 `_try_execute_ready_tool` 中的去重检查之后、限量检查之前，确保委托行为也受去重和限量约束
+- 委托执行通过 `SubAgentOrchestrator.run_task()` 创建隔离子代理，`max_iterations=3`（子代理只需 1 次工具调用），`timeout=30s`
+- 委托结果以 `[自动委托...]` 前缀的格式化文本注入主上下文，含子代理 ID、工具名、调用次数、耗时和结果摘要
+- 工具描述格式化器（`_format_task_description`）针对 5 种高频工具生成语义化子代理任务描述，使其按统一格式使用工具
