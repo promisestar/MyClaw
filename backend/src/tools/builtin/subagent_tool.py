@@ -46,6 +46,9 @@ class SubAgentTool(Tool):
             expandable=True,
         )
         self.orchestrator = orchestrator
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 500
+        self.has_side_effects = True  # 递归工具，不可委托
 
     # ------------------------------------------------------------------ #
     # 参数定义

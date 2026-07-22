@@ -274,9 +274,31 @@ class ContextManager:
         content = message.content or ""
         snipped = self._snip_content_text(content)
         if snipped != content:
+            # 非破坏性：备份原始内容到 metadata（仅首次备份）
+            if not hasattr(message, 'metadata') or message.metadata is None:
+                message.metadata = {}
+            if "original_content" not in message.metadata:
+                message.metadata["original_content"] = content
             message.content = snipped
             return True
         return False
+
+    def restore_original_content(self) -> bool:
+        """恢复所有被截断的消息到原始内容。
+
+        在替换会话轮次前调用，确保历史完整性。
+        Returns: 是否有恢复操作发生。
+        """
+        changed = False
+        for msg in self.history_manager._history:
+            if not hasattr(msg, 'metadata') or msg.metadata is None:
+                continue
+            original = msg.metadata.get("original_content")
+            if original is not None:
+                msg.content = original
+                del msg.metadata["original_content"]
+                changed = True
+        return changed
 
     def _snip_content_text(self, content: str) -> str:
         if len(content) <= self.tool_snip_chars:

@@ -51,6 +51,9 @@ class SkillTool(Tool):
             expandable=False,
         )
         self.skill_loader = skill_loader
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 2000
+        self.has_side_effects = True  # 加载技能改变 Agent 状态，不可委托
 
     def get_parameters(self) -> List[ToolParameter]:
         return [

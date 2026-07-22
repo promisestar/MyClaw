@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent
+from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
@@ -122,7 +122,7 @@ async def lifespan(app: FastAPI):
                 pass
         try:
             if _agent is not None and hasattr(_agent, "shutdown"):
-                _agent.shutdown()
+                await _agent.shutdown()  # async: 关闭 LLM 连接池 + 工具资源
         except Exception as e:
             print(f"⚠️ Agent 资源清理失败: {e}")
         finally:
@@ -174,6 +174,7 @@ app.include_router(tool_logs.router, prefix="/api")
 app.include_router(skills.router, prefix="/api")
 app.include_router(agent.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
+app.include_router(health.router, prefix="/api")
 
 
 # 多模态：当 MULTIMODAL_IMAGE_MODE=url 时挂载 /files 静态资源，仅暴露 workspace/uploads

@@ -109,6 +109,9 @@ class WebSearchTool(Tool):
         self._base_url = "https://api.search.brave.com/res/v1/web/search"
         self.tavily_key = tavily_key or os.getenv("TAVILY_API_KEY")
         self.serpapi_key = serpapi_key or os.getenv("SERPAPI_API_KEY")
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 4000
+        self.has_side_effects = False  # 搜索操作，可委托
         self.default_freshness = _normalize_freshness(default_freshness)
         self.auto_recency = auto_recency
         self.available_backends: list[str] = []

@@ -39,6 +39,9 @@ class MemoryTool(Tool):
         )
         self.memory_store = memory_store
         self.workspace = workspace_manager  # 过渡期回退
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 1000
+        self.has_side_effects = False  # memory_search 无副作用，可委托
 
     def _has_store(self) -> bool:
         return self.memory_store is not None

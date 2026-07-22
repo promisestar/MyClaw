@@ -85,14 +85,48 @@ class ContextGuard:
         "calculator",
     }
 
-    def __init__(self, orchestrator: Optional["SubAgentOrchestrator"] = None):
+    def __init__(
+        self,
+        orchestrator: Optional["SubAgentOrchestrator"] = None,
+        tool_registry: Optional[Any] = None,
+    ):
         """初始化上下文守卫。
 
         Args:
             orchestrator: SubAgentOrchestrator 实例。如果为 None，delegate 策略不可用，
                           会降级为 snip。
+            tool_registry: ToolRegistry 实例。如果提供，decide() 会优先从工具元数据
+                          (output_size_hint, has_side_effects) 读取，而非硬编码字典。
         """
         self._orchestrator = orchestrator
+        self._tool_registry = tool_registry
+        # 动态元数据映射（从工具实例的 output_size_hint / has_side_effects 构建）
+        self._dynamic_estimates: Dict[str, int] = {}
+        self._dynamic_no_delegate: set = set()
+        if tool_registry is not None:
+            self._build_metadata_from_registry()
+
+    def set_tool_registry(self, tool_registry: Any) -> None:
+        """设置或更新工具注册表（工具注册后调用）。"""
+        self._tool_registry = tool_registry
+        self._build_metadata_from_registry()
+
+    def _build_metadata_from_registry(self) -> None:
+        """从工具注册表构建动态元数据映射。"""
+        if self._tool_registry is None:
+            return
+        try:
+            for tool in self._tool_registry.get_all_tools():
+                name = getattr(tool, "name", None)
+                if name is None:
+                    continue
+                hint = getattr(tool, "output_size_hint", None)
+                if hint is not None:
+                    self._dynamic_estimates[name] = hint
+                if getattr(tool, "has_side_effects", False):
+                    self._dynamic_no_delegate.add(name)
+        except Exception as e:
+            logger.warning(f"构建工具元数据失败，回退到硬编码: {e}")
 
     # ------------------------------------------------------------------ #
     # 公开 API
@@ -101,15 +135,22 @@ class ContextGuard:
     def decide(self, tool_name: str) -> str:
         """根据工具名判断执行策略。
 
+        优先从工具元数据 (output_size_hint, has_side_effects) 读取，
+        回退到硬编码 TOOL_ESTIMATES / NO_DELEGATE_TOOLS。
+
         Returns:
             "inline" | "snip" | "delegate"
         """
+        # 合并动态元数据和硬编码（动态优先）
+        no_delegate = self._dynamic_no_delegate | self.NO_DELEGATE_TOOLS
+        estimates = {**self.TOOL_ESTIMATES, **self._dynamic_estimates}
+
         # 副作用工具不能委托
-        if tool_name in self.NO_DELEGATE_TOOLS:
-            estimate = self.TOOL_ESTIMATES.get(tool_name, 2000)
+        if tool_name in no_delegate:
+            estimate = estimates.get(tool_name, 2000)
             return "snip" if estimate > self.SMALL_THRESHOLD else "inline"
 
-        estimate = self.TOOL_ESTIMATES.get(tool_name, 2000)
+        estimate = estimates.get(tool_name, 2000)
 
         if estimate < self.SMALL_THRESHOLD:
             return "inline"
@@ -161,7 +202,8 @@ class ContextGuard:
             tools=[tool_name],              # 子代理只能用这一个工具
             result_mode=SubAgentResultMode.SUMMARY,
             max_iterations=3,               # 子代理少迭代（通常 1 次工具调用就够）
-            timeout_seconds=30,
+            # timeout_seconds 不设置：SubAgentTask.__post_init__ 自动计算
+            # 1 个工具 + 3 轮迭代 → 30 + 15 + 30 = 75s
         )
 
         result = await self._orchestrator.run_task(task)

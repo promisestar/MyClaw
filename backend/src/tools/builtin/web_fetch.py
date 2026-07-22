@@ -38,6 +38,9 @@ class WebFetchTool(Tool):
         self.timeout = timeout
         self.max_content_size = max_content_size
         self.user_agent = user_agent or "Mozilla/5.0 (compatible; HelloClawBot/1.0)"
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 8000
+        self.has_side_effects = False  # 抓取操作，可委托
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         """执行抓取（默认行为）"""

@@ -82,6 +82,8 @@ class ToolCallLogger:
         duration_ms: float = 0.0,
         retry_attempt: Optional[int] = None,
         retry_count: Optional[int] = None,
+        agent_name: Optional[str] = None,
+        error_type: Optional[str] = None,
     ) -> None:
         """写入一条工具调用日志。
 
@@ -96,6 +98,8 @@ class ToolCallLogger:
             duration_ms: 累计耗时（毫秒）
             retry_attempt: 当前是第几次重试尝试（1-based，仅 status="retry" 时传入）
             retry_count: 最终记录的总重试次数（仅在最终成功/失败记录时传入）
+            agent_name: Agent 名称（主代理 vs 子代理，用于审计区分）
+            error_type: 错误类型标签（如 "timeout", "rate_limit"，用于结构化审计）
         """
         trace = trace_id or get_trace_id()
         entry = {
@@ -110,6 +114,10 @@ class ToolCallLogger:
             "status": status,
             "duration_ms": round(duration_ms, 2),
         }
+        if agent_name is not None:
+            entry["agent_name"] = agent_name
+        if error_type is not None:
+            entry["error_type"] = error_type
         if retry_attempt is not None:
             entry["retry_attempt"] = retry_attempt
         if retry_count is not None:

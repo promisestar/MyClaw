@@ -1,11 +1,14 @@
 """增强版 HelloAgentsLLM - 支持流式工具调用"""
 
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List, Dict, Union, Any, AsyncIterator
 
 from hello_agents.core.llm import HelloAgentsLLM
 from hello_agents.core.exceptions import HelloAgentsException
+
+from ..core.timeouts import TimeoutConfig
 
 
 # ==================== 流式工具调用数据结构 ====================
@@ -118,9 +121,39 @@ class EnhancedHelloAgentsLLM(HelloAgentsLLM):
     - get_last_stream_tool_result: 获取最后一次流式工具调用的累积结果
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, timeout_config: Optional[TimeoutConfig] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._last_stream_tool_result: Optional[StreamToolCallResult] = None
+        self._timeout_config = timeout_config or TimeoutConfig()
+        self._async_client: Optional[Any] = None  # 实例级 AsyncOpenAI 客户端缓存
+
+    def _get_async_client(self):
+        """获取或创建实例级 AsyncOpenAI 客户端（连接池复用）。
+
+        避免每次 astream_invoke_with_tools 调用都新建客户端导致反复建立 TCP 连接。
+        """
+        if self._async_client is None:
+            from openai import AsyncOpenAI
+            self._async_client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+            )
+        return self._async_client
+
+    async def close_async_client(self):
+        """关闭异步客户端并释放 httpx 连接池。
+
+        在以下场景调用：
+        - MyClawAgent.shutdown() 时（lifespan finally 块 / Ctrl+C）
+        - _reload_llm_if_changed() 替换 LLM 实例前
+        """
+        if self._async_client is not None:
+            try:
+                await self._async_client.close()
+            except Exception:
+                pass
+            self._async_client = None
 
     async def astream_invoke_with_tools(
         self,
@@ -155,12 +188,8 @@ class EnhancedHelloAgentsLLM(HelloAgentsLLM):
         """
         from openai import AsyncOpenAI
 
-        # 创建异步客户端
-        client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            timeout=self.timeout
-        )
+        # 复用实例级客户端（避免每次调用新建 TCP 连接）
+        client = self._get_async_client()
 
         # 构建请求参数
         request_params: Dict[str, Any] = {
@@ -178,10 +207,46 @@ class EnhancedHelloAgentsLLM(HelloAgentsLLM):
         # 初始化累积结果
         result = StreamToolCallResult()
 
+        # 模块级超时：首 token + 流式中断
+        import time as _time
+        start_time = _time.perf_counter()
+        last_chunk_time = start_time
+        first_token_received = False
+        first_token_timeout_s = self._timeout_config.llm_first_token_ms / 1000
+        stream_idle_timeout_s = self._timeout_config.llm_stream_idle_ms / 1000
+
         try:
             response = await client.chat.completions.create(**request_params)
 
-            async for chunk in response:
+            # 手动迭代以支持首 token / 流式中断超时检测
+            while True:
+                if not first_token_received:
+                    # 首 token 超时检查
+                    elapsed = _time.perf_counter() - start_time
+                    if elapsed > first_token_timeout_s:
+                        raise TimeoutError(
+                            f"LLM 首 token 超时 ({elapsed:.1f}s > {first_token_timeout_s:.1f}s)"
+                        )
+                    chunk_timeout = first_token_timeout_s - elapsed
+                else:
+                    # 流式中断超时检查
+                    idle = _time.perf_counter() - last_chunk_time
+                    if idle > stream_idle_timeout_s:
+                        raise TimeoutError(
+                            f"LLM 流式中断超时 ({idle:.1f}s > {stream_idle_timeout_s:.1f}s)"
+                        )
+                    chunk_timeout = stream_idle_timeout_s - idle
+
+                try:
+                    chunk = await asyncio.wait_for(
+                        response.__anext__(), timeout=max(chunk_timeout, 0.1)
+                    )
+                except StopAsyncIteration:
+                    break
+
+                first_token_received = True
+                last_chunk_time = _time.perf_counter()
+
                 if not chunk.choices:
                     continue
 

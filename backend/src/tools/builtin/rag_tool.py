@@ -100,6 +100,9 @@ class RAGTool(Tool):
             if workspace_root
             else None
         )
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 5000
+        self.has_side_effects = False  # 读取操作，可委托
 
         self.knowledge_base_path = knowledge_base_path
         self.qdrant_url = qdrant_url or os.getenv("QDRANT_URL")

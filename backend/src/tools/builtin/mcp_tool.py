@@ -104,6 +104,9 @@ class MCPTool(Tool):
             description=description,
             expandable=auto_expand,
         )
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 5000
+        self.has_side_effects = False  # MCP 调用通常可委托
 
     def _prepare_headers(
         self,

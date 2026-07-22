@@ -45,6 +45,9 @@ class TaskTool(Tool):
             expandable=True,
         )
         self.tracker = tracker
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 300
+        self.has_side_effects = True  # 元工具，不可委托
 
     # ------------------------------------------------------------------ #
     # 参数定义

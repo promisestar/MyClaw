@@ -74,7 +74,10 @@ class BashTool(Tool):
         timeout: int = 120,
         allowed_directories: Optional[List[str]] = None,
         default_workdir: Optional[str] = None,
+        timeout_config: Optional["TimeoutConfig"] = None,
     ):
+        from ...core.timeouts import TimeoutConfig
+
         super().__init__(
             name="execute_command",
             description=(
@@ -85,7 +88,13 @@ class BashTool(Tool):
             expandable=False,
         )
         self.max_output_size = max_output_size
-        self.timeout = timeout
+        # 模块级超时：env > config.json > 默认值；timeout 参数为兼容回退
+        self._timeout_config = timeout_config or TimeoutConfig()
+        self.timeout = (
+            self._timeout_config.bash_default_ms // 1000
+            if timeout_config is not None
+            else timeout
+        )
         self.allowed_directories = (
             [os.path.abspath(os.path.expanduser(d)) for d in allowed_directories]
             if allowed_directories
@@ -97,6 +106,9 @@ class BashTool(Tool):
             else None
         )
         self._cwd: Optional[str] = None
+        # 工具元数据（供 ContextGuard 动态路由）
+        self.output_size_hint = 3000
+        self.has_side_effects = False  # 可委托（子代理在隔离环境执行命令）
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         command = (parameters.get("command") or "").strip()
@@ -206,6 +218,20 @@ class BashTool(Tool):
             output = "\n".join(parts).strip() or "(无输出)"
             output = _truncate_output(output, self.max_output_size)
 
+            # 检测技能脚本执行（路径包含 skills/ 和 .venv）
+            is_skill_script = False
+            skill_name = None
+            if "skills/" in command and ".venv" in command:
+                is_skill_script = True
+                # 从路径中提取技能名称（skills/<name>/ 模式）
+                import re as _re
+                m = _re.search(r"skills[\\/]([^\\/]+)", command)
+                if m:
+                    skill_name = m.group(1)
+                # 在输出前添加技能标记
+                prefix = f"[skill:{skill_name}]" if skill_name else "[skill]"
+                output = f"{prefix} {output}"
+
             return ToolResponse.success(
                 text=output,
                 data={
@@ -214,6 +240,8 @@ class BashTool(Tool):
                     "stderr": stderr,
                     "command": command,
                     "workdir": cwd,
+                    "is_skill_script": is_skill_script,
+                    "skill_name": skill_name,
                 },
             )
         except subprocess.TimeoutExpired:

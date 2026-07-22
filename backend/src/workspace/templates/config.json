@@ -23,5 +23,23 @@
     "max_delay": 15.0,
     "backoff": 2.0,
     "jitter": 0.2
+  },
+  "timeouts": {
+    "llm_first_token_ms": 1200000,
+    "llm_stream_idle_ms": 300000,
+    "bash_default_ms": 120000,
+    "bash_max_ms": 600000,
+    "mcp_connect_ms": 30000,
+    "mcp_tool_ms": 60000
+  },
+  "llm_retry": {
+    "max_retries": 2,
+    "base_delay": 1.0,
+    "max_delay": 15.0,
+    "backoff": 2.0,
+    "jitter": 0.2
+  },
+  "gateway": {
+    "runTimeoutMs": 1800000
   }
 }

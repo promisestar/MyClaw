@@ -5,7 +5,6 @@ import asyncio
 import time
 import os
 import re
-import random
 from datetime import datetime
 from pathlib import Path
 from typing import Set, Tuple
@@ -19,50 +18,18 @@ from hello_agents.core.streaming import StreamEvent, StreamEventType
 
 from ..context import ContextManager
 from ..context.context_guard import ContextGuard
+from ..core.timeouts import TimeoutConfig
 
 # 导入 HelloClaw 专用 LLM（支持流式工具调用）
 from .enhanced_llm import EnhancedHelloAgentsLLM, StreamToolEventType
+from .retry_executor import RetryExecutor, RetryResult, classify_error, compute_retry_delay
 
 from ..logging.tool_logger import ToolCallLogger, get_trace_id
 
 if TYPE_CHECKING:
     from hello_agents.tools.registry import ToolRegistry
 
-# ── 工具调用智能重试 ──────────────────────────────────────────────
-
-# 可重试的错误特征（正则匹配工具返回的错误文本）
-_RETRYABLE_ERROR_PATTERNS: List[re.Pattern] = [
-    # 网络 / HTTP
-    re.compile(r"rate.?limit", re.IGNORECASE),
-    re.compile(r"too\s+many\s+requests", re.IGNORECASE),
-    re.compile(r"429|503|502|504", re.IGNORECASE),
-    re.compile(r"connection\s+(error|refused|reset|timed?\s*out)", re.IGNORECASE),
-    re.compile(r"network\s+(error|unreachable)", re.IGNORECASE),
-    re.compile(r"timeout|timed?\s*out|读取超时|连接超时|请求超时", re.IGNORECASE),
-    re.compile(r"temporar(?:y|ily)\s+(?:unavailable|down)", re.IGNORECASE),
-    re.compile(r"service\s+unavailable", re.IGNORECASE),
-    # MCP
-    re.compile(r"mcp\s+(?:server\s+)?(?:disconnect|connection|transport)", re.IGNORECASE),
-    re.compile(r"mcp\s+error", re.IGNORECASE),
-    re.compile(r"session\s+(?:expired|closed|disconnected)", re.IGNORECASE),
-    # 通用临时性错误
-    re.compile(r"retry|重试", re.IGNORECASE),
-    re.compile(r"try\s+again\s+later", re.IGNORECASE),
-    re.compile(r"internal\s+server\s+error", re.IGNORECASE),
-    re.compile(r"bad\s+gateway", re.IGNORECASE),
-]
-
-# 明确不可重试的错误特征（优先级高于可重试匹配）
-_NON_RETRYABLE_ERROR_PATTERNS: List[re.Pattern] = [
-    re.compile(r"文件(?:不)?存在|file\s+not\s+found|no\s+such\s+file", re.IGNORECASE),
-    re.compile(r"权限|permission\s+denied|access\s+denied", re.IGNORECASE),
-    re.compile(r"参数.*(?:格式|错误|无效)|invalid\s+(?:argument|parameter|input)", re.IGNORECASE),
-    re.compile(r"未找到工具|tool\s+not\s+found", re.IGNORECASE),
-    re.compile(r"json\s*(?:解析|decode|格式)", re.IGNORECASE),
-    re.compile(r"验证失败|validat(?:e|ion)\s+(?:failed|error)", re.IGNORECASE),
-    re.compile(r"not\s+implemented|unsupported", re.IGNORECASE),
-    re.compile(r"quota\s+exceeded|insufficient_quota|billing", re.IGNORECASE),
-]
+# 错误分类和重试逻辑已抽取到 retry_executor.py，此处不再保留重复的正则模式
 
 
 class EnhancedSimpleAgent(SimpleAgent):
@@ -95,6 +62,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         tool_retry_jitter: float = 0.2,
         max_tools_per_round: int = 5,
         subagent_orchestrator=None,   # SubAgentOrchestrator 引用（可选）
+        timeout_config: Optional[TimeoutConfig] = None,
     ):
         """初始化 EnhancedSimpleAgent
 
@@ -114,6 +82,7 @@ class EnhancedSimpleAgent(SimpleAgent):
             tool_retry_backoff: 指数退避因子（默认 2.0）
             tool_retry_jitter: 随机抖动比例（0.2 表示 ±20%，默认 0.2）
             subagent_orchestrator: SubAgentOrchestrator 引用（可选，供子代理使用）
+            timeout_config: 模块级超时配置（可选，默认从 env/config.json 加载）
         """
         super().__init__(
             name=name,
@@ -143,6 +112,19 @@ class EnhancedSimpleAgent(SimpleAgent):
         self._tool_call_dedup: Set[str] = set()
 
         self._subagent_orchestrator = subagent_orchestrator
+
+        # 模块级超时配置
+        self._timeout_config = timeout_config or TimeoutConfig()
+
+        # 统一重试执行器（同步/异步共享错误分类和延迟计算）
+        self._retry_executor = RetryExecutor(
+            max_retries=max_tool_retries,
+            base_delay=tool_retry_base_delay,
+            max_delay=tool_retry_max_delay,
+            backoff=tool_retry_backoff,
+            jitter=tool_retry_jitter,
+            agent_name=name,
+        )
 
         # 上下文守卫 —— 工具执行前预判输出大小，决定 inline/snip/delegate
         self._context_guard = ContextGuard(orchestrator=subagent_orchestrator)
@@ -241,38 +223,13 @@ class EnhancedSimpleAgent(SimpleAgent):
         return deleted_count, failed
 
     @staticmethod
-    def _is_retryable_error(error_text: str) -> Tuple[bool, str]:
-        """判断工具返回的错误是否可重试。
-
-        基于预定义的正则模式进行分类：
-        - 先检查不可重试特征（文件不存在、权限、参数错误等）
-        - 再检查可重试特征（网络超时、HTTP 5xx、MCP 断连等）
-
-        Args:
-            error_text: 工具返回的错误文本（通常以 ❌ 开头）
+    def _is_retryable_error(error_text: str) -> Tuple[bool, str, Optional[str]]:
+        """判断工具返回的错误是否可重试（委托给 retry_executor.classify_error）。
 
         Returns:
-            (is_retryable, reason): 是否可重试及原因简述
+            (is_retryable, reason, error_type): 3 元组
         """
-        if not error_text:
-            return False, "empty result"
-
-        # 非错误结果不重试
-        if not error_text.startswith("❌"):
-            return False, "not an error"
-
-        # 1) 先匹配不可重试特征（优先级更高）
-        for pattern in _NON_RETRYABLE_ERROR_PATTERNS:
-            if pattern.search(error_text):
-                return False, f"non-retryable: {pattern.pattern}"
-
-        # 2) 再匹配可重试特征
-        for pattern in _RETRYABLE_ERROR_PATTERNS:
-            if pattern.search(error_text):
-                return True, f"retryable: {pattern.pattern}"
-
-        # 3) 未命中任何模式 → 保守策略：不重试（避免无意义重试导致延迟）
-        return False, "unknown error (conservative)"
+        return classify_error(error_text)
 
     @staticmethod
     def _compute_retry_delay(
@@ -282,14 +239,8 @@ class EnhancedSimpleAgent(SimpleAgent):
         backoff: float,
         jitter: float,
     ) -> float:
-        """计算第 N 次重试的等待延迟（指数退避 + 随机抖动）。
-
-        delay = min(base_delay * backoff^(attempt-1), max_delay) * (1 ± jitter)
-        """
-        delay = min(base_delay * (backoff ** (attempt - 1)), max_delay)
-        if jitter > 0:
-            delay *= 1.0 + random.uniform(-jitter, jitter)
-        return max(delay, 0.05)
+        """计算重试延迟（委托给 retry_executor.compute_retry_delay）。"""
+        return compute_retry_delay(attempt, base_delay, max_delay, backoff, jitter)
 
     def _execute_tool_call_with_retry_sync(
         self,
@@ -300,79 +251,26 @@ class EnhancedSimpleAgent(SimpleAgent):
     ) -> str:
         """同步执行工具调用（含智能重试）。
 
-        与异步路径 _yield_tool_call_execution 使用相同的重试策略，
-        但不 yield 流式事件，适用于 run() 同步对话路径。
+        委托给 RetryExecutor.execute_sync，共享与异步路径完全一致的重试策略。
 
         Returns:
             工具执行结果字符串
         """
-        exec_result = ""
-        duration_ms = 0.0
-        retry_count = 0
-        max_attempts = 1 + self.max_tool_retries
-
-        for attempt in range(1, max_attempts + 1):
-            t_start = time.perf_counter()
-            exec_result = self._execute_tool_call(tool_name, arguments)
-            duration_ms += (time.perf_counter() - t_start) * 1000
-
-            is_error = exec_result.startswith("❌")
-            is_retryable = False
-
-            if is_error:
-                is_retryable, retry_reason = self._is_retryable_error(exec_result)
-
-                if is_retryable and attempt < max_attempts:
-                    retry_count += 1
-                    delay = self._compute_retry_delay(
-                        attempt=retry_count,
-                        base_delay=self.tool_retry_base_delay,
-                        max_delay=self.tool_retry_max_delay,
-                        backoff=self.tool_retry_backoff,
-                        jitter=self.tool_retry_jitter,
-                    )
-                    result_preview = exec_result[:120] + "..." if len(exec_result) > 120 else exec_result
-                    print(f"🔄 工具 {tool_name} 第 {attempt}/{max_attempts} 次失败 ({retry_reason})，"
-                          f"{delay:.1f}s 后重试… → {result_preview}")
-
-                    # 结构化日志：记录失败尝试
-                    ToolCallLogger.log(
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        args=arguments,
-                        result=exec_result,
-                        session_id=getattr(self, "_current_session_id", None),
-                        status="retry",
-                        duration_ms=duration_ms,
-                        retry_attempt=retry_count,
-                    )
-
-                    time.sleep(delay)
-                    continue
-
-            # 不再重试
-            break
-
-        # 日志：最终结果
-        final_status = "error" if exec_result.startswith("❌") else "done"
-        ToolCallLogger.log(
+        result = self._retry_executor.execute_sync(
+            execute_fn=lambda args: self._execute_tool_call(tool_name, args),
             tool_name=tool_name,
             tool_call_id=tool_call_id,
-            args=arguments,
-            result=exec_result,
+            arguments=arguments,
             session_id=getattr(self, "_current_session_id", None),
-            status=final_status,
-            duration_ms=duration_ms,
-            retry_count=retry_count,
         )
 
-        if retry_count:
-            if final_status == "done":
-                print(f"✅ 工具 {tool_name} 第 {retry_count + 1} 次重试成功")
+        if result.retry_count:
+            if result.status == "done":
+                print(f"✅ 工具 {tool_name} 第 {result.retry_count + 1} 次重试成功")
             else:
-                print(f"❌ 工具 {tool_name} 已重试 {retry_count} 次，最终失败")
+                print(f"❌ 工具 {tool_name} 已重试 {result.retry_count} 次，最终失败")
 
-        return exec_result
+        return result.result
 
     def _build_messages(self, input_text: str) -> List[Dict[str, Any]]:
         """构建消息列表，并在对话开始前执行上下文管理。"""
@@ -454,68 +352,20 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         await asyncio.sleep(0)
 
-        # ── 智能重试循环 ──
-        exec_result = ""
-        duration_ms = 0.0
-        retry_count = 0
-        max_attempts = 1 + self.max_tool_retries
-
-        for attempt in range(1, max_attempts + 1):
-            t_start = time.perf_counter()
-            exec_result = self._execute_tool_call(tool_name, arguments)
-            duration_ms += (time.perf_counter() - t_start) * 1000
-
-            is_error = exec_result.startswith("❌")
-            is_retryable = False
-
-            if is_error:
-                is_retryable, retry_reason = self._is_retryable_error(exec_result)
-
-                if is_retryable and attempt < max_attempts:
-                    retry_count += 1
-                    delay = self._compute_retry_delay(
-                        attempt=retry_count,
-                        base_delay=self.tool_retry_base_delay,
-                        max_delay=self.tool_retry_max_delay,
-                        backoff=self.tool_retry_backoff,
-                        jitter=self.tool_retry_jitter,
-                    )
-                    result_preview = exec_result[:120] + "..." if len(exec_result) > 120 else exec_result
-                    print(f"🔄 工具 {tool_name} 第 {attempt}/{max_attempts} 次失败 ({retry_reason})，"
-                          f"{delay:.1f}s 后重试… → {result_preview}")
-
-                    # 结构化日志：记录本次失败尝试
-                    ToolCallLogger.log(
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        args=arguments,
-                        result=exec_result,
-                        session_id=getattr(self, "_current_session_id", None),
-                        status="retry",
-                        duration_ms=duration_ms,
-                        retry_attempt=retry_count,
-                    )
-
-                    await asyncio.sleep(delay)
-                    continue  # 进入下一轮重试
-
-            # 不再重试：成功 / 不可重试错误 / 已达最大次数
-            break
-
-        # ── 最终结果 ──
-        final_status = "error" if exec_result.startswith("❌") else "done"
-
-        # 结构化日志：记录最终结果
-        ToolCallLogger.log(
+        # ── 智能重试循环（委托给 RetryExecutor） ──
+        retry_result = await self._retry_executor.execute_async(
+            execute_fn=lambda args: self._execute_tool_call(tool_name, args),
             tool_name=tool_name,
             tool_call_id=tool_call_id,
-            args=arguments,
-            result=exec_result,
+            arguments=arguments,
             session_id=getattr(self, "_current_session_id", None),
-            status=final_status,
-            duration_ms=duration_ms,
-            retry_count=retry_count,
         )
+
+        exec_result = retry_result.result
+        retry_count = retry_result.retry_count
+        duration_ms = retry_result.duration_ms
+        final_status = retry_result.status
+
         self._maybe_track_temp_file(
             tool_name=tool_name,
             arguments=arguments,
@@ -550,7 +400,7 @@ class EnhancedSimpleAgent(SimpleAgent):
             "name": tool_name,
             "args": arguments,
             "result": exec_result,
-            "status": "error" if exec_result.startswith("❌") else "done",
+            "status": final_status,
             "retry_count": retry_count,
         })
         tool_results_by_id[tool_call_id] = exec_result
@@ -809,12 +659,33 @@ class EnhancedSimpleAgent(SimpleAgent):
             )
 
             try:
-                response = self.llm.invoke_with_tools(
-                    messages=messages,
-                    tools=tool_schemas,
-                    tool_choice="auto",
-                    **kwargs,
-                )
+                # LLM 调用重试（网络抖动时指数退避）
+                response = None
+                llm_max_attempts = 1 + self._timeout_config.llm_retry_max
+                for llm_attempt in range(1, llm_max_attempts + 1):
+                    try:
+                        response = self.llm.invoke_with_tools(
+                            messages=messages,
+                            tools=tool_schemas,
+                            tool_choice="auto",
+                            **kwargs,
+                        )
+                        break  # 成功
+                    except Exception as llm_e:
+                        error_text = f"❌ {llm_e}"
+                        is_retryable, reason, _ = classify_error(error_text)
+                        if is_retryable and llm_attempt < llm_max_attempts:
+                            delay = compute_retry_delay(
+                                attempt=llm_attempt,
+                                base_delay=self._timeout_config.llm_retry_base_delay,
+                                max_delay=self._timeout_config.llm_retry_max_delay,
+                                backoff=self._timeout_config.llm_retry_backoff,
+                                jitter=self._timeout_config.llm_retry_jitter,
+                            )
+                            print(f"🔄 LLM 调用第 {llm_attempt}/{llm_max_attempts} 次失败 ({reason})，{delay:.1f}s 后重试…")
+                            time.sleep(delay)
+                        else:
+                            raise  # 不可重试或已耗尽
             except Exception as e:
                 print(f"❌ LLM 调用失败: {e}")
                 if trace_logger:
@@ -1058,112 +929,148 @@ class EnhancedSimpleAgent(SimpleAgent):
                 self._tools_executed_this_round = 0
                 self._tool_call_dedup = set()
 
-                # 使用 LLM 的流式工具调用方法
-                try:
-                    async for event in self.llm.astream_invoke_with_tools(
-                        messages=messages,
-                        tools=tool_schemas,
-                        tool_choice="auto",
-                        **kwargs
-                    ):
-                        # 处理文本内容
-                        if event.event_type == StreamToolEventType.CONTENT:
-                            yield StreamEvent.create(
-                                StreamEventType.LLM_CHUNK,
-                                self.name,
-                                chunk=event.content,
-                                step=current_iteration
-                            )
-                            print(event.content, end="", flush=True)
+                # 使用 LLM 的流式工具调用方法（含重试）
+                llm_max_attempts = 1 + self._timeout_config.llm_retry_max
+                llm_stream_succeeded = False
+                for llm_attempt in range(1, llm_max_attempts + 1):
+                    events_received = False
+                    try:
+                        async for event in self.llm.astream_invoke_with_tools(
+                            messages=messages,
+                            tools=tool_schemas,
+                            tool_choice="auto",
+                            **kwargs
+                        ):
+                            events_received = True
+                            # 处理文本内容
+                            if event.event_type == StreamToolEventType.CONTENT:
+                                yield StreamEvent.create(
+                                    StreamEventType.LLM_CHUNK,
+                                    self.name,
+                                    chunk=event.content,
+                                    step=current_iteration
+                                )
+                                print(event.content, end="", flush=True)
 
-                        elif event.event_type == StreamToolEventType.TOOL_CALL_START:
-                            idx = event.tool_call_index
-                            if idx is None:
-                                continue
-                            if idx not in pending_tools:
-                                pending_tools[idx] = {
-                                    "id": "",
-                                    "name": "",
-                                    "arguments": "",
-                                    "executed": False,
-                                }
-                            if event.tool_call_id:
-                                pending_tools[idx]["id"] = event.tool_call_id
-                            if event.tool_name:
-                                pending_tools[idx]["name"] = event.tool_name
-                            # 新工具开始时，尝试执行已完成解析的前序工具
-                            for prev_idx in sorted(pending_tools.keys()):
-                                if prev_idx >= idx:
-                                    break
-                                async for tool_event in self._try_execute_ready_tool(
-                                    pending_tools[prev_idx],
-                                    tracked_temp_files,
-                                    iteration_tool_records,
-                                    tool_results_by_id,
-                                    executed_ids,
-                                ):
-                                    yield tool_event
-
-                        elif event.event_type == StreamToolEventType.TOOL_CALL_DELTA:
-                            idx = event.tool_call_index
-                            if idx is None or not event.tool_arguments_delta:
-                                continue
-                            if idx not in pending_tools:
-                                pending_tools[idx] = {
-                                    "id": "",
-                                    "name": "",
-                                    "arguments": "",
-                                    "executed": False,
-                                }
-                            pending_tools[idx]["arguments"] += event.tool_arguments_delta
-                            async for tool_event in self._try_execute_ready_tool(
-                                pending_tools[idx],
-                                tracked_temp_files,
-                                iteration_tool_records,
-                                tool_results_by_id,
-                                executed_ids,
-                            ):
-                                yield tool_event
-
-                        elif event.event_type == StreamToolEventType.FINISH:
-                            for idx in sorted(pending_tools.keys()):
-                                tc_state = pending_tools[idx]
-                                if tc_state.get("executed"):
+                            elif event.event_type == StreamToolEventType.TOOL_CALL_START:
+                                idx = event.tool_call_index
+                                if idx is None:
                                     continue
-                                async for tool_event in self._try_execute_ready_tool(
-                                    tc_state,
-                                    tracked_temp_files,
-                                    iteration_tool_records,
-                                    tool_results_by_id,
-                                    executed_ids,
-                                ):
-                                    yield tool_event
-                                if tc_state.get("executed"):
-                                    continue
-                                tool_call_id = tc_state.get("id") or ""
-                                tool_name = tc_state.get("name") or ""
-                                if tool_call_id and tool_name:
-                                    async for tool_event in self._execute_tool_call_with_error(
-                                        tool_name=tool_name,
-                                        tool_call_id=tool_call_id,
-                                        error_message="参数 JSON 不完整或格式错误",
-                                        tool_call_records=iteration_tool_records,
-                                        tool_results_by_id=tool_results_by_id,
-                                        executed_ids=executed_ids,
+                                if idx not in pending_tools:
+                                    pending_tools[idx] = {
+                                        "id": "",
+                                        "name": "",
+                                        "arguments": "",
+                                        "executed": False,
+                                    }
+                                if event.tool_call_id:
+                                    pending_tools[idx]["id"] = event.tool_call_id
+                                if event.tool_name:
+                                    pending_tools[idx]["name"] = event.tool_name
+                                # 新工具开始时，尝试执行已完成解析的前序工具
+                                for prev_idx in sorted(pending_tools.keys()):
+                                    if prev_idx >= idx:
+                                        break
+                                    async for tool_event in self._try_execute_ready_tool(
+                                        pending_tools[prev_idx],
+                                        tracked_temp_files,
+                                        iteration_tool_records,
+                                        tool_results_by_id,
+                                        executed_ids,
                                     ):
                                         yield tool_event
-                                    tc_state["executed"] = True
 
-                    print()  # 换行
+                            elif event.event_type == StreamToolEventType.TOOL_CALL_DELTA:
+                                idx = event.tool_call_index
+                                if idx is None or not event.tool_arguments_delta:
+                                    continue
+                                if idx not in pending_tools:
+                                    pending_tools[idx] = {
+                                        "id": "",
+                                        "name": "",
+                                        "arguments": "",
+                                        "executed": False,
+                                    }
+                                pending_tools[idx]["arguments"] += event.tool_arguments_delta
+                                async for tool_event in self._try_execute_ready_tool(
+                                    pending_tools[idx],
+                                    tracked_temp_files,
+                                    iteration_tool_records,
+                                    tool_results_by_id,
+                                    executed_ids,
+                                ):
+                                    yield tool_event
 
-                except Exception as e:
-                    error_msg = f"LLM 调用失败: {str(e)}"
-                    print(f"\n❌ {error_msg}")
-                    yield StreamEvent.create(
-                        StreamEventType.ERROR,
-                        self.name,
-                        error=error_msg
-                    )
+                            elif event.event_type == StreamToolEventType.FINISH:
+                                for idx in sorted(pending_tools.keys()):
+                                    tc_state = pending_tools[idx]
+                                    if tc_state.get("executed"):
+                                        continue
+                                    async for tool_event in self._try_execute_ready_tool(
+                                        tc_state,
+                                        tracked_temp_files,
+                                        iteration_tool_records,
+                                        tool_results_by_id,
+                                        executed_ids,
+                                    ):
+                                        yield tool_event
+                                    if tc_state.get("executed"):
+                                        continue
+                                    tool_call_id = tc_state.get("id") or ""
+                                    tool_name = tc_state.get("name") or ""
+                                    if tool_call_id and tool_name:
+                                        async for tool_event in self._execute_tool_call_with_error(
+                                            tool_name=tool_name,
+                                            tool_call_id=tool_call_id,
+                                            error_message="参数 JSON 不完整或格式错误",
+                                            tool_call_records=iteration_tool_records,
+                                            tool_results_by_id=tool_results_by_id,
+                                            executed_ids=executed_ids,
+                                        ):
+                                            yield tool_event
+                                        tc_state["executed"] = True
+
+                        print()  # 换行
+                        llm_stream_succeeded = True
+                        break  # 成功，退出重试循环
+
+                    except Exception as e:
+                        if events_received:
+                            # 已开始输出，不能重试（会导致重复输出）
+                            error_msg = f"LLM 流式中断: {str(e)}"
+                            print(f"\n❌ {error_msg}")
+                            yield StreamEvent.create(
+                                StreamEventType.ERROR,
+                                self.name,
+                                error=error_msg
+                            )
+                            llm_stream_succeeded = True
+                            break
+
+                        is_retryable, reason, _ = classify_error(f"❌ {e}")
+                        if is_retryable and llm_attempt < llm_max_attempts:
+                            delay = compute_retry_delay(
+                                attempt=llm_attempt,
+                                base_delay=self._timeout_config.llm_retry_base_delay,
+                                max_delay=self._timeout_config.llm_retry_max_delay,
+                                backoff=self._timeout_config.llm_retry_backoff,
+                                jitter=self._timeout_config.llm_retry_jitter,
+                            )
+                            print(f"🔄 LLM 调用第 {llm_attempt}/{llm_max_attempts} 次失败 ({reason})，{delay:.1f}s 后重试…")
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            error_msg = f"LLM 调用失败: {str(e)}"
+                            print(f"\n❌ {error_msg}")
+                            yield StreamEvent.create(
+                                StreamEventType.ERROR,
+                                self.name,
+                                error=error_msg
+                            )
+                            llm_stream_succeeded = True
+                            break
+
+                if not llm_stream_succeeded:
                     break
 
                 # 获取累积结果

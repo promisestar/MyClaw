@@ -63,7 +63,20 @@ class SubAgentTask:
     tools: List[str] = field(default_factory=list)
     result_mode: SubAgentResultMode = SubAgentResultMode.SUMMARY
     max_iterations: int = 8
-    timeout_seconds: int = 60
+    timeout_seconds: int = 60  # 默认值，__post_init__ 会自动覆盖
+
+    def __post_init__(self):
+        """自动计算超时（如果仍为默认值 60）。
+
+        公式：base(30) + per_tool(15 * len(tools)) + per_iteration(10 * max_iterations)
+        限制范围：30s - 300s（5 分钟）
+        """
+        if self.timeout_seconds == 60:
+            base = 30
+            per_tool = 15 * len(self.tools)
+            per_iteration = 10 * self.max_iterations
+            calculated = base + per_tool + per_iteration
+            self.timeout_seconds = min(max(calculated, 30), 300)
 
 
 @dataclass
@@ -159,6 +172,8 @@ class SubAgentOrchestrator:
         import time
 
         t_start = time.perf_counter()
+        print(f"🤖 子代理 {task.task_id} 启动: tools={task.tools}, "
+              f"max_iter={task.max_iterations}, timeout={task.timeout_seconds}s")
 
         try:
             # 1. 构建隔离的工具注册表

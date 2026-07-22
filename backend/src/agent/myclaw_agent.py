@@ -1,6 +1,7 @@
 """HelloClaw Agent - 基于 HelloAgents SimpleAgent 的个性化 AI 助手"""
 
 import os
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +35,7 @@ from ..tools import MemoryTool, BashTool, WebSearchTool, WebFetchTool, RAGTool, 
 from ..tools.builtin.mcp_tool import reset_all_mcp_disclosed_tools
 from ..tools.builtin.skill_tool import SkillTool
 from ..skills.loader import SkillLoader
+from ..core.timeouts import TimeoutConfig, get_timeout_config
 
 # SubAgent 编排器 + 任务追踪器
 from .subagent_orchestrator import SubAgentOrchestrator, SubAgentTask, SubAgentResultMode
@@ -83,6 +85,9 @@ class MyClawAgent:
 
         # 编辑/重新生成时暂存该轮之后的对话，跑完新回复后再拼回
         self._resend_suffix: List[Message] = []
+
+        # 加载模块级超时配置（env > config.json > 默认值）
+        self._timeout_config = get_timeout_config()
 
         # 从 IDENTITY.md 读取名称，如果没有则使用默认值
         self.name = name or self._read_identity_name() or "HelloClaw"
@@ -166,6 +171,7 @@ class MyClawAgent:
             tool_retry_jitter=tool_retry_jitter,
             max_tools_per_round=5,
             subagent_orchestrator=self._subagent_orchestrator,
+            timeout_config=self._timeout_config,
         )
 
         # 注入模型信息到 ContextManager，启用精确 token 统计
@@ -174,6 +180,10 @@ class MyClawAgent:
                 model=self._model_id,
                 base_url=self._base_url,
             )
+
+        # 更新 ContextGuard 的工具元数据（元数据驱动路由）
+        if hasattr(self._agent, '_context_guard') and self._agent._context_guard:
+            self._agent._context_guard.set_tool_registry(self.tool_registry)
 
         # 初始化 Memory Flush 管理器
         self._memory_flush_manager = MemoryFlushManager(
@@ -229,6 +239,7 @@ class MyClawAgent:
             model=self._model_id,
             api_key=self._api_key,
             base_url=self._base_url,
+            timeout_config=self._timeout_config,
         )
 
         # 动态感知模型的实际上下文窗口
@@ -254,6 +265,13 @@ class MyClawAgent:
 
             print(f"🔄 检测到配置变化，重新加载 LLM: {self._model_id} -> {new_model_id}")
 
+            # 关闭旧 LLM 的异步客户端（释放 httpx 连接池）
+            if self._llm and hasattr(self._llm, 'close_async_client'):
+                try:
+                    asyncio.get_event_loop().create_task(self._llm.close_async_client())
+                except Exception:
+                    pass
+
             self._model_id = new_model_id
             self._api_key = new_api_key
             self._base_url = new_base_url
@@ -262,6 +280,7 @@ class MyClawAgent:
                 model=self._model_id,
                 api_key=self._api_key,
                 base_url=self._base_url,
+                timeout_config=self._timeout_config,
             )
 
             # 更新 Agent 的 LLM 引用
@@ -407,11 +426,26 @@ class MyClawAgent:
         """设置工具集"""
         registry = ToolRegistry()
 
-        # HelloAgents 内置工具
-        registry.register_tool(ReadTool(project_root=self.workspace_path))
-        registry.register_tool(WriteTool(project_root=self.workspace_path))
-        registry.register_tool(EditTool(project_root=self.workspace_path))
-        registry.register_tool(CalculatorTool())
+        # HelloAgents 内置工具（设置元数据属性供 ContextGuard 动态路由）
+        read_tool = ReadTool(project_root=self.workspace_path)
+        read_tool.output_size_hint = 5000
+        read_tool.has_side_effects = False
+        registry.register_tool(read_tool)
+
+        write_tool = WriteTool(project_root=self.workspace_path)
+        write_tool.output_size_hint = 500
+        write_tool.has_side_effects = True
+        registry.register_tool(write_tool)
+
+        edit_tool = EditTool(project_root=self.workspace_path)
+        edit_tool.output_size_hint = 800
+        edit_tool.has_side_effects = True
+        registry.register_tool(edit_tool)
+
+        calc_tool = CalculatorTool()
+        calc_tool.output_size_hint = 100
+        calc_tool.has_side_effects = True  # 不可委托（输出太小无需委托）
+        registry.register_tool(calc_tool)
 
         # HelloClaw 自定义工具
         registry.register_tool(MemoryTool(
@@ -421,6 +455,7 @@ class MyClawAgent:
         registry.register_tool(BashTool(
             allowed_directories=[self.workspace_path],  # 限制在工作空间目录
             default_workdir=self.workspace_path,  # 与 Read/Write 根目录一致，避免 uvicorn CWD 下找不到脚本
+            timeout_config=self._timeout_config,
         ))
         registry.register_tool(WebFetchTool())   # 网页抓取工具
 
@@ -553,6 +588,11 @@ class MyClawAgent:
             raise ValueError(f"会话 {session_id} 不存在")
 
         self._agent.load_session(session_file)
+
+        # 恢复被截断的历史内容（非破坏性压缩的逆向操作）
+        if hasattr(self._agent, "context_manager"):
+            self._agent.context_manager.restore_original_content()
+
         history = list(self._agent.get_history())
         prefix, suffix = self._split_history_at_user_turn(history, user_turn_index)
         self._agent._history = prefix
@@ -1078,8 +1118,18 @@ class MyClawAgent:
         # 重新读取 name（因为 IDENTITY.md 可能已被重置）
         self.name = self._read_identity_name() or "HelloClaw"
 
-    def shutdown(self):
-        """关闭 Agent 持有的外部连接与可释放资源。"""
+    async def shutdown(self):
+        """异步关闭 Agent 持有的外部连接与可释放资源。
+
+        由 main.py 的 lifespan finally 块调用（Ctrl+C / 正常退出时均会触发）。
+        """
+        # 0) 关闭 LLM 异步客户端（释放 httpx 连接池）
+        if self._llm and hasattr(self._llm, 'close_async_client'):
+            try:
+                await self._llm.close_async_client()
+            except Exception as e:
+                print(f"⚠️ 关闭 LLM 客户端失败: {e}")
+
         self._reset_mcp_disclosed_tools()
         # 1) 尝试让各工具自行释放资源（如 RAG/Qdrant、HTTP client 等）
         try:
