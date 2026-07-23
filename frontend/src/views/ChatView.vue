@@ -803,7 +803,14 @@ const isGroupWaiting = (group: MessageGroup): boolean => {
 }
 
 // 停止生成
-const stopGeneration = () => {
+const stopGeneration = async () => {
+  // 先通知后端取消 Agent 执行
+  try {
+    await chatApi.cancelGeneration()
+  } catch {
+    // 忽略取消请求本身的网络错误
+  }
+  // 再断开前端 SSE 连接
   if (abortController.value) {
     abortController.value.abort()
     abortController.value = null
@@ -1115,6 +1122,9 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
           }).catch(() => {
             // 忽略错误，保持当前名字
           })
+        } else if (event.type === 'cancelled') {
+          // 用户取消，不显示错误提示
+          console.log('Agent generation cancelled:', event.error)
         } else if (event.type === 'error') {
           message.error(event.error || '发送消息失败')
         }

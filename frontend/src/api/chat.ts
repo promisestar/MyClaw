@@ -23,7 +23,7 @@ export interface ChatResponse {
 }
 
 export interface StreamEvent {
-  type: 'session' | 'step_start' | 'chunk' | 'tool_start' | 'tool_finish' | 'step_finish' | 'done' | 'error'
+  type: 'session' | 'step_start' | 'chunk' | 'tool_start' | 'tool_finish' | 'step_finish' | 'done' | 'cancelled' | 'error'
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -50,10 +50,20 @@ export interface SendMessageOptions {
   signal?: AbortSignal
 }
 
+export interface CancelResponse {
+  success: boolean
+  message: string
+}
+
 export const chatApi = {
   // 流式发送消息 (SSE)
   sendMessage: async (message: string, sessionId?: string) => {
     return api.post('/chat/send', { message, session_id: sessionId })
+  },
+
+  // 取消当前正在执行的 Agent 生成
+  cancelGeneration: async (): Promise<CancelResponse> => {
+    return api.post('/chat/cancel')
   },
 
   // 同步发送消息（支持取消，超时时间 5 分钟）
@@ -161,6 +171,8 @@ export const chatApi = {
                     session_id: parsed.session_id,
                     context_usage: parsed.context_usage,
                   })
+                } else if (currentEvent === 'cancelled') {
+                  onChunk({ type: 'cancelled', error: parsed.reason || 'cancelled' })
                 } else if (currentEvent === 'error') {
                   onChunk({ type: 'error', error: parsed.error })
                 }

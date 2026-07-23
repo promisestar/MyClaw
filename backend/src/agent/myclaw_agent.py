@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from hello_agents import Config
 from hello_agents.core.message import Message
 from .enhanced_simple_agent import EnhancedSimpleAgent
+from .cancel_token import CancellationToken
 from .enhanced_llm import EnhancedHelloAgentsLLM  # HelloClaw 专用 LLM（支持流式工具调用）
 from .multimodal_bridge import (
     encode_multimodal_content,
@@ -378,12 +379,13 @@ class MyClawAgent:
         if soul:
             context_parts.append(f"\n## 人格模板\n{soul}")
 
-        # 长期记忆使用指引（不做自动检索，由 Agent 按需调用 memory_search）
+        # 长期记忆使用指引（自动注入 + 主动检索）
         context_parts.append(
             "\n## 长期记忆\n"
-            "你拥有长期记忆能力，所有历史记忆存储在向量数据库中。"
-            "当需要回忆之前的对话内容、用户偏好、历史决策、个人实体信息时，"
-            "请使用 memory_search 工具进行语义检索。\n"
+            "你拥有长期记忆能力，所有历史记忆存储在向量数据库中。\n"
+            "每轮对话开始时，系统会自动检索与你当前消息相关的记忆并注入上下文"
+            "（标记为「相关记忆（自动注入）」）。\n"
+            "如果自动注入的记忆不够，你可以使用 memory_search 工具进行更深入的语义检索。\n"
             "使用 memory_add 写入新的长期记忆。"
         )
 
@@ -421,6 +423,86 @@ class MyClawAgent:
             return base_prompt + "\n" + "\n".join(context_parts)
 
         return base_prompt
+
+    def _inject_relevant_memories(self, user_message: str) -> str:
+        """检索与用户消息相关的记忆，返回格式化的记忆上下文文本。
+
+        每轮用户消息到达时后台语义检索 top-K 记忆，作为 system context 静默注入。
+        如果记忆系统不可用或无相关记忆，返回空字符串。
+
+        配置项（config.json 的 memory 段）：
+        - auto_inject: bool, 是否启用自动注入（默认 True）
+        - auto_inject_top_k: int, 返回结果数量（默认 3）
+        - auto_inject_threshold: float, 相似度阈值（默认 0.3）
+
+        Args:
+            user_message: 用户消息文本（可能是多模态编码字符串）
+
+        Returns:
+            格式化的记忆上下文文本，无相关记忆时返回空字符串
+        """
+        if not self._memory_store or not self._memory_store.available:
+            return ''
+
+        # 读取配置
+        try:
+            global_config = self.workspace.load_global_config()
+            memory_cfg = global_config.get('memory', {})
+        except Exception:
+            memory_cfg = {}
+
+        if not memory_cfg.get('auto_inject', True):
+            return ''
+
+        top_k = memory_cfg.get('auto_inject_top_k', 3)
+        score_threshold = memory_cfg.get('auto_inject_threshold', 0.3)
+
+        try:
+            # 从多模态编码中提取纯文本用于检索
+            query_text = user_message
+            try:
+                from .multimodal_bridge import (
+                    is_encoded_multimodal,
+                    decode_multimodal_content,
+                )
+                from ..multimodal import flatten_content_to_text
+                if is_encoded_multimodal(user_message):
+                    decoded = decode_multimodal_content(user_message)
+                    query_text = flatten_content_to_text(decoded)
+            except Exception:
+                pass
+
+            if not query_text or not query_text.strip():
+                return ''
+
+            memories = self._memory_store.search_memories(
+                query=query_text,
+                top_k=top_k,
+                score_threshold=score_threshold,
+            )
+
+            if not memories:
+                return ''
+
+            # 格式化记忆上下文
+            lines = [
+                '\n## 相关记忆（自动注入）',
+                '以下是从长期记忆中检索到的与当前对话相关的信息：\n',
+            ]
+            for i, m in enumerate(memories, 1):
+                content = m.get('content', '')
+                category = m.get('category', '')
+                lines.append(f'{i}. [{category}] {content}')
+
+            lines.append(
+                '\n（以上记忆仅供参考，如需更多历史信息请使用 memory_search 工具）'
+            )
+
+            print(f'🧠 自动注入 {len(memories)} 条相关记忆')
+            return '\n'.join(lines)
+        except Exception as e:
+            print(f'⚠️ 记忆自动注入失败: {e}')
+            return ''
 
     def _setup_tools(self) -> ToolRegistry:
         """设置工具集"""
@@ -711,13 +793,23 @@ class MyClawAgent:
         user_turn_index: Optional[int] = None,
         regenerate: bool = False,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        cancel_token: Optional['CancellationToken'] = None,
     ) -> str:
-        """同步聊天"""
+        """同步聊天
+
+        Args:
+            cancel_token: 取消令牌，用于中断 Agent 循环
+        """
         # 热加载配置（检测 config.json 变化）
         self._reload_llm_if_changed()
 
         # 动态更新系统提示词（检查 BOOTSTRAP 状态、读取最新配置）
         self._agent.system_prompt = self._build_system_prompt()
+
+        # 自动注入相关记忆（后台语义检索 top-K）
+        memory_context = self._inject_relevant_memories(message)
+        if memory_context:
+            self._agent.system_prompt += memory_context
 
         if session_id:
             if user_turn_index is not None:
@@ -736,7 +828,7 @@ class MyClawAgent:
 
         # 构造（可能含多模态附件）输入并运行 Agent
         agent_input = self._prepare_message_with_attachments(message, attachments)
-        response = self._agent.run(agent_input, **llm_kwargs)
+        response = self._agent.run(agent_input, cancel_token=cancel_token, **llm_kwargs)
         self._finalize_turn_replace_if_needed()
 
         # 保存会话
@@ -756,6 +848,7 @@ class MyClawAgent:
         user_turn_index: Optional[int] = None,
         regenerate: bool = False,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        cancel_token: Optional['CancellationToken'] = None,
     ):
         """异步聊天（支持流式输出）
 
@@ -764,6 +857,7 @@ class MyClawAgent:
             session_id: 会话 ID，如果为 None 则创建新会话
             user_turn_index: 要替换回复的用户轮次（0 起）；保留该轮之后的对话
             regenerate: 是否为重新生成（与编辑共用替换逻辑）
+            cancel_token: 取消令牌，用于中断 Agent 循环
 
         Yields:
             StreamEvent: 流式事件
@@ -779,6 +873,12 @@ class MyClawAgent:
 
         # 动态更新系统提示词（检查 BOOTSTRAP 状态、读取最新配置）
         self._agent.system_prompt = self._build_system_prompt()
+
+        # 自动注入相关记忆（后台语义检索 top-K）
+        memory_context = self._inject_relevant_memories(message)
+        if memory_context:
+            self._agent.system_prompt += memory_context
+
         print(f"[⏱️ {time.time():.3f}] 系统提示词构建完成 (+{time.time()-t0:.3f}s)")
 
         if not session_id:
@@ -812,7 +912,7 @@ class MyClawAgent:
         # 构造（可能含多模态附件）输入
         agent_input = self._prepare_message_with_attachments(message, attachments)
 
-        async for event in self._agent.arun_stream_with_tools(agent_input, **llm_kwargs):
+        async for event in self._agent.arun_stream_with_tools(agent_input, cancel_token=cancel_token, **llm_kwargs):
             if first_chunk and event.type.value == "llm_chunk":
                 print(f"[⏱️ {time.time():.3f}] 首个 token 到达 (LLM 延迟: {time.time()-t_llm:.3f}s)")
                 first_chunk = False

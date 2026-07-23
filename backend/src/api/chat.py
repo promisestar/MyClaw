@@ -1,12 +1,32 @@
 """聊天 API 路由"""
 import json
+import asyncio
 from typing import List, Literal, Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from ..logging.tool_logger import set_trace_id, generate_trace_id
+from ..agent.cancel_token import CancellationToken
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+# ══════════════════════════════════════════════════════════
+# 全局取消令牌管理
+# agent_lock 串行化保证同一时间只有一个活跃请求，
+# 因此只需维护一个"当前活跃令牌"即可。
+# ══════════════════════════════════════════════════════════
+_current_cancel_token: Optional[CancellationToken] = None
+
+
+def get_current_cancel_token() -> Optional[CancellationToken]:
+    """获取当前活跃的取消令牌（供外部模块使用）。"""
+    return _current_cancel_token
+
+
+def _set_current_cancel_token(token: Optional[CancellationToken]) -> None:
+    """设置当前活跃的取消令牌。"""
+    global _current_cancel_token
+    _current_cancel_token = token
 
 
 class Attachment(BaseModel):
@@ -100,7 +120,7 @@ async def send_message_sync(request: ChatRequest):
 
 
 @router.post("/send/stream")
-async def send_message_stream(request: ChatRequest):
+async def send_message_stream(request: ChatRequest, http_request: Request):
     """发送消息并获取流式响应 (SSE)
 
     事件类型：
@@ -111,6 +131,7 @@ async def send_message_stream(request: ChatRequest):
     - tool_finish: 工具调用结束
     - step_finish: 步骤结束
     - done: 完成（含 context_usage 上下文用量）
+    - cancelled: 用户取消
     - error: 错误
     """
 
@@ -122,6 +143,10 @@ async def send_message_stream(request: ChatRequest):
                 "data": json.dumps({"error": "Agent not initialized"}, ensure_ascii=False)
             }
             return
+
+        # 创建取消令牌并注册为当前活跃令牌
+        cancel_token = CancellationToken()
+        _set_current_cancel_token(cancel_token)
 
         lock = get_agent_lock()
         try:
@@ -138,6 +163,7 @@ async def send_message_stream(request: ChatRequest):
                     user_turn_index=request.user_turn_index,
                     regenerate=request.regenerate,
                     attachments=attachments,
+                    cancel_token=cancel_token,
                 ):
                     event_type = event.type.value
                     event_data = event.data
@@ -219,12 +245,34 @@ async def send_message_stream(request: ChatRequest):
                             "data": json.dumps({"error": event_data.get("error", "Unknown error")}, ensure_ascii=False)
                         }
 
+            async def _consume_stream():
+                """消费 Agent 事件流，同时检测客户端断开和取消信号。"""
+                async for item in _run_stream():
+                    yield item
+
+                    # 检测客户端断开（SSE 连接关闭）→ 触发后端取消
+                    if await http_request.is_disconnected():
+                        cancel_token.cancel('client_disconnected')
+                        print('🔌 检测到客户端断开，已触发后端取消')
+                        break
+
+                    # 检测取消信号（前端通过 /chat/cancel 触发）
+                    if cancel_token.is_cancelled:
+                        yield {
+                            'event': 'cancelled',
+                            'data': json.dumps(
+                                {'reason': cancel_token.reason or 'cancelled'},
+                                ensure_ascii=False
+                            )
+                        }
+                        break
+
             if lock:
                 async with lock:
-                    async for item in _run_stream():
+                    async for item in _consume_stream():
                         yield item
             else:
-                async for item in _run_stream():
+                async for item in _consume_stream():
                     yield item
 
         except Exception as e:
@@ -234,6 +282,9 @@ async def send_message_stream(request: ChatRequest):
                 "event": "error",
                 "data": json.dumps({"error": str(e)}, ensure_ascii=False)
             }
+        finally:
+            # 清理全局取消令牌
+            _set_current_cancel_token(None)
 
     return EventSourceResponse(event_generator())
 
@@ -242,3 +293,24 @@ async def send_message_stream(request: ChatRequest):
 async def send_message(request: ChatRequest):
     """发送消息（暂返回同步响应）"""
     return await send_message_sync(request)
+
+
+class CancelResponse(BaseModel):
+    """取消响应"""
+    success: bool
+    message: str = ""
+
+
+@router.post("/cancel", response_model=CancelResponse)
+async def cancel_generation():
+    """取消当前正在执行的 Agent 生成
+
+    前端"停止"按钮调用此端点，后端通过 CancellationToken 中断 Agent 循环。
+    依赖 agent_lock 串行化特性，同一时间只有一个活跃请求可被取消。
+    """
+    token = get_current_cancel_token()
+    if token and not token.is_cancelled:
+        token.cancel('user_requested')
+        print('⏹️ 收到取消请求，已触发 Agent 中断')
+        return CancelResponse(success=True, message='cancel signal sent')
+    return CancelResponse(success=False, message='no active generation to cancel')

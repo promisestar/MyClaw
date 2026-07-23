@@ -17,8 +17,9 @@
 9. [BashTool 安全沙箱](#9-bashtool-安全沙箱)
 10. [会话编辑与时间线分叉](#10-会话编辑与时间线分叉)
 11. [工具调用去重与限量保护](#11-工具调用去重与限量保护)
-12. [多模态 Token 估算与自适应压缩](#12-多模态-token-估算与自适应压缩)
-13. [面试展示策略](#13-面试展示策略)
+12. [Agent 循环可中断与协同取消](#12-agent-循环可中断与协同取消)
+13. [多模态 Token 估算与自适应压缩](#13-多模态-token-估算与自适应压缩)
+14. [面试展示策略](#14-面试展示策略)
 
 ---
 
@@ -36,25 +37,43 @@ LLM 输出完整响应 → 解析所有工具调用 → 逐个执行 → 下一�
 
 ### 实现方案
 
-MyClaw 在 `EnhancedSimpleAgent.arun_stream_with_tools` 中实现了"边流边执行"的流水线模式：
+MyClaw 在 `EnhancedSimpleAgent.arun_stream_with_tools` 中实现了"边流边执行"的流水线模式。LLM 的流式工具调用发出三种事件，每种事件触发不同的执行策略：
 
 ```
 时间轴：
 ─────────────────────────────────────────────────────►
-LLM 流:  [文本]...[tool_1 开始]...[tool_1 参数完整]...[tool_2 开始]...[tool_2 参数完整]...[FINISH]
-                                          │                              │
-执行:                                    ├─→ 立即执行 tool_1             ├─→ 立即执行 tool_2
-                                          │                              │
-                                          ◄── 不等流结束，继续接收 ──────►
+LLM 流:  [文本]...[tool_1 START]...[tool_1 DELTA（补齐全）]...[tool_2 START]...[tool_2 DELTA（补齐全）]...[FINISH]
+                     │                         │                      │                         │
+TOOL_CALL_START:     ├─→ 新工具开始              │                      │                         │
+                     │   执行前序已完成解析的工具    │                      │                         │
+                     │                           │                      │                         │
+TOOL_CALL_DELTA:                                ├─→ 参数累积            ├─→ 执行 tool_2           │
+                                                 │   JSON 完整即执行      │   （同步等待完成）         │
+                                                 │   （同步等待完成）      │                         │
+                                                 │                      │                         │
+FINISH:                                                                                           ├─→ 收集所有未执行工具
+                                                                                                      _execute_tools_batch
+                                                                                                      无副作用 → 并行
+                                                                                                      有副作用 → 串行
 ```
 
-**关键代码**（`enhanced_simple_agent.py`）：
+**三种事件类型与执行策略**（`enhanced_simple_agent.py`）：
 
 ```python
-# 流式接收 LLM 输出
 async for event in self.llm.astream_invoke_with_tools(...):
-    if event.event_type == StreamToolEventType.TOOL_CALL_START:
-        # 新工具开始 → 尝试执行已完成解析的前序工具
+
+    # ── TOOL_CALL_DELTA：参数增量到达，完整后立即同步执行 ──
+    # 关键：async for 完整消费 _try_execute_ready_tool 后才回到外层循环，
+    # 所以 tool_0 执行完毕前，tool_1 的 LLM 事件不会被接收
+    if event.event_type == StreamToolEventType.TOOL_CALL_DELTA:
+        pending_tools[idx]["arguments"] += event.tool_arguments_delta
+        async for tool_event in self._try_execute_ready_tool(
+            pending_tools[idx], ...
+        ):
+            yield tool_event
+
+    # ── TOOL_CALL_START：新工具开始，执行前序已完成解析的工具 ──
+    elif event.event_type == StreamToolEventType.TOOL_CALL_START:
         for prev_idx in sorted(pending_tools.keys()):
             if prev_idx >= idx:
                 break
@@ -63,28 +82,118 @@ async for event in self.llm.astream_invoke_with_tools(...):
             ):
                 yield tool_event
 
-    elif event.event_type == StreamToolEventType.TOOL_CALL_DELTA:
-        # 参数增量到达 → 累积后尝试执行
-        pending_tools[idx]["arguments"] += event.tool_arguments_delta
-        async for tool_event in self._try_execute_ready_tool(
-            pending_tools[idx], ...
+    # ── FINISH：流结束，收集所有未执行工具批量执行 ──
+    elif event.event_type == StreamToolEventType.FINISH:
+        ready_calls = []
+        for idx in sorted(pending_tools.keys()):
+            # 去重检查 + 限量检查 + 加入批量列表
+            ready_calls.append({"name": ..., "id": ..., "arguments": ...})
+        async for tool_event in self._execute_tools_batch(
+            ready_calls, ...  # 无副作用并行，有副作用串行
         ):
             yield tool_event
 ```
 
-`_try_execute_ready_tool` 内部会检查参数 JSON 是否可解析（`json.loads`），解析成功则立即执行并 yield 流式事件。
+`_try_execute_ready_tool` 内部首先将 `tc_state["executed"] = True`（行 440），然后才执行工具。这确保了即使工具执行中（如正在写入文件），后续事件不会再重复触发同一工具。
+
+### 只读工具并行执行
+
+流水线模式中，三种事件的执行都是**同步等待完成的**（`async for` 完整消费生成器）。这意味着在 `TOOL_CALL_DELTA` 和 `TOOL_CALL_START` 中，工具仍然是**逐个串行**的——要等当前工具完全执行完才会接收下一个 LLM 事件。
+
+真正的并行化发生在 `FINISH` 事件和兜底路径中，通过 `_execute_tools_batch` 实现：
+
+```python
+async def _execute_tools_batch(self, tool_calls, ...):
+    # 基于 has_side_effects 元数据自动分组
+    parallel_calls = [tc for tc in tool_calls if not has_side_effects(tc)]
+    serial_calls   = [tc for tc in tool_calls if has_side_effects(tc)]
+
+    # 无副作用工具用 asyncio.Queue + create_task 并行执行
+    queue = asyncio.Queue()
+    tasks = [asyncio.create_task(_run_one(tc)) for tc in parallel_calls]
+    while pending > 0:
+        event = await queue.get()
+        if event is None:
+            pending -= 1
+        else:
+            yield event   # 各工具的事件实时交错推送，前端可见并行进度
+
+    # 有副作用工具保持串行（避免竞态）
+    for tc in serial_calls:
+        async for event in self._yield_tool_call_execution(tc, ...):
+            yield event
+```
+
+**设计决策**：
+- `read_file`、`web_search` 等只读工具可安全并行（`has_side_effects=False`）
+- `write_file`、`edit_file`、`memory_add` 等有副作用工具保持串行（`has_side_effects=True`）
+- 基于 `has_side_effects` 元数据自动决策，无需 LLM 标注
+- 用 `asyncio.Queue` 合并多个并行工具的事件流，前端仍能看到各工具的实时进度
+- `FINISH` 是并行的最佳接入点——此时所有工具参数已确定，可一次性分组批量执行
+
+### 执行路径全覆盖
+
+将流水线三事件 + 兜底路径合并为完整的执行覆盖矩阵：
+
+```
+FINISH 批量执行（无副作用并行）
+          │
+          ├─ _execute_tools_batch
+          │    ├─ read_file, web_search, ... → asyncio.Queue 并行
+          │    └─ write_file, edit_file, ... → async for 串行
+          │
+          ▼
+  complete_tool_calls（来自 _last_stream_tool_result）
+          │
+          ▼
+  兜底路径：executed_ids 中查漏补缺
+          │
+          ├─ 仍有未执行工具 → _execute_tools_batch（同上）
+          └─ 全部已执行 → 跳过
+```
+
+**各路径的覆盖范围**：
+
+| 路径 | 触发时机 | has_side_effects=False | has_side_effects=True | 说明 |
+|------|---------|----------------------|----------------------|------|
+| TOOL_CALL_DELTA | 参数增量到达，JSON 完整 | 同步串行 | 同步串行 | `async for` 等待每个工具完成后才接收下一个 LLM 事件 |
+| TOOL_CALL_START | 新工具开始 | 同步串行 | 同步串行 | 只执行前序已完成解析的工具 |
+| FINISH | LLM 流结束 | **asyncio.Queue 并行** | `async for` 串行 | 收集全部待执行工具，`_execute_tools_batch` 分组处理 |
+| 兜底路径 | FINISH 处理后仍有遗漏 | **asyncio.Queue 并行** | `async for` 串行 | 防御性代码，正常流程不触发 |
+
+### 并发安全性分析：同一文件两次写入
+
+这引出一个关键问题：如果 LLM 在同一轮中对同一文件生成两次 `write_file`，会不会出现写入冲突？
+
+**答案：不会。** 三层保障确保安全：
+
+**保障 1：TOOL_CALL_DELTA 天然串行**。`async for` 完整消费 `_try_execute_ready_tool` 的所有 yield 后才回到外层接收下一个 LLM 事件。这意味着 tool_0 的 `write_file` 完全执行完毕之前，tool_1 的参数**还没开始从 LLM 流接收**。
+
+```python
+# tool_0 DELTA 到达，JSON 完整
+async for tool_event in self._try_execute_ready_tool(...):
+    yield tool_event
+# ← tool_0 已完全执行完毕，现在才能接收 tool_1 的流事件
+```
+
+**保障 2：`_try_execute_ready_tool` 先标记后执行**。JSON 解析成功后立即 `tc_state["executed"] = True`（行 440），之后才进入工具执行。即使 tool_0 仍在执行中，后续的 `TOOL_CALL_START` 遍历前序工具时会直接跳过它。
+
+**保障 3：`_execute_tools_batch` 按副作用分组**。`write_file` 标记了 `has_side_effects=True`（`myclaw_agent.py:437`），始终进入 `serial_calls` 组，用 `async for` 逐个执行，不会并发。
 
 ### 对比分析
 
 | 维度 | 传统串行 | MyClaw 流水线 |
 |------|---------|--------------|
 | 多工具延迟 | N × (LLM 输出时间 + 工具执行时间) | max(LLM 输出时间) + 最后一个工具执行时间 |
+| 只读工具并行 | ❌ 全部串行 | ✅ FINISH 时 asyncio.Queue 并行 |
+| 副作用工具安全 | ✅ 天然串行 | ✅ 分组串行，同上 |
+| 写冲突风险 | ❌ 无 | ❌ 无（三层保障） |
 | 用户体验 | 长时间无反馈 | 工具调用实时推送，前端可见执行进度 |
-| 实现复杂度 | 简单（收集完整响应后处理） | 高（增量解析 + 状态机 + 并发 yield） |
+| 实现复杂度 | 简单（收集完整响应后处理） | 高（增量解析 + 状态机 + 并行分组） |
 
 ### 面试展示要点
 
-> "我注意到 LLM 流式输出时，工具调用的参数 JSON 是增量到达的。当一个工具的参数完整解析后，我不等整轮流结束就立即执行它，同时继续接收流。这把串行的 N 轮工具调用变成了流水线，端到端延迟降低约 30%。"
+> "我注意到 LLM 流式输出时，工具调用的参数 JSON 是增量到达的。当一个工具的参数完整解析后，我不等整轮流结束就立即执行它，同时继续接收流。在 FINISH 事件时，我把所有待执行的工具分组——只读的并行、有副作用的串行——用 asyncio.Queue 合并事件流。同一文件两次写入绝不会冲突：流式路径天然串行，FINISH 路径按副作用分组。端到端延迟降低约 30%。"
 
 ---
 
@@ -452,7 +561,14 @@ Agent 需要跨会话记住用户偏好、历史决策、个人实体信息。�
            → Qdrant 向量存储
 
 检索路径：
-  Agent 调用 memory_search → embedding 语义检索 → 命中记忆自动强化
+  自动注入（被动）：
+    每轮用户消息 → _inject_relevant_memories
+                 → 语义检索 top-3（score_threshold=0.3）
+                 → 格式化为「相关记忆（自动注入）」追加到系统提示词
+                 → Qdrant 不可用时静默降级（跳过注入）
+
+  主动检索（Agent 按需）：
+    Agent 调用 memory_search → embedding 语义检索 → 命中记忆自动强化
 
 遗忘路径：
   每条记忆 decay_score 初始 1.0
@@ -479,9 +595,11 @@ Agent 需要跨会话记住用户偏好、历史决策、个人实体信息。�
 
 **4. 懒处理策略**：衰减计算和删除只在程序启动时或手动调用时执行，不随每轮对话触发，零运行时开销。
 
+**5. 自动注入（被动检索）**：每轮用户消息到达时，后台自动用 `memory_search` 语义检索 top-3 相关记忆，作为「相关记忆（自动注入）」追加到系统提示词。Agent 无需主动调用工具即可获得历史上下文。配置项（`config.json` 的 `memory` 段）支持开关、top_k 和相似度阈值。Qdrant 不可用时静默降级，不影响正常对话。
+
 ### 面试展示要点
 
-> "记忆系统有四层设计：自动捕获用 28 条正则规则从用户消息中提取值得记住的内容；写入时做双层去重（字面 + 语义）；检索用 Qdrant 向量语义搜索；遗忘用分类差异化衰减——重要的个人信息 70 天才衰减完，易过时的 URL 23 天自动消退。被检索命中的记忆重置计时器，实现'用进废退'。"
+> "记忆系统有四层设计：自动捕获用 28 条正则规则从用户消息中提取值得记住的内容；写入时做双层去重（字面 + 语义）；检索分两条路径——每轮自动注入 top-3 相关记忆到系统提示词（被动），以及 Agent 按需调用 memory_search 做深度检索（主动）；遗忘用分类差异化衰减——重要的个人信息 70 天才衰减完，易过时的 URL 23 天自动消退。被检索命中的记忆重置计时器，实现'用进废退'。"
 
 ---
 
@@ -652,7 +770,75 @@ if self._tools_executed_this_round >= self.max_tools_per_round:  # 默认 5
 
 ---
 
-## 12. 多模态 Token 估算与自适应压缩
+## 12. Agent 循环可中断与协同取消
+
+### 设计动机
+
+Agent 的 ReAct 循环可能执行多轮工具调用（搜索 → 读取 → 分析 → 写入），耗时数十秒甚至更久。用户在等待过程中可能改变想法，希望"停止"当前生成。传统方案中，前端仅通过 `AbortController` 断开 SSE 连接，但**后端对此无感知**——Agent 循环继续执行、LLM 继续调用、工具继续运行，白白消耗算力和 API 额度。
+
+### 实现方案
+
+MyClaw 实现了**双向协同取消**机制，前端和后端协同工作：
+
+```
+前端"停止"按钮
+  │
+  ├─→ POST /chat/cancel  ──→  后端 CancellationToken.cancel('user_requested')
+  │                                │
+  └─→ AbortController.abort()      │
+       (断开 SSE)                  ↓
+                            Agent ReAct 循环检查点：
+                            ┌─ 每轮迭代开头 → if token.is_cancelled: break
+                            ├─ LLM 流式输出中 → if token.is_cancelled: break
+                            └─ 工具执行前    → if token.is_cancelled: break
+                                     │
+                            SSE 断开检测（http_request.is_disconnected()）
+                                     │
+                            token.cancel('client_disconnected')
+```
+
+**CancellationToken**（`agent/cancel_token.py`）是一个协作式取消令牌：
+
+```python
+class CancellationToken:
+    def cancel(self, reason: str = 'user_requested') -> None:
+        """触发取消信号"""
+        self._cancelled = True
+        self._reason = reason
+
+    @property
+    def is_cancelled(self) -> bool:
+        """是否已取消"""
+        return self._cancelled
+
+    def check(self) -> None:
+        """检查点：已取消则抛出 AgentCancelledError"""
+        if self._cancelled:
+            raise AgentCancelledError(self._reason)
+```
+
+**关键设计**：
+
+1. **三层检查点**：在 ReAct 循环迭代开头、LLM 流式输出每个事件后、工具执行前检查取消信号，确保在任何阶段都能及时中断
+2. **SSE 断开检测**：后端在每次 yield 事件后检查 `http_request.is_disconnected()`，客户端断开时自动触发取消
+3. **全局令牌管理**：利用 `agent_lock` 串行化特性，只需维护一个"当前活跃令牌"，`/chat/cancel` 端点直接取消它
+4. **优雅结束**：取消后 Agent 循环 break，正常保存历史记录并发送 `AGENT_FINISH` 事件，前端收到 `cancelled` 事件类型
+
+### 对比分析
+
+| 方案 | 前端操作 | 后端感知 | 资源浪费 | 实现复杂度 |
+|------|---------|---------|---------|-----------|
+| 前端单边断开 | AbortController | ❌ 无 | 高（继续执行） | 低 |
+| 后端轮询 | — | ✅ 有 | 中（轮询开销） | 中 |
+| **双向协同取消（MyClaw）** | **cancel API + abort** | **✅ 有** | **低（即时中断）** | **中** |
+
+### 面试展示要点
+
+> "Agent 循环可能执行很久，用户点'停止'时不能只是前端断开 SSE——后端还在跑。我设计了双向协同取消：前端先调 /chat/cancel 通知后端，CancellationToken 在 ReAct 循环的三个检查点（迭代开头、LLM 流中、工具执行前）检测取消信号并 break。后端还会检测 SSE 断开自动触发取消。取消后正常保存历史，不丢失上下文。"
+
+---
+
+## 13. 多模态 Token 估算与自适应压缩
 
 ### 设计动机
 
@@ -689,18 +875,18 @@ strategies = [
 
 ---
 
-## 13. 面试展示策略
+## 14. 面试展示策略
 
 ### 推荐展示顺序（15 分钟 talk）
 
 | 时间 | 内容 | 目的 |
 |------|------|------|
 | 0-2 min | 项目定位 + 架构全景图 | 建立整体印象 |
-| 2-5 min | **流式工具调用提前执行**（画时序图） | 展示对延迟优化的深度思考 |
+| 2-5 min | **流式工具调用提前执行 + 只读并行**（画时序图） | 展示对延迟优化的深度思考 |
 | 5-8 min | **Context Guard 三级路由** | 展示系统设计能力 |
 | 8-10 min | **错误分类重试 + 指数退避** | 展示工程严谨性 |
-| 10-12 min | **记忆系统四层设计** | 展示产品思维 |
-| 12-13 min | **SubAgent + Task 依赖管理** | 展示架构扩展性 |
+| 10-12 min | **记忆系统四层设计 + 自动注入** | 展示产品思维 |
+| 12-13 min | **Agent 循环可中断 + SubAgent** | 展示架构扩展性与用户体验 |
 | 13-15 min | 优化方向 + 学习收获 | 展示反思能力 |
 
 ### 核心原则
@@ -714,7 +900,7 @@ strategies = [
 
 ### 一句话总结
 
-> 这个项目最大的亮点不是"做了什么功能"，而是"**在功能背后的工程决策**"——流式提前执行、三级路由、错误分类重试、破坏性截断的取舍，每一个都体现了对"Agent 如何在生产环境可靠运行"的深度思考。
+> 这个项目最大的亮点不是"做了什么功能"，而是"**在功能背后的工程决策**"——流式提前执行、只读工具并行、三级路由、错误分类重试、记忆自动注入、双向协同取消、破坏性截断的取舍，每一个都体现了对"Agent 如何在生产环境可靠运行"的深度思考。
 
 ---
 

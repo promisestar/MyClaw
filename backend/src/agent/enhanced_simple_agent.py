@@ -23,6 +23,7 @@ from ..core.timeouts import TimeoutConfig
 # 导入 HelloClaw 专用 LLM（支持流式工具调用）
 from .enhanced_llm import EnhancedHelloAgentsLLM, StreamToolEventType
 from .retry_executor import RetryExecutor, RetryResult, classify_error, compute_retry_delay
+from .cancel_token import CancellationToken
 
 from ..logging.tool_logger import ToolCallLogger, get_trace_id
 
@@ -602,8 +603,108 @@ class EnhancedSimpleAgent(SimpleAgent):
         })
         tool_results_by_id[tool_call_id] = exec_result
 
-    def run(self, input_text: str, **kwargs) -> str:
-        """同步运行；每轮工具迭代重建 tool_schemas（支持 MCP 渐进披露）。"""
+    async def _execute_tools_batch(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        tracked_temp_files: Set[Path],
+        tool_call_records: List[Dict[str, Any]],
+        tool_results_by_id: Dict[str, str],
+        cancel_token: Optional[CancellationToken] = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """批量执行工具调用，无副作用工具并行，有副作用工具串行。
+
+        基于 has_side_effects 元数据自动决策：
+        - has_side_effects=False 的工具用 asyncio 并行执行
+        - has_side_effects=True 的工具保持串行执行
+
+        Args:
+            tool_calls: 已过滤、已解析参数的工具调用列表，
+                        每项形如 {"name": str, "id": str, "arguments": dict}
+            tracked_temp_files: 临时文件追踪集合
+            tool_call_records: 工具调用记录列表（会被追加）
+            tool_results_by_id: 工具结果映射（会被追加）
+            cancel_token: 取消令牌
+        """
+        if not tool_calls:
+            return
+
+        # 1. 基于 has_side_effects 分组
+        parallel_calls: List[Dict[str, Any]] = []
+        serial_calls: List[Dict[str, Any]] = []
+        for tc in tool_calls:
+            tool_name = tc["name"]
+            tool = self.tool_registry.get_tool(tool_name) if self.tool_registry else None
+            has_side_effects = getattr(tool, "has_side_effects", True) if tool else True
+            if has_side_effects:
+                serial_calls.append(tc)
+            else:
+                parallel_calls.append(tc)
+
+        # 2. 并行执行无副作用工具
+        if len(parallel_calls) == 1:
+            # 只有一个工具，无需并行开销
+            tc = parallel_calls[0]
+            async for event in self._yield_tool_call_execution(
+                tool_name=tc["name"],
+                tool_call_id=tc["id"],
+                arguments=tc["arguments"],
+                tracked_temp_files=tracked_temp_files,
+                tool_call_records=tool_call_records,
+                tool_results_by_id=tool_results_by_id,
+            ):
+                yield event
+        elif len(parallel_calls) > 1:
+            print(f"⚡ 并行执行 {len(parallel_calls)} 个无副作用工具: "
+                  f"{[tc['name'] for tc in parallel_calls]}")
+            queue: asyncio.Queue = asyncio.Queue()
+
+            async def _run_one(tc: Dict[str, Any]):
+                try:
+                    async for event in self._yield_tool_call_execution(
+                        tool_name=tc["name"],
+                        tool_call_id=tc["id"],
+                        arguments=tc["arguments"],
+                        tracked_temp_files=tracked_temp_files,
+                        tool_call_records=tool_call_records,
+                        tool_results_by_id=tool_results_by_id,
+                    ):
+                        await queue.put(event)
+                except Exception as exc:
+                    print(f"⚠️ 并行工具执行异常 ({tc['name']}): {exc}")
+                finally:
+                    await queue.put(None)  # 完成标记
+
+            tasks = [asyncio.create_task(_run_one(tc)) for tc in parallel_calls]
+            pending = len(tasks)
+            while pending > 0:
+                event = await queue.get()
+                if event is None:
+                    pending -= 1
+                else:
+                    yield event
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 3. 串行执行有副作用工具
+        for tc in serial_calls:
+            if cancel_token and cancel_token.is_cancelled:
+                break
+            async for event in self._yield_tool_call_execution(
+                tool_name=tc["name"],
+                tool_call_id=tc["id"],
+                arguments=tc["arguments"],
+                tracked_temp_files=tracked_temp_files,
+                tool_call_records=tool_call_records,
+                tool_results_by_id=tool_results_by_id,
+            ):
+                yield event
+
+    def run(self, input_text: str, *, cancel_token: Optional[CancellationToken] = None, **kwargs) -> str:
+        """同步运行；每轮工具迭代重建 tool_schemas（支持 MCP 渐进披露）。
+
+        Args:
+            input_text: 用户输入
+            cancel_token: 取消令牌，用于中断 Agent 循环
+        """
         from datetime import datetime as dt
         from hello_agents.observability import TraceLogger
 
@@ -651,6 +752,9 @@ class EnhancedSimpleAgent(SimpleAgent):
         final_response = ""
 
         while current_iteration < self.max_tool_iterations:
+            if cancel_token and cancel_token.is_cancelled:
+                print(f"⏹️ Agent 执行被取消（同步第 {current_iteration} 轮）")
+                break
             current_iteration += 1
             tool_schemas = self._build_tool_schemas()
             print(
@@ -738,6 +842,8 @@ class EnhancedSimpleAgent(SimpleAgent):
             })
 
             for tool_call in tool_calls:
+                if cancel_token and cancel_token.is_cancelled:
+                    break
                 tool_name = tool_call.function.name
                 tool_call_id = tool_call.id
                 try:
@@ -813,6 +919,8 @@ class EnhancedSimpleAgent(SimpleAgent):
     async def arun_stream_with_tools(
         self,
         input_text: str,
+        *,
+        cancel_token: Optional[CancellationToken] = None,
         **kwargs
     ) -> AsyncGenerator[StreamEvent, None]:
         """异步流式运行（支持工具调用）
@@ -822,6 +930,7 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         Args:
             input_text: 用户输入
+            cancel_token: 取消令牌，用于中断 Agent 循环
             **kwargs: 其他参数
 
         Yields:
@@ -896,6 +1005,9 @@ class EnhancedSimpleAgent(SimpleAgent):
             tool_call_records: List[Dict[str, Any]] = []
 
             while current_iteration < self.max_tool_iterations:
+                if cancel_token and cancel_token.is_cancelled:
+                    print(f"⏹️ Agent 执行被取消（第 {current_iteration} 轮）")
+                    break
                 current_iteration += 1
 
                 tool_schemas = self._build_tool_schemas()
@@ -942,6 +1054,12 @@ class EnhancedSimpleAgent(SimpleAgent):
                             **kwargs
                         ):
                             events_received = True
+
+                            # 取消检查：LLM 流式输出过程中也可及时中断
+                            if cancel_token and cancel_token.is_cancelled:
+                                print("\n⏹️ LLM 流式输出被取消")
+                                break
+
                             # 处理文本内容
                             if event.event_type == StreamToolEventType.CONTENT:
                                 yield StreamEvent.create(
@@ -1002,23 +1120,26 @@ class EnhancedSimpleAgent(SimpleAgent):
                                     yield tool_event
 
                             elif event.event_type == StreamToolEventType.FINISH:
+                                # 收集所有参数已完整但尚未执行的工具调用，批量执行
+                                ready_calls: List[Dict[str, Any]] = []
                                 for idx in sorted(pending_tools.keys()):
                                     tc_state = pending_tools[idx]
                                     if tc_state.get("executed"):
                                         continue
-                                    async for tool_event in self._try_execute_ready_tool(
-                                        tc_state,
-                                        tracked_temp_files,
-                                        iteration_tool_records,
-                                        tool_results_by_id,
-                                        executed_ids,
-                                    ):
-                                        yield tool_event
-                                    if tc_state.get("executed"):
-                                        continue
+
                                     tool_call_id = tc_state.get("id") or ""
                                     tool_name = tc_state.get("name") or ""
-                                    if tool_call_id and tool_name:
+                                    args_str = tc_state.get("arguments", "")
+                                    if not tool_call_id or not tool_name:
+                                        continue
+
+                                    tc_state["executed"] = True
+                                    executed_ids.add(tool_call_id)
+
+                                    # 尝试解析参数
+                                    try:
+                                        arguments = json.loads(args_str)
+                                    except json.JSONDecodeError:
                                         async for tool_event in self._execute_tool_call_with_error(
                                             tool_name=tool_name,
                                             tool_call_id=tool_call_id,
@@ -1028,7 +1149,86 @@ class EnhancedSimpleAgent(SimpleAgent):
                                             executed_ids=executed_ids,
                                         ):
                                             yield tool_event
-                                        tc_state["executed"] = True
+                                        continue
+
+                                    # 去重检查
+                                    dedup_key = f"{tool_name}:{args_str}"
+                                    if dedup_key in self._tool_call_dedup:
+                                        skip_msg = f"⚠️ 重复调用已跳过（同一轮中已执行过相同参数的 {tool_name}）"
+                                        tool_results_by_id[tool_call_id] = skip_msg
+                                        iteration_tool_records.append({
+                                            "tool_call_id": tool_call_id,
+                                            "name": tool_name,
+                                            "args": arguments,
+                                            "result": skip_msg,
+                                            "status": "skipped_dedup"
+                                        })
+                                        yield StreamEvent.create(
+                                            StreamEventType.TOOL_CALL_START,
+                                            self.name,
+                                            tool_name=tool_name,
+                                            tool_call_id=tool_call_id,
+                                            args=arguments,
+                                        )
+                                        await asyncio.sleep(0)
+                                        yield StreamEvent.create(
+                                            StreamEventType.TOOL_CALL_FINISH,
+                                            self.name,
+                                            tool_name=tool_name,
+                                            tool_call_id=tool_call_id,
+                                            result=skip_msg,
+                                        )
+                                        continue
+
+                                    # 限量检查
+                                    if self._tools_executed_this_round >= self.max_tools_per_round:
+                                        skip_msg = (
+                                            f"⚠️ 已达到本轮工具调用上限({self.max_tools_per_round})，此调用被跳过。"
+                                        )
+                                        tool_results_by_id[tool_call_id] = skip_msg
+                                        iteration_tool_records.append({
+                                            "tool_call_id": tool_call_id,
+                                            "name": tool_name,
+                                            "args": arguments,
+                                            "result": skip_msg,
+                                            "status": "skipped_limit"
+                                        })
+                                        yield StreamEvent.create(
+                                            StreamEventType.TOOL_CALL_START,
+                                            self.name,
+                                            tool_name=tool_name,
+                                            tool_call_id=tool_call_id,
+                                            args=arguments,
+                                        )
+                                        await asyncio.sleep(0)
+                                        yield StreamEvent.create(
+                                            StreamEventType.TOOL_CALL_FINISH,
+                                            self.name,
+                                            tool_name=tool_name,
+                                            tool_call_id=tool_call_id,
+                                            result=skip_msg,
+                                        )
+                                        continue
+
+                                    # 加入批量执行列表
+                                    self._tool_call_dedup.add(dedup_key)
+                                    self._tools_executed_this_round += 1
+                                    ready_calls.append({
+                                        "name": tool_name,
+                                        "id": tool_call_id,
+                                        "arguments": arguments,
+                                    })
+
+                                # 批量执行（无副作用工具并行，有副作用串行）
+                                if ready_calls:
+                                    async for tool_event in self._execute_tools_batch(
+                                        tool_calls=ready_calls,
+                                        tracked_temp_files=tracked_temp_files,
+                                        tool_call_records=iteration_tool_records,
+                                        tool_results_by_id=tool_results_by_id,
+                                        cancel_token=cancel_token,
+                                    ):
+                                        yield tool_event
 
                         print()  # 换行
                         llm_stream_succeeded = True
@@ -1093,6 +1293,8 @@ class EnhancedSimpleAgent(SimpleAgent):
                     break
 
                 # 兜底：流结束后仍未执行的工具（如未收到 FINISH 事件）
+                # 先过滤、解析参数、限量检查，再批量执行（无副作用工具并行）
+                batch_calls: List[Dict[str, Any]] = []
                 for tc in complete_tool_calls:
                     tool_call_id = tc["id"]
                     if tool_call_id in executed_ids:
@@ -1141,17 +1343,25 @@ class EnhancedSimpleAgent(SimpleAgent):
                         )
                         continue
 
+                    # 加入批量执行列表
+                    batch_calls.append({
+                        "name": tool_name,
+                        "id": tool_call_id,
+                        "arguments": arguments,
+                    })
+                    executed_ids.add(tool_call_id)
                     self._tools_executed_this_round += 1
-                    async for tool_event in self._yield_tool_call_execution(
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        arguments=arguments,
+
+                # 批量执行（无副作用工具并行，有副作用工具串行）
+                if batch_calls:
+                    async for tool_event in self._execute_tools_batch(
+                        tool_calls=batch_calls,
                         tracked_temp_files=tracked_temp_files,
                         tool_call_records=iteration_tool_records,
                         tool_results_by_id=tool_results_by_id,
+                        cancel_token=cancel_token,
                     ):
                         yield tool_event
-                    executed_ids.add(tool_call_id)
 
                 tool_call_records.extend(iteration_tool_records)
 
