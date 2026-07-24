@@ -12,7 +12,7 @@
 
 import logging
 import os
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -90,6 +90,7 @@ class SkillInfo(BaseModel):
     description: str
     enabled: bool
     dir: str
+    source: str = "workspace"  # "global"（跨工作区共享）/ "workspace"（项目专属）
     has_venv: bool = False
     has_dependencies: bool = False
     python_path: Optional[str] = None
@@ -114,6 +115,7 @@ class ImportRequest(BaseModel):
     """导入技能请求"""
     source_type: str  # "path" 或 "git"
     source: str       # 目录路径或 Git URL
+    scope: Literal["global", "workspace"] = "workspace"  # "global"（用户级 ~/.helloclaw/skills/）或 "workspace"（项目级 .myclaw/skills/）
 
 
 class ImportResponse(BaseModel):
@@ -275,9 +277,9 @@ async def import_skill(request: ImportRequest):
     try:
         if request.source_type == "path":
             source = os.path.expanduser(source)
-            skill = loader.import_from_path(source)
+            skill = loader.import_from_path(source, scope=request.scope)
         elif request.source_type == "git":
-            skill = loader.import_from_git(source)
+            skill = loader.import_from_git(source, scope=request.scope)
         else:
             raise HTTPException(
                 status_code=400,
@@ -310,6 +312,7 @@ async def import_skill(request: ImportRequest):
             description=skill.description,
             enabled=True,
             dir=str(skill.dir),
+            source=request.scope,
             has_venv=skill.python_path is not None,
             has_dependencies=skill.has_dependencies,
             python_path=str(skill.python_path) if skill.python_path else None,

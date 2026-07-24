@@ -5,6 +5,8 @@ export interface SkillInfo {
   description: string
   enabled: boolean
   dir: string
+  /** 来源：global（跨工作区共享）/ workspace（项目专属） */
+  source?: string
   has_venv?: boolean
   has_dependencies?: boolean
   python_path?: string | null
@@ -70,10 +72,11 @@ export const skillsApi = {
     return api.delete(`/skills/${encodeURIComponent(name)}`)
   },
 
-  import: async (sourceType: 'path' | 'git', source: string) => {
+  import: async (sourceType: 'path' | 'git', source: string, scope: 'global' | 'workspace' = 'workspace') => {
     return api.post<{ message: string; skill?: SkillInfo }>('/skills/import', {
       source_type: sourceType,
       source,
+      scope,
     })
   },
 

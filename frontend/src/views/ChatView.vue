@@ -23,6 +23,7 @@ import UserMessageContent from '@/components/UserMessageContent.vue'
 import TaskCard from '@/components/TaskCard.vue'
 import TaskPanel from '@/components/TaskPanel.vue'
 import LobsterIcon from '@/assets/lobster.svg'
+import { useWorkspaceStore } from '@/stores/workspace'
 
 // 单文档大小硬上限（与后端 MULTIMODAL_DOC_MAX_BYTES 保持一致；超过即拒绝，不发起上传请求）
 const DOC_MAX_BYTES = 10 * 1024 * 1024
@@ -62,6 +63,9 @@ const SESSION_STORAGE_KEY = 'helloclaw.lastSessionId'
 
 // 助手名字（从后端获取）
 const assistantName = ref('HelloClaw')
+
+// 工作区 store（发送消息时附带当前 workspace_path）
+const workspaceStore = useWorkspaceStore()
 
 // 消息段类型
 interface TextSegment {
@@ -729,6 +733,18 @@ watch(currentSessionId, () => {
   void refreshContextUsage()
 })
 
+// 监听工作区切换：会话是工作区隔离的，切换后清空当前会话并创建新会话
+watch(
+  () => workspaceStore.current,
+  (newWs, oldWs) => {
+    if (oldWs && newWs && newWs !== oldWs) {
+      messages.value = []
+      currentSessionId.value = null
+      void createNewSession()
+    }
+  }
+)
+
 // 滚动到底部
 const scrollToBottom = async () => {
   await nextTick()
@@ -1134,6 +1150,7 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
         userTurnIndex: options.userTurnIndex,
         regenerate: options.regenerate,
         skill: options.skill,
+        workspacePath: workspaceStore.current || undefined,
         attachments: turnAttachments.length > 0
           ? turnAttachments.map<ChatAttachment>(a => ({
               stored_path: a.storedPath,

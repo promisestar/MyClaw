@@ -47,6 +47,8 @@ export interface SendMessageOptions {
   skill?: string
   /** 多模态附件列表（已通过 /upload/file 上传得到 stored_path） */
   attachments?: ChatAttachment[]
+  /** 工作区路径（指定后后端切换到该工作区再处理消息） */
+  workspacePath?: string
   signal?: AbortSignal
 }
 
@@ -84,7 +86,7 @@ export const chatApi = {
     onChunk: StreamCallback,
     options: SendMessageOptions = {}
   ): Promise<ChatResponse> => {
-    const { sessionId, userTurnIndex, regenerate, skill, attachments, signal } = options
+    const { sessionId, userTurnIndex, regenerate, skill, attachments, workspacePath, signal } = options
     const body: Record<string, unknown> = {
       message,
       session_id: sessionId,
@@ -98,6 +100,9 @@ export const chatApi = {
     }
     if (attachments && attachments.length > 0) {
       body.attachments = attachments
+    }
+    if (workspacePath) {
+      body.workspace_path = workspacePath
     }
 
     const response = await fetch(`${API_BASE}/api/chat/send/stream`, {

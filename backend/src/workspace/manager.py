@@ -1,29 +1,47 @@
-"""工作空间管理器"""
+"""工作空间管理器 (V2) — 仅管理项目工作区的 .myclaw/ 子目录。
+
+身份/人格文件（IDENTITY/SOUL/USER/BOOTSTRAP）已迁移到 IdentityManager，
+本模块只负责工作区级文件（AGENTS/HEARTBEAT）与子目录（sessions/tasks/uploads/skills）。
+所有工作区文件统一归拢到 `<workspace>/.myclaw/` 隐藏子目录，不污染项目根目录。
+"""
 
 import json
 import os
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-# 配置文件列表
-CONFIG_FILES = [
-    "BOOTSTRAP",
-    "IDENTITY",
-    "SOUL",
-    "USER",
-    "AGENTS",
-    "HEARTBEAT",
-]
-
-# 模板目录（相对于当前文件）
+# 模板目录（相对于当前文件：workspace/templates/）
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+# 工作区模板目录
+WORKSPACE_TEMPLATES_DIR = TEMPLATES_DIR / "workspace"
+
+# 工作区级 .myclaw/ 子目录
+WORKSPACE_SUBDIRS = ["sessions", "tasks", "uploads", "skills"]
+
+# 工作区级必需配置文件（不存在时从模板部署）
+WORKSPACE_CONFIG_FILES = ["AGENTS"]
+
+# 工作区级可选配置文件（不存在不报错，存在时从模板部署）
+WORKSPACE_OPTIONAL_FILES = ["HEARTBEAT"]
+
+# .gitignore 中自动追加的条目（幂等）
+_GITIGNORE_ENTRIES = [
+    "# MyClaw Agent 工作区文件 (自动生成)",
+    ".myclaw/sessions/",
+    ".myclaw/tasks/",
+    ".myclaw/uploads/",
+    ".myclaw/HEARTBEAT.md",
+    "# 以下文件可选择提交到 Git 以与团队共享：",
+    "# .myclaw/AGENTS.md      <- 项目行为规范，可选择性提交",
+    "# .myclaw/skills/         <- 项目专属 Skill，可选择性提交",
+]
 
 
 def get_default_global_config() -> dict:
-    """获取默认全局配置（从模板文件读取）"""
+    """获取默认全局配置（从模板文件读取）。"""
     template_path = TEMPLATES_DIR / "config.json"
     if template_path.exists():
         with open(template_path, "r", encoding="utf-8") as f:
@@ -35,27 +53,46 @@ def get_default_global_config() -> dict:
 
 
 class WorkspaceManager:
-    """工作空间管理器
+    """管理单个项目工作区的 .myclaw/ 子目录。
 
     负责：
-    - 创建和管理工作空间目录结构
-    - 加载和保存配置文件
-    - 管理记忆文件（每日记忆、长期记忆）
+    - 创建和管理 .myclaw/ 目录结构（sessions/tasks/uploads/skills）
+    - 加载和保存工作区级配置文件（AGENTS.md / HEARTBEAT.md）
+    - 全局 config.json 的读取（LLM/MCP 配置，与工作区无关）
     """
 
     def __init__(self, workspace_path: str):
-        """初始化工作空间管理器
+        """初始化工作空间管理器。
 
         Args:
-            workspace_path: 工作空间根目录路径
+            workspace_path: 项目工作区根目录路径
         """
-        self.workspace_path = os.path.expanduser(workspace_path)
-        self.sessions_path = os.path.join(self.workspace_path, "sessions")
+        self.workspace_path = os.path.abspath(os.path.expanduser(workspace_path))
+        # 所有 Agent 文件归拢到 .myclaw/ 隐藏子目录
+        self.claw_dir = os.path.join(self.workspace_path, ".myclaw")
+
+    # ==================== 路径属性 ====================
+
+    @property
+    def sessions_path(self) -> str:
+        return os.path.join(self.claw_dir, "sessions")
+
+    @property
+    def tasks_path(self) -> str:
+        return os.path.join(self.claw_dir, "tasks")
+
+    @property
+    def uploads_path(self) -> str:
+        return os.path.join(self.claw_dir, "uploads")
+
+    @property
+    def skills_path(self) -> str:
+        return os.path.join(self.claw_dir, "skills")
 
     # ==================== 全局配置读取 ====================
 
     def load_global_config(self) -> dict:
-        """加载全局 config.json
+        """加载全局 config.json（~/.helloclaw/config.json，与工作区无关）。
 
         Returns:
             配置字典，如果文件不存在返回空字典
@@ -70,12 +107,9 @@ class WorkspaceManager:
         return {}
 
     def get_llm_config(self) -> dict:
-        """获取 LLM 配置
+        """获取 LLM 配置。
 
         优先级：config.json 非空值 > 环境变量 > 默认值
-
-        Returns:
-            包含 model_id, api_key, base_url 的字典
         """
         global_config = self.load_global_config()
         llm_config = global_config.get("llm", {})
@@ -87,26 +121,7 @@ class WorkspaceManager:
         }
 
     def get_mcp_config(self) -> Dict[str, Any]:
-        """读取 MCP 工具相关配置（来自 ~/.helloclaw/config.json 的 `mcp` 段）。
-
-        字段说明：
-        - enabled: 是否注册任何 MCP 工具（默认 True）
-        - builtin_demo: 当 servers 为空时，是否注册内置演示 MCPTool（默认 True）
-        - servers: 外部 MCP 服务列表；非空时按条目各注册一个 MCPTool（此时不再注册内置演示，除非自行再加一条）
-
-        每条 server 支持：
-        - name: 工具注册名（建议唯一，如 github、fs）
-        - server_url: 远程 MCP 地址（推荐 GitHub 托管：https://api.githubcopilot.com/mcp/）
-        - server_command: 本地启动命令，如 ["npx","-y","@modelcontextprotocol/server-github"]
-          （与 server_url 二选一；GitHub 场景请优先 server_url，工具更全）
-        - transport_type: 远程传输类型，http（默认）或 sse
-        - headers: 远程 MCP 请求头（也可用 env_keys 自动注入 Bearer PAT）
-        - server_args: 可选附加参数列表
-        - env: 可选，传给子进程的环境变量字典
-        - env_keys: 可选，从当前进程环境读取的变量名列表
-        - auto_expand: 可选，是否启动时全量展开远端工具（默认 False，渐进披露）
-        - 渐进披露：auto_expand=false 时通过 action=enable_tools 按需注册 mcp_{name}_* 子工具
-        """
+        """读取 MCP 工具相关配置（来自 ~/.helloclaw/config.json 的 `mcp` 段）。"""
         defaults: Dict[str, Any] = {
             "enabled": True,
             "builtin_demo": True,
@@ -122,13 +137,7 @@ class WorkspaceManager:
         return merged
 
     def ensure_global_config_exists(self) -> None:
-        """若不存在则创建全局配置文件 ~/.helloclaw/config.json。
-
-        工作区内的 AGENTS.md 等与「全局」config.json 是两套配置：前者在 workspace 目录，
-        后者供 LLM/MCP 等读取；首次初始化工作区时应一并生成，便于用户编辑。
-
-        若文件已存在则不做覆盖，避免丢失用户修改。
-        """
+        """若不存在则创建全局配置文件 ~/.helloclaw/config.json（不覆盖已有）。"""
         config_path = os.path.expanduser("~/.helloclaw/config.json")
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         if os.path.exists(config_path):
@@ -140,62 +149,87 @@ class WorkspaceManager:
         except OSError as e:
             print(f"⚠️ 无法写入全局配置 {config_path}: {e}")
 
-    # ==================== 入职状态检测 ====================
+    # ==================== 工作区部署 ====================
 
-    def is_onboarding_completed(self) -> bool:
-        """检查入职是否完成
+    def _deploy_from_template(self, name: str):
+        """从 workspace 模板部署单个文件到 .myclaw/（不覆盖已有）。
 
-        入职完成的标志：BOOTSTRAP.md 不存在。
-        同时会检查身份是否已确定，如果是则自动删除 BOOTSTRAP.md。
-
-        Returns:
-            入职是否已完成
+        Args:
+            name: 配置文件名（不含 .md 后缀）
         """
-        # 先检查是否需要删除 BOOTSTRAP（身份已确定但文件还在）
-        self._check_and_delete_bootstrap()
+        target = os.path.join(self.claw_dir, f"{name}.md")
+        if os.path.exists(target):
+            return
+        src = WORKSPACE_TEMPLATES_DIR / f"{name}.md"
+        if src.exists():
+            with open(src, "r", encoding="utf-8") as f:
+                content = f.read()
+            # 替换日期占位符
+            content = content.replace("{date}", datetime.now().strftime("%Y-%m-%d"))
+            os.makedirs(self.claw_dir, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"📝 已从模板部署: {target}")
+        else:
+            # 模板缺失时跳过（工作区配置文件是可选的）
+            print(f"⚠️ 模板不存在，跳过部署: {src}")
 
-        return not os.path.exists(self.get_config_path("BOOTSTRAP"))
+    def ensure_project_workspace(self):
+        """Phase 2 部署：确保 .myclaw/ 目录结构存在。
 
-    def ensure_workspace_exists(self):
-        """确保工作空间存在
-
-        如果工作空间不存在，创建默认目录和配置文件
+        每次切换到新工作区时调用（首次部署模板文件，后续仅确保目录存在）。
         """
-        # 全局配置（~/.helloclaw/config.json）与 workspace 内 *.md 分开管理；首次一并创建
-        self.ensure_global_config_exists()
+        # 创建 .myclaw/ 子目录
+        for subdir in WORKSPACE_SUBDIRS:
+            os.makedirs(os.path.join(self.claw_dir, subdir), exist_ok=True)
 
-        # 创建目录
-        os.makedirs(self.workspace_path, exist_ok=True)
-        os.makedirs(self.sessions_path, exist_ok=True)
+        # 部署必需的工作区配置文件
+        for name in WORKSPACE_CONFIG_FILES:
+            self._deploy_from_template(name)
 
-        # 创建默认配置文件
-        for config_name in CONFIG_FILES:
-            config_path = self.get_config_path(config_name)
-            if not os.path.exists(config_path):
-                self._create_default_config(config_name)
+        # 部署可选配置文件
+        for name in WORKSPACE_OPTIONAL_FILES:
+            self._deploy_from_template(name)
 
-        # 检查是否需要删除 BOOTSTRAP（遗留工作空间迁移）
-        self._check_and_delete_bootstrap()
+        # 自动注入 .gitignore
+        self._ensure_gitignore()
+
+    def _ensure_gitignore(self):
+        """幂等追加 .myclaw/ 相关条目到项目根目录的 .gitignore。"""
+        gitignore_path = os.path.join(self.workspace_path, ".gitignore")
+        existing = ""
+        if os.path.exists(gitignore_path):
+            with open(gitignore_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+
+        # 找出尚未存在的条目
+        missing = [line for line in _GITIGNORE_ENTRIES if line not in existing]
+        if not missing:
+            return
+
+        # 追加（前面确保有空行分隔）
+        with open(gitignore_path, "a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            if existing and not existing.endswith("\n\n"):
+                f.write("\n")
+            f.write("\n".join(missing) + "\n")
+        print(f"📝 已更新 .gitignore: {gitignore_path}")
+
+    # ==================== 工作区配置读写 ====================
 
     def get_config_path(self, name: str) -> str:
-        """获取配置文件路径
+        """获取工作区配置文件路径（.myclaw/<name>.md）。"""
+        return os.path.join(self.claw_dir, f"{name}.md")
+
+    def load_config(self, name: str) -> Optional[str]:
+        """加载工作区配置文件内容。
 
         Args:
             name: 配置文件名称（不含扩展名）
 
         Returns:
-            配置文件完整路径
-        """
-        return os.path.join(self.workspace_path, f"{name}.md")
-
-    def load_config(self, name: str) -> Optional[str]:
-        """加载配置文件内容
-
-        Args:
-            name: 配置文件名称
-
-        Returns:
-            配置文件内容，如果不存在返回 None
+            配置文件内容，如果不存在返回 None（工作区 AGENTS.md 是可选的）
         """
         config_path = self.get_config_path(name)
         if os.path.exists(config_path):
@@ -204,101 +238,45 @@ class WorkspaceManager:
         return None
 
     def save_config(self, name: str, content: str):
-        """保存配置文件
-
-        Args:
-            name: 配置文件名称
-            content: 配置文件内容
-        """
+        """保存工作区配置文件。"""
+        os.makedirs(self.claw_dir, exist_ok=True)
         config_path = self.get_config_path(name)
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        # 如果保存的是 IDENTITY，检查是否需要删除 BOOTSTRAP
-        if name == "IDENTITY":
-            self._check_and_delete_bootstrap()
-
     def list_configs(self) -> list:
-        """列出所有配置文件
-
-        Returns:
-            配置文件名称列表
-        """
+        """列出当前工作区 .myclaw/ 下已存在的配置文件名。"""
         configs = []
-        for name in CONFIG_FILES:
-            config_path = self.get_config_path(name)
-            if os.path.exists(config_path):
+        for name in WORKSPACE_CONFIG_FILES + WORKSPACE_OPTIONAL_FILES:
+            if os.path.exists(self.get_config_path(name)):
                 configs.append(name)
         return configs
 
-    def _check_and_delete_bootstrap(self):
-        """检查身份是否已确定，如果是则删除 BOOTSTRAP.md"""
-        bootstrap_path = self.get_config_path("BOOTSTRAP")
+    # ==================== 重置与清理 ====================
 
-        # BOOTSTRAP 不存在，无需处理
-        if not os.path.exists(bootstrap_path):
-            return
-
-        # 检查身份是否已确定
-        if self._is_identity_established():
-            os.remove(bootstrap_path)
-
-    def _is_identity_established(self) -> bool:
-        """检查身份是否已确定（名称字段有实际内容）
-
-        Returns:
-            身份是否已确定
-        """
-        identity = self.load_config("IDENTITY")
-        if not identity:
-            return False
-
-        # 尝试匹配名称字段
-        # 格式: - **名称：** xxx 或 - **名称:** xxx
-        match = re.search(r'\*\*名称[：:]\*\*\s*(.+?)(?:\n|$)', identity)
-        if match:
-            name = match.group(1).strip()
-            # 如果名称不是占位符，则认为身份已确定
-            # 占位符特征：以下划线开头、包含"选一个"、包含"（"
-            if name and not name.startswith('_') and '选一个' not in name and '（' not in name:
-                return True
-
-        return False
-
-    def _create_default_config(self, name: str):
-        """创建默认配置文件
-
-        从模板文件读取内容，如果模板不存在则使用基础模板
-
-        Args:
-            name: 配置文件名称
-        """
-        template_path = TEMPLATES_DIR / f"{name}.md"
-
-        if template_path.exists():
-            with open(template_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        else:
-            # 回退到基础模板
-            content = f"# {name}\n\n（待配置）"
-
-        # 替换日期占位符
-        content = content.replace("{date}", datetime.now().strftime("%Y-%m-%d"))
-
-        self.save_config(name, content)
+    def _clear_sessions(self):
+        """清除 .myclaw/sessions/ 下所有会话。"""
+        if os.path.exists(self.sessions_path):
+            for filename in os.listdir(self.sessions_path):
+                if filename.endswith(".json"):
+                    filepath = os.path.join(self.sessions_path, filename)
+                    os.remove(filepath)
 
     def reset_to_templates(self, reset_sessions: bool = False, reset_global_config: bool = False):
-        """重置工作空间到初始模板
+        """重置当前工作区的 .myclaw/ 配置文件到初始模板。
 
         Args:
             reset_sessions: 是否清除会话
-            reset_global_config: 是否重置全局配置
+            reset_global_config: 是否重置全局配置（~/.helloclaw/config.json）
 
-        警告：这将覆盖所有配置文件！
+        警告：这将覆盖工作区配置文件！
         """
-        # 重置配置文件（包括 BOOTSTRAP）
-        for config_name in CONFIG_FILES:
-            self._create_default_config(config_name)
+        # 重置工作区配置文件
+        for name in WORKSPACE_CONFIG_FILES + WORKSPACE_OPTIONAL_FILES:
+            target = os.path.join(self.claw_dir, f"{name}.md")
+            if os.path.exists(target):
+                os.remove(target)
+            self._deploy_from_template(name)
 
         # 清除会话
         if reset_sessions:
@@ -308,18 +286,9 @@ class WorkspaceManager:
         if reset_global_config:
             self._reset_global_config()
 
-    def _clear_sessions(self):
-        """清除所有会话"""
-        if os.path.exists(self.sessions_path):
-            for filename in os.listdir(self.sessions_path):
-                if filename.endswith(".json"):
-                    filepath = os.path.join(self.sessions_path, filename)
-                    os.remove(filepath)
-
     def _reset_global_config(self):
-        """重置全局配置文件"""
+        """重置全局配置文件。"""
         config_path = os.path.expanduser("~/.helloclaw/config.json")
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
-
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(get_default_global_config(), f, indent=2, ensure_ascii=False)

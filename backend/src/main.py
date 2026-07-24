@@ -13,11 +13,12 @@ load_dotenv()
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
-from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health
+from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health, workspace
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
@@ -47,18 +48,18 @@ async def lifespan(app: FastAPI):
     # 启动时初始化
     print("HelloClaw Backend starting...")
 
-    # 初始化工作空间
-    workspace_path = os.getenv("WORKSPACE_PATH", "~/.helloclaw/workspace")
-    workspace = WorkspaceManager(workspace_path)
-    workspace.ensure_workspace_exists()
-    print(f"Workspace initialized at: {workspace.workspace_path}")
+    # 初始化工作空间（home_path 基座 + workspace_path 默认工作区分离）
+    home_path = os.getenv("AGENT_HOME", "~/.helloclaw")
+    workspace_path = os.getenv("WORKSPACE_PATH", "~")
+    print(f"Agent home: {os.path.expanduser(home_path)}")
 
-    # 设置全局 workspace 实例
-    config.set_workspace(workspace)
-
-    # 初始化全局 Agent 实例
-    _agent = MyClawAgent(workspace_path=workspace_path)
+    # 初始化全局 Agent 实例（构造函数内完成 Phase 1 identity 部署 + Phase 2 工作区部署）
+    _agent = MyClawAgent(home_path=home_path, workspace_path=workspace_path)
+    print(f"Workspace initialized at: {_agent.current_workspace}")
     print("MyClawAgent initialized")
+
+    # 设置全局 workspace 实例（指向 agent 当前工作区，供 config API 兼容）
+    config.set_workspace(_agent.workspace)
 
     # 将 memory_store 传递给 API 模块
     if hasattr(_agent, "_memory_store") and _agent._memory_store:
@@ -175,29 +176,40 @@ app.include_router(skills.router, prefix="/api")
 app.include_router(agent.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
 app.include_router(health.router, prefix="/api")
+app.include_router(workspace.router, prefix="/api")
 
 
-# 多模态：当 MULTIMODAL_IMAGE_MODE=url 时挂载 /files 静态资源，仅暴露 workspace/uploads
-def _mount_uploads_static(application: FastAPI) -> None:
+# 多模态：当 MULTIMODAL_IMAGE_MODE=url 时注册 /files 动态路由，从当前工作区 uploads 读取
+def _register_uploads_route(application: FastAPI) -> None:
     mode = (os.getenv("MULTIMODAL_IMAGE_MODE", "base64").strip().lower())
     if mode != "url":
         return
     public_base_url = (os.getenv("MULTIMODAL_PUBLIC_BASE_URL", "").strip())
     if not public_base_url:
-        print("⚠️ MULTIMODAL_IMAGE_MODE=url 但未配置 MULTIMODAL_PUBLIC_BASE_URL，跳过 /files 挂载")
+        print("⚠️ MULTIMODAL_IMAGE_MODE=url 但未配置 MULTIMODAL_PUBLIC_BASE_URL，跳过 /files 路由")
         return
-    workspace_path = os.path.expanduser(os.getenv("WORKSPACE_PATH", "~/.helloclaw/workspace"))
-    uploads_dir = Path(workspace_path) / "uploads"
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    application.mount(
-        "/files",
-        StaticFiles(directory=str(uploads_dir), check_dir=False),
-        name="uploads",
-    )
-    print(f"📁 多模态静态资源已挂载: /files → {uploads_dir}")
+
+    @application.get("/files/{file_path:path}")
+    async def serve_upload(file_path: str):
+        """从当前工作区的 uploads 目录提供文件（切换工作区后自动指向新目录）。"""
+        agent = get_agent()
+        if not agent:
+            raise HTTPException(status_code=503, detail="Agent not initialized")
+        uploads_dir = Path(agent.workspace.uploads_path).resolve()
+        target = (uploads_dir / file_path).resolve()
+        # 防路径遍历：确保目标在 uploads 目录内
+        try:
+            target.relative_to(uploads_dir)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(str(target))
+
+    print(f"📁 多模态静态资源路由已注册: /files → <workspace>/.myclaw/uploads")
 
 
-_mount_uploads_static(app)
+_register_uploads_route(app)
 
 
 @app.get("/api")

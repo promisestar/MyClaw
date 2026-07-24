@@ -51,6 +51,8 @@ class ChatRequest(BaseModel):
     skill: Optional[str] = None
     # 多模态附件列表（图片走 VLM image_url；文档抽取为 text 注入）
     attachments: List[Attachment] = Field(default_factory=list)
+    # 工作区路径（可选，指定后切换到该工作区再处理消息）
+    workspace_path: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -101,6 +103,12 @@ async def send_message_sync(request: ChatRequest):
     lock = get_agent_lock()
     if lock:
         async with lock:
+            # 切换工作区（在锁内执行，避免与正在进行的对话竞态）
+            if request.workspace_path:
+                try:
+                    agent.bind_workspace(request.workspace_path)
+                except ValueError as e:
+                    return ChatResponse(content=f"工作区切换失败: {e}", session_id=request.session_id)
             response = agent.chat(
                 message,
                 request.session_id,
@@ -109,6 +117,11 @@ async def send_message_sync(request: ChatRequest):
                 attachments=attachments,
             )
     else:
+        if request.workspace_path:
+            try:
+                agent.bind_workspace(request.workspace_path)
+            except ValueError as e:
+                return ChatResponse(content=f"工作区切换失败: {e}", session_id=request.session_id)
         response = agent.chat(
             message,
             request.session_id,
@@ -267,12 +280,26 @@ async def send_message_stream(request: ChatRequest, http_request: Request):
                         }
                         break
 
+            async def _do_stream():
+                # 切换工作区（在锁内执行，避免与正在进行的对话竞态）
+                if request.workspace_path:
+                    try:
+                        agent.bind_workspace(request.workspace_path)
+                    except ValueError as e:
+                        yield {
+                            "event": "error",
+                            "data": json.dumps({"error": f"工作区切换失败: {e}"}, ensure_ascii=False)
+                        }
+                        return
+                async for item in _consume_stream():
+                    yield item
+
             if lock:
                 async with lock:
-                    async for item in _consume_stream():
+                    async for item in _do_stream():
                         yield item
             else:
-                async for item in _consume_stream():
+                async for item in _do_stream():
                     yield item
 
         except Exception as e:

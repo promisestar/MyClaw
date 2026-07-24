@@ -32,6 +32,7 @@ from hello_agents.tools import (
 )
 
 from ..workspace.manager import WorkspaceManager
+from ..workspace.identity import IdentityManager
 from ..tools import MemoryTool, BashTool, WebSearchTool, WebFetchTool, RAGTool, MCPTool
 from ..tools.builtin.mcp_tool import reset_all_mcp_disclosed_tools
 from ..tools.builtin.skill_tool import SkillTool
@@ -56,7 +57,8 @@ class MyClawAgent:
 
     def __init__(
         self,
-        workspace_path: str = None,
+        home_path: str = "~/.helloclaw",
+        workspace_path: str = "~",
         name: str = None,
         model_id: str = None,
         api_key: str = None,
@@ -67,7 +69,8 @@ class MyClawAgent:
         """初始化 HelloClaw Agent
 
         Args:
-            workspace_path: 工作空间路径，默认 ~/.helloclaw/workspace
+            home_path: Agent 基座目录，默认 ~/.helloclaw（进程固定，永不可切换）
+            workspace_path: 默认工作区路径，默认 ~（用户家目录）
             name: Agent 名称（从 IDENTITY.md 读取，无需手动指定）
             model_id: LLM 模型 ID
             api_key: API Key
@@ -75,14 +78,31 @@ class MyClawAgent:
             max_tool_iterations: 最大工具调用迭代次数
             max_tool_retries: 工具调用失败最大重试次数（None=从 config.json 读取，默认 2）
         """
-        # 确保 workspace_path 正确展开 ~/
-        self.workspace_path = os.path.expanduser(workspace_path or "~/.helloclaw/workspace")
+        # Agent 基座目录（进程固定，存放 identity/全局配置）
+        self.home_path = os.path.expanduser(home_path)
 
-        # 初始化工作空间管理器
-        self.workspace = WorkspaceManager(self.workspace_path)
+        # Phase 1：初始化身份管理器并部署 identity 基座（含 V1→V2 迁移）
+        self.identity = IdentityManager(self.home_path)
+        old_ws = os.path.expanduser("~/.helloclaw/workspace")
+        self.identity.ensure_exists(
+            old_workspace=old_ws if os.path.isdir(old_ws) else None
+        )
 
-        # 确保工作空间存在
-        self.workspace.ensure_workspace_exists()
+        # 确保基座 AGENTS.md fallback 存在（工作区无 AGENTS.md 时的 prompt 骨架）
+        self._ensure_base_agents_md()
+
+        # 当前工作区（运行时可通过 bind_workspace 切换）
+        self._current_workspace = os.path.abspath(
+            os.path.expanduser(workspace_path or "~")
+        )
+
+        # 初始化工作空间管理器（管理 .myclaw/ 子目录）
+        self.workspace = WorkspaceManager(self._current_workspace)
+        self.workspace.ensure_global_config_exists()
+        self.workspace.ensure_project_workspace()  # Phase 2 部署
+
+        # 保留 workspace_path 属性（供 SubAgentOrchestrator 等外部引用，指向当前工作区）
+        self.workspace_path = self._current_workspace
 
         # 编辑/重新生成时暂存该轮之后的对话，跑完新回复后再拼回
         self._resend_suffix: List[Message] = []
@@ -90,7 +110,7 @@ class MyClawAgent:
         # 加载模块级超时配置（env > config.json > 默认值）
         self._timeout_config = get_timeout_config()
 
-        # 从 IDENTITY.md 读取名称，如果没有则使用默认值
+        # 从 IDENTITY.md 读取名称（从基座 identity 目录），如果没有则使用默认值
         self.name = name or self._read_identity_name() or "HelloClaw"
 
         # 保存传入的参数（用于热加载时的优先级判断）
@@ -122,7 +142,7 @@ class MyClawAgent:
         # 初始化配置
         self.config = Config(
             session_enabled=True,
-            session_dir=os.path.join(self.workspace_path, "sessions"),
+            session_dir=self.workspace.sessions_path,
             compression_threshold=0.8,
             min_retain_rounds=10,
             enable_smart_compression=False,
@@ -135,9 +155,11 @@ class MyClawAgent:
             subagent_enabled=False,  # 使用自实现的 SubAgentOrchestrator（不依赖 hello_agents）
         )
 
-        # 初始化自实现的 Skill 系统
+        # 初始化自实现的 Skill 系统（支持全局 + 工作区双目录）
+        global_skills_dir = Path(self.home_path) / "skills"
         self.skill_loader = SkillLoader(
-            skills_dir=Path(os.path.join(self.workspace_path, "skills"))
+            skills_dir=Path(self.workspace.skills_path),
+            global_dir=global_skills_dir,
         )
 
         # 初始化 MemoryVectorStore（长期记忆的 Qdrant 存储层）
@@ -148,8 +170,7 @@ class MyClawAgent:
         self._subagent_orchestrator = None
 
         # 初始化任务追踪器（带持久化）
-        tasks_dir = os.path.join(self.workspace_path, "tasks")
-        self._task_tracker = TaskTracker(persist_dir=tasks_dir)
+        self._task_tracker = TaskTracker(persist_dir=self.workspace.tasks_path)
 
         # 初始化工具注册表
         self.tool_registry = self._setup_tools()
@@ -163,7 +184,7 @@ class MyClawAgent:
             config=self.config,
             enable_tool_calling=True,
             max_tool_iterations=max_tool_iterations,
-            workspace_root=self.workspace_path,
+            workspace_root=self._current_workspace,
             auto_cleanup_temp_files=True,
             max_tool_retries=max_tool_retries,
             tool_retry_base_delay=tool_retry_base_delay,
@@ -204,26 +225,30 @@ class MyClawAgent:
             workspace_manager=self.workspace,  # 过渡期回退
         )
 
+    def _ensure_base_agents_md(self):
+        """确保基座 AGENTS.md fallback 存在。
+
+        从 templates/workspace/AGENTS.md 复制一份到 ~/.helloclaw/AGENTS.md，
+        作为工作区无 AGENTS.md 时的 prompt 骨架。不覆盖已有。
+        """
+        base_agents_path = os.path.join(self.home_path, "AGENTS.md")
+        if os.path.exists(base_agents_path):
+            return
+        from ..workspace.manager import WORKSPACE_TEMPLATES_DIR
+        src = WORKSPACE_TEMPLATES_DIR / "AGENTS.md"
+        if src.exists():
+            os.makedirs(self.home_path, exist_ok=True)
+            import shutil
+            shutil.copy2(src, base_agents_path)
+            print(f"📝 已部署基座 AGENTS.md fallback: {base_agents_path}")
+
     def _read_identity_name(self) -> str:
-        """从 IDENTITY.md 读取助手名称
+        """从 IDENTITY.md 读取助手名称（从基座 identity 目录）。
 
         Returns:
             助手名称，如果未设置则返回 None
         """
-        import re
-        identity = self.workspace.load_config("IDENTITY")
-        if not identity:
-            return None
-
-        # 尝试匹配名称字段
-        # 格式: - **名称：** xxx 或 - **名称:** xxx
-        match = re.search(r'\*\*名称[：:]\*\*\s*(.+?)(?:\n|$)', identity)
-        if match:
-            name = match.group(1).strip()
-            # 检查是否是占位符文本（包含下划线或"选一个"等）
-            if name and not name.startswith('_') and '选一个' not in name and '（' not in name:
-                return name
-        return None
+        return self.identity.read_name()
 
     def _init_llm(self):
         """初始化 LLM（从 config.json 读取配置）
@@ -348,34 +373,40 @@ class MyClawAgent:
         Raises:
             RuntimeError: 如果 AGENTS.md 不存在
         """
-        # 从 AGENTS.md 读取（必须存在）
+        # AGENTS.md：优先用工作区 .myclaw/AGENTS.md，不存在则用基座 fallback
         agents_content = self.workspace.load_config("AGENTS")
         if not agents_content:
-            raise RuntimeError("AGENTS.md 配置文件不存在，请检查工作空间初始化")
+            # 基座 AGENTS.md fallback（~/.helloclaw/AGENTS.md）
+            base_agents_path = os.path.join(self.home_path, "AGENTS.md")
+            if os.path.exists(base_agents_path):
+                with open(base_agents_path, "r", encoding="utf-8") as f:
+                    agents_content = f.read()
+        if not agents_content:
+            raise RuntimeError("AGENTS.md 不存在（工作区与基座均无），请检查部署")
 
         base_prompt = agents_content
 
         # 加载其他配置文件作为上下文
         context_parts = []
 
-        # 检查入职是否完成
-        if not self.workspace.is_onboarding_completed():
-            bootstrap = self.workspace.load_config("BOOTSTRAP")
+        # 检查入职是否完成（从 identity 基座读取）
+        if not self.identity.is_onboarding_completed():
+            bootstrap = self.identity.bootstrap
             if bootstrap:
                 context_parts.append(f"\n## 初始化引导\n\n{bootstrap}")
 
-        # 身份信息
-        identity = self.workspace.load_config("IDENTITY")
+        # 身份信息（从 identity 基座读取）
+        identity = self.identity.identity
         if identity:
             context_parts.append(f"\n## 你的身份信息\n{identity}")
 
-        # 用户信息
-        user_info = self.workspace.load_config("USER")
+        # 用户信息（从 identity 基座读取）
+        user_info = self.identity.user
         if user_info:
             context_parts.append(f"\n## 用户信息\n{user_info}")
 
-        # 人格模板
-        soul = self.workspace.load_config("SOUL")
+        # 人格模板（从 identity 基座读取）
+        soul = self.identity.soul
         if soul:
             context_parts.append(f"\n## 人格模板\n{soul}")
 
@@ -423,6 +454,105 @@ class MyClawAgent:
             return base_prompt + "\n" + "\n".join(context_parts)
 
         return base_prompt
+
+    # ==================== 工作区动态切换 ====================
+
+    @property
+    def current_workspace(self) -> str:
+        """当前工作区绝对路径。"""
+        return self._current_workspace
+
+    def bind_workspace(self, workspace_path: str):
+        """切换到指定工作区（运行时动态重绑工具根目录 + 部署 .myclaw/ 结构）。
+
+        调用时机：
+        - POST /api/workspace/switch 接口
+        - 前端发送消息时附带 workspace_path 参数
+
+        全量重绑所有依赖 workspace_path 的引用点，确保切换后
+        session/tasks/skills/uploads/tools 都落在新工作区。
+
+        Args:
+            workspace_path: 用户选择的工作区目录
+
+        Raises:
+            ValueError: 工作区未授权或路径无效
+        """
+        from ..workspace.auth import is_allowed
+
+        if not is_allowed(workspace_path):
+            raise ValueError(f"工作区未授权: {workspace_path}")
+
+        abs_path = os.path.abspath(os.path.expanduser(workspace_path))
+        self._current_workspace = abs_path
+
+        # Phase 2 部署：确保 .myclaw/ 子目录结构存在
+        self.workspace = WorkspaceManager(abs_path)
+        self.workspace.ensure_project_workspace()
+
+        # 保留 workspace_path 属性（外部引用，如 SubAgentOrchestrator）
+        self.workspace_path = abs_path
+
+        # 重绑工具沙箱根目录（Read/Write/Edit/Bash/RAG）
+        self._rebind_workspace_tools(abs_path)
+
+        # 重绑 config.session_dir
+        self.config.session_dir = self.workspace.sessions_path
+
+        # 重绑 SkillLoader（仅切工作区目录，全局目录不变）
+        self.skill_loader.update_workspace_dir(Path(self.workspace.skills_path))
+        self.refresh_skill_tool()
+
+        # 重绑 TaskTracker（私有属性 _persist_dir）
+        self._task_tracker._persist_dir = self.workspace.tasks_path
+
+        # 重绑 SubAgentOrchestrator
+        if self._subagent_orchestrator is not None:
+            self._subagent_orchestrator.workspace_path = abs_path
+
+        # 重绑 EnhancedSimpleAgent workspace_root（Path 对象）
+        if self._agent is not None and hasattr(self._agent, "workspace_root"):
+            self._agent.workspace_root = Path(abs_path).resolve()
+
+        # 更新 MemoryCaptureManager 的 workspace 引用
+        if hasattr(self, "_memory_capture_manager") and self._memory_capture_manager:
+            self._memory_capture_manager.workspace_manager = self.workspace
+
+        # 重建系统提示词（identity 不变 + 新工作区 AGENTS 叠加）
+        if self._agent is not None:
+            self._agent.system_prompt = self._build_system_prompt()
+
+        print(f"🔄 已切换工作区: {abs_path}")
+
+    def _rebind_workspace_tools(self, abs_path: str):
+        """重绑工作区相关工具的根目录。
+
+        Args:
+            abs_path: 新工作区绝对路径
+        """
+        if not self.tool_registry:
+            return
+
+        for tool in self.tool_registry.get_all_tools():
+            tool_name = getattr(tool, "name", "")
+
+            # ReadTool / WriteTool / EditTool
+            if hasattr(tool, "project_root"):
+                tool.project_root = abs_path
+
+            # BashTool（name 为 execute_command）：重置白名单 + 默认工作目录 + cd 历史（防跨工作区逃逸）
+            if tool_name == "execute_command" and hasattr(tool, "allowed_directories"):
+                tool.allowed_directories = [abs_path]
+                tool.default_workdir = abs_path
+                tool._cwd = None
+
+            # RAGTool（属性名为 _workspace_root）
+            if hasattr(tool, "_workspace_root"):
+                tool._workspace_root = os.path.normpath(abs_path)
+
+            # MemoryTool：更新 workspace_manager 引用（memory_store 不可用时回退到文件搜索）
+            if hasattr(tool, "workspace_manager"):
+                tool.workspace_manager = self.workspace
 
     def _inject_relevant_memories(self, user_message: str) -> str:
         """检索与用户消息相关的记忆，返回格式化的记忆上下文文本。
@@ -664,7 +794,7 @@ class MyClawAgent:
 
     def _prepare_session_turn_replace(self, session_id: str, user_turn_index: int) -> None:
         """加载会话：保留该轮之前的上下文与之后的对话，仅替换该轮回复。"""
-        session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+        session_file = os.path.join(self.workspace.sessions_path, f"{session_id}.json")
         if not os.path.exists(session_file):
             self._agent.clear_history()
             raise ValueError(f"会话 {session_id} 不存在")
@@ -696,7 +826,7 @@ class MyClawAgent:
         if hasattr(self, '_task_tracker') and self._task_tracker:
             self._task_tracker.clear()
             self._task_tracker.load(session_id)
-        session_file = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+        session_file = os.path.join(self.workspace.sessions_path, f"{session_id}.json")
         self._resend_suffix = []
         if os.path.exists(session_file):
             self._agent.load_session(session_file)
@@ -727,7 +857,7 @@ class MyClawAgent:
             max_image_mb = float(os.getenv("MULTIMODAL_MAX_IMAGE_MB", "5"))
         except ValueError:
             max_image_mb = 5.0
-        uploads_root = os.path.join(self.workspace_path, "uploads")
+        uploads_root = self.workspace.uploads_path
         return MultimodalConfig(
             image_mode=image_mode,  # type: ignore[arg-type]
             public_base_url=(os.getenv("MULTIMODAL_PUBLIC_BASE_URL") or None),
@@ -778,7 +908,7 @@ class MyClawAgent:
         content = build_user_content(
             message,
             attachments,
-            workspace_root=self.workspace_path,
+            workspace_root=self._current_workspace,
             config=cfg,
         )
         if isinstance(content, str):
@@ -1025,7 +1155,7 @@ class MyClawAgent:
         import json
         from hello_agents.core.message import Message
 
-        filepath = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+        filepath = os.path.join(self.workspace.sessions_path, f"{session_id}.json")
         if not os.path.exists(filepath):
             return 0
 
@@ -1110,7 +1240,7 @@ class MyClawAgent:
 
     def list_sessions(self) -> List[dict]:
         """列出所有会话"""
-        sessions_dir = os.path.join(self.workspace_path, "sessions")
+        sessions_dir = self.workspace.sessions_path
         if not os.path.exists(sessions_dir):
             return []
 
@@ -1129,7 +1259,7 @@ class MyClawAgent:
 
     def delete_session(self, session_id: str) -> bool:
         """删除会话"""
-        filepath = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+        filepath = os.path.join(self.workspace.sessions_path, f"{session_id}.json")
         if os.path.exists(filepath):
             os.remove(filepath)
             return True
@@ -1147,7 +1277,7 @@ class MyClawAgent:
         ``{"kind": "image", "url": "<data:...|http://...>"}``，便于前端直接渲染缩略图。
         """
         import json
-        filepath = os.path.join(self.workspace_path, "sessions", f"{session_id}.json")
+        filepath = os.path.join(self.workspace.sessions_path, f"{session_id}.json")
         if not os.path.exists(filepath):
             return []
 

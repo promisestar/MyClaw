@@ -83,14 +83,21 @@ class SkillLoader:
     - 支持启用/禁用管理
     """
 
-    def __init__(self, skills_dir: Path):
+    def __init__(self, skills_dir: Path, global_dir: Optional[Path] = None):
         """初始化技能加载器
 
         Args:
-            skills_dir: 技能目录路径
+            skills_dir: 工作区技能目录路径（可运行时切换）
+            global_dir: 全局技能目录路径（跨工作区共享，进程固定，可选）
         """
+        # 工作区技能目录（可运行时通过 update_workspace_dir 切换）
         self.skills_dir = Path(skills_dir)
         self.skills_dir.mkdir(parents=True, exist_ok=True)
+
+        # 全局技能目录（基座，进程固定，跨工作区共享）
+        self.global_dir = Path(global_dir) if global_dir else None
+        if self.global_dir:
+            self.global_dir.mkdir(parents=True, exist_ok=True)
 
         # 完整技能缓存
         self.skills_cache: Dict[str, Skill] = {}
@@ -98,9 +105,13 @@ class SkillLoader:
         # 仅元数据缓存（启动时加载）
         self.metadata_cache: Dict[str, Dict] = {}
 
-        # 状态管理器
+        # 状态管理器：工作区级 + 全局级（分离存储，互不干扰）
         self._state_manager = SkillStateManager(
             self.skills_dir / "skill_states.json"
+        )
+        self._global_state_manager = (
+            SkillStateManager(self.global_dir / "skill_states.json")
+            if self.global_dir else None
         )
 
         # 启动时扫描并加载元数据
@@ -111,7 +122,7 @@ class SkillLoader:
         """已启用的技能数量"""
         return sum(
             1 for name in self.metadata_cache
-            if self._state_manager.is_enabled(name)
+            if self._get_state_manager(name).is_enabled(name)
         )
 
     @property
@@ -120,15 +131,33 @@ class SkillLoader:
         return len(self.metadata_cache)
 
     def _scan_skills(self):
-        """扫描 skills/ 目录，加载元数据
+        """扫描技能目录，加载元数据
 
+        先扫描全局目录（低优先级），再扫描工作区目录（高优先级）。
+        工作区同名技能覆盖全局。metadata 中记录 source 字段标记来源。
         对 frontmatter.name 与目录名不一致的旧数据，会记录警告但仍保留加载，
         以 frontmatter.name 为准作为 cache key。新导入的技能则强制目录名 = name。
+        """
+        # 先扫描全局（低优先级）
+        if self.global_dir:
+            self._scan_dir(self.global_dir, source="global")
+        # 再扫描工作区（高优先级，覆盖全局同名）
+        self._scan_dir(self.skills_dir, source="workspace")
+
+    def _scan_dir(self, directory: Path, source: str):
+        """扫描单个技能目录，加载元数据到 metadata_cache。
+
+        Args:
+            directory: 技能目录路径
+            source: 来源标记（"global" / "workspace"）
         """
         # 排除非技能目录（如 venv、缓存等）
         SKIP_NAMES = {"__pycache__", env_manager.VENV_DIR_NAME, "node_modules"}
 
-        for skill_dir in self.skills_dir.iterdir():
+        if not directory.exists():
+            return
+
+        for skill_dir in directory.iterdir():
             if not skill_dir.is_dir():
                 continue
             if skill_dir.name.startswith("."):
@@ -175,21 +204,58 @@ class SkillLoader:
                     skill_dir.name, name,
                 )
 
-            # 处理重名（不同目录的 frontmatter 写了相同 name）
+            # 处理重名：工作区覆盖全局；同级别重名跳过后者
             if name in self.metadata_cache:
-                existing_dir = self.metadata_cache[name]["dir"]
-                logger.warning(
-                    "技能名 '%s' 重复：目录 '%s' 已加载，跳过 '%s'",
-                    name, existing_dir, skill_dir,
-                )
-                continue
+                existing = self.metadata_cache[name]
+                if source == "workspace" and existing.get("source") == "global":
+                    logger.info(
+                        "工作区技能 '%s' 覆盖全局同名技能（全局: %s → 工作区: %s）",
+                        name, existing["dir"], skill_dir,
+                    )
+                else:
+                    logger.warning(
+                        "技能名 '%s' 重复：目录 '%s' 已加载，跳过 '%s'",
+                        name, existing["dir"], skill_dir,
+                    )
+                    continue
 
             self.metadata_cache[name] = {
                 "name": name,
                 "description": metadata.get("description", ""),
                 "path": str(skill_md),
                 "dir": str(skill_dir),
+                "source": source,
             }
+
+    def _get_state_manager(self, name: str) -> SkillStateManager:
+        """根据技能来源返回对应的状态管理器。
+
+        全局技能用全局状态文件，工作区技能用工作区状态文件，互不干扰。
+        """
+        meta = self.metadata_cache.get(name, {})
+        if meta.get("source") == "global" and self._global_state_manager:
+            return self._global_state_manager
+        return self._state_manager
+
+    def _get_dir_for_source(self, source: str) -> Path:
+        """根据来源标记返回对应技能目录。"""
+        if source == "global" and self.global_dir:
+            return self.global_dir
+        return self.skills_dir
+
+    def update_workspace_dir(self, workspace_dir: Path):
+        """切换工作区技能目录（全局目录不变）。
+
+        用于 bind_workspace 时重绑技能目录：更新 skills_dir 和工作区状态管理器，
+        然后重新扫描。全局目录和全局状态管理器保持不变。
+        """
+        self.skills_dir = Path(workspace_dir)
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
+        # 更新工作区状态管理器（全局不变）
+        self._state_manager = SkillStateManager(
+            self.skills_dir / "skill_states.json"
+        )
+        self.reload()
 
     def _parse_frontmatter_only(self, path: Path) -> Optional[Dict]:
         """仅解析 YAML frontmatter
@@ -251,7 +317,7 @@ class SkillLoader:
 
         lines = []
         for name, meta in self.metadata_cache.items():
-            if only_enabled and not self._state_manager.is_enabled(name):
+            if only_enabled and not self._get_state_manager(name).is_enabled(name):
                 continue
             lines.append(f"- {name}: {meta['description']}")
 
@@ -270,13 +336,13 @@ class SkillLoader:
             Skill 对象，不存在或已禁用则返回 None
         """
         # 检查是否禁用
-        if not self._state_manager.is_enabled(name):
+        if not self._get_state_manager(name).is_enabled(name):
             return None
 
         # 检查缓存
         if name in self.skills_cache:
             cached = self.skills_cache[name]
-            if self._state_manager.is_enabled(name):
+            if self._get_state_manager(name).is_enabled(name):
                 cached.enabled = True
                 return cached
             return None
@@ -333,7 +399,7 @@ class SkillLoader:
         if only_enabled:
             return [
                 name for name in self.metadata_cache
-                if self._state_manager.is_enabled(name)
+                if self._get_state_manager(name).is_enabled(name)
             ]
         return list(self.metadata_cache.keys())
 
@@ -350,8 +416,9 @@ class SkillLoader:
             result.append({
                 "name": name,
                 "description": meta["description"],
-                "enabled": self._state_manager.is_enabled(name),
+                "enabled": self._get_state_manager(name).is_enabled(name),
                 "dir": meta["dir"],
+                "source": meta.get("source", "workspace"),
                 "has_venv": venv_python is not None,
                 "has_dependencies": env_manager.has_dependencies(skill_dir),
                 "python_path": str(venv_python) if venv_python else None,
@@ -473,8 +540,10 @@ class SkillLoader:
 
         # 处理改名：重命名目录、迁移状态
         if new_name != name:
-            old_dir = Path(self.metadata_cache[name]["dir"])
-            new_dir = self.skills_dir / new_name
+            old_meta = self.metadata_cache[name]
+            skill_source = old_meta.get("source", "workspace")
+            old_dir = Path(old_meta["dir"])
+            new_dir = self._get_dir_for_source(skill_source) / new_name
             try:
                 old_dir.rename(new_dir)
             except OSError as e:
@@ -486,10 +555,11 @@ class SkillLoader:
                     detail=f"{old_dir} -> {new_dir}",
                 )
 
-            # 迁移状态
-            old_enabled = self._state_manager.is_enabled(name)
-            self._state_manager.set_enabled(new_name, old_enabled)
-            self._state_manager.remove_state(name)
+            # 迁移状态（改名不改 source，用同一 state manager）
+            old_sm = self._get_state_manager(name)
+            old_enabled = old_sm.is_enabled(name)
+            old_sm.set_enabled(new_name, old_enabled)
+            old_sm.remove_state(name)
 
             # 迁移 metadata
             self.metadata_cache.pop(name, None)
@@ -499,6 +569,7 @@ class SkillLoader:
                 "description": (new_metadata or {}).get("description", ""),
                 "path": str(new_path),
                 "dir": str(new_dir),
+                "source": skill_source,
             }
             logger.info("技能已重命名：'%s' -> '%s'", name, new_name)
             return new_name
@@ -512,11 +583,13 @@ class SkillLoader:
             return name
 
         if metadata:
+            old_source = self.metadata_cache[name].get("source", "workspace")
             self.metadata_cache[name] = {
                 "name": metadata.get("name", name),
                 "description": metadata.get("description", ""),
                 "path": str(path),
                 "dir": str(path.parent),
+                "source": old_source,
             }
 
         return name
@@ -534,7 +607,7 @@ class SkillLoader:
         if name not in self.metadata_cache:
             logger.warning("set_enabled: 技能 '%s' 不存在", name)
             return False
-        self._state_manager.set_enabled(name, enabled)
+        self._get_state_manager(name).set_enabled(name, enabled)
         if not enabled:
             self.skills_cache.pop(name, None)
         return True
@@ -543,7 +616,7 @@ class SkillLoader:
         """检查技能是否启用"""
         if name not in self.metadata_cache:
             return False
-        return self._state_manager.is_enabled(name)
+        return self._get_state_manager(name).is_enabled(name)
 
     def delete_skill(self, name: str) -> bool:
         """删除技能目录（含专属 venv）
@@ -556,6 +629,14 @@ class SkillLoader:
         """
         if name not in self.metadata_cache:
             logger.warning("delete_skill: 技能 '%s' 不存在", name)
+            return False
+        # 全局技能不允许从工作区上下文删除（防止误删跨工作区共享技能）
+        if self.metadata_cache[name].get("source") == "global":
+            logger.warning(
+                "delete_skill: 全局技能 '%s' 不允许删除，请手动删除目录 %s",
+                name, self.metadata_cache[name]["dir"],
+            )
+            print(f"⚠️ 全局技能 '{name}' 不允许删除，请手动删除目录：{self.metadata_cache[name]['dir']}")
             return False
         skill_dir = Path(self.metadata_cache[name]["dir"])
         try:
@@ -572,20 +653,21 @@ class SkillLoader:
             print(f"⚠️ 删除技能 '{name}' 失败：{e}")
             return False
 
+        self._get_state_manager(name).remove_state(name)
         self.metadata_cache.pop(name, None)
         self.skills_cache.pop(name, None)
-        self._state_manager.remove_state(name)
         logger.info("技能 '%s' 已删除", name)
         return True
 
-    def import_from_path(self, source: str, auto_install: bool = True) -> Skill:
+    def import_from_path(self, source: str, auto_install: bool = True, scope: str = "workspace") -> Skill:
         """从本地目录导入技能
 
-        将 source 目录复制到 skills_dir 下（强制使用 frontmatter.name 作为目录名）。
+        将 source 目录复制到指定层级目录下（强制使用 frontmatter.name 作为目录名）。
 
         Args:
             source: 源目录路径
             auto_install: 是否自动为技能创建专属 venv 并安装依赖
+            scope: 导入层级，"global"（~/.helloclaw/skills/）或 "workspace"（.myclaw/skills/）
 
         Returns:
             导入的 Skill 对象
@@ -596,6 +678,12 @@ class SkillLoader:
             SkillConflictError: 已存在同名技能（来自不同目录）
             SkillLoadError: SKILL.md 解析失败
         """
+        # 校验 scope 合法性
+        if scope == "global" and self.global_dir is None:
+            raise SkillImportError(
+                "全局技能目录未配置，无法导入到 global 层级",
+                code="GLOBAL_DIR_NOT_CONFIGURED",
+            )
         source_path = Path(source).resolve()
         if not source_path.exists():
             raise SkillImportError(
@@ -632,7 +720,8 @@ class SkillLoader:
         name = ensure_valid_skill_name(raw_name)
 
         # P3：强制目录名 = name
-        dest_dir = self.skills_dir / name
+        target_dir = self._get_dir_for_source(scope)
+        dest_dir = target_dir / name
 
         # 同源同目标：无需重复导入
         if dest_dir.exists() and dest_dir.resolve() == source_path.resolve():
@@ -662,17 +751,42 @@ class SkillLoader:
             )
 
         # 更新元数据
+        # 导入到 global 时，若 workspace 已有同名技能，保留 workspace 版本（workspace 优先）
+        if scope == "global" and name in self.metadata_cache:
+            existing_source = self.metadata_cache[name].get("source")
+            if existing_source == "workspace":
+                self.skills_cache.pop(name, None)
+                logger.info(
+                    "全局技能 '%s' 已导入，但工作区已有同名技能，metadata 保留工作区版本",
+                    name,
+                )
+                # 仍为 global 版本安装依赖
+                if auto_install:
+                    try:
+                        env_manager.setup_skill_env(dest_dir)
+                    except Exception:
+                        logger.exception("技能 '%s' 依赖安装失败（不影响加载）", name)
+                        print(f"⚠️ 技能 '{name}' 依赖安装失败（不影响加载）")
+                skill = self.get_skill(name)
+                if skill is None:
+                    raise SkillImportError(
+                        f"导入后无法加载技能 '{name}'",
+                        code="LOAD_AFTER_IMPORT",
+                    )
+                return skill
+
         new_skill_md = dest_dir / "SKILL.md"
         self.metadata_cache[name] = {
             "name": name,
             "description": metadata.get("description", ""),
             "path": str(new_skill_md),
             "dir": str(dest_dir),
+            "source": scope,
         }
         self.skills_cache.pop(name, None)
 
         # 确保新导入的技能默认启用（覆盖之前可能存在的禁用状态）
-        self._state_manager.set_enabled(name, True)
+        self._get_state_manager(name).set_enabled(name, True)
 
         # 自动为技能创建专属 venv 并安装依赖
         if auto_install:
@@ -690,15 +804,16 @@ class SkillLoader:
             )
         return skill
 
-    def import_from_git(self, repo_url: str, auto_install: bool = True) -> Skill:
+    def import_from_git(self, repo_url: str, auto_install: bool = True, scope: str = "workspace") -> Skill:
         """从 Git 仓库导入技能
 
-        Clone 仓库到 skills_dir 下临时目录，递归查找含 SKILL.md 的子目录，
+        Clone 仓库到指定层级目录下临时目录，递归查找含 SKILL.md 的子目录，
         每个子目录作为一个技能导入。
 
         Args:
             repo_url: Git 仓库 URL
             auto_install: 是否自动为技能创建专属 venv 并安装依赖
+            scope: 导入层级，"global"（~/.helloclaw/skills/）或 "workspace"（.myclaw/skills/）
 
         Returns:
             首个成功导入的 Skill 对象
@@ -707,6 +822,12 @@ class SkillLoader:
             SkillImportError: git 不可用 / clone 失败 / 未找到合法 SKILL.md
             SkillNameError: 仓库中 SKILL.md 的 name 不合法
         """
+        # 校验 scope 合法性
+        if scope == "global" and self.global_dir is None:
+            raise SkillImportError(
+                "全局技能目录未配置，无法导入到 global 层级",
+                code="GLOBAL_DIR_NOT_CONFIGURED",
+            )
         # 检查 git 是否可用
         try:
             subprocess.run(
@@ -726,7 +847,8 @@ class SkillLoader:
         if repo_name.endswith(".git"):
             repo_name = repo_name[:-4]
 
-        temp_dir = self.skills_dir / ("_" + repo_name)
+        target_dir = self._get_dir_for_source(scope)
+        temp_dir = target_dir / ("_" + repo_name)
         if temp_dir.exists():
             try:
                 shutil.rmtree(temp_dir)
@@ -801,7 +923,7 @@ class SkillLoader:
                 continue
 
             name = raw_name.strip()
-            dest_dir = self.skills_dir / name
+            dest_dir = target_dir / name
 
             try:
                 if dest_dir.exists():
@@ -812,15 +934,27 @@ class SkillLoader:
                 skipped_errors.append(f"{name}: 复制失败 - {e}")
                 continue
 
+            # 导入到 global 时，若 workspace 已有同名技能，保留 workspace 版本
+            if scope == "global" and name in self.metadata_cache:
+                existing_source = self.metadata_cache[name].get("source")
+                if existing_source == "workspace":
+                    logger.info(
+                        "全局技能 '%s' 已导入，但工作区已有同名技能，metadata 保留工作区版本",
+                        name,
+                    )
+                    imported_skills.append((name, dest_dir))
+                    continue
+
             new_skill_md = dest_dir / "SKILL.md"
             self.metadata_cache[name] = {
                 "name": name,
                 "description": metadata.get("description", ""),
                 "path": str(new_skill_md),
                 "dir": str(dest_dir),
+                "source": scope,
             }
             self.skills_cache.pop(name, None)
-            self._state_manager.set_enabled(name, True)
+            self._get_state_manager(name).set_enabled(name, True)
             imported_skills.append((name, dest_dir))
 
         # 清理临时目录

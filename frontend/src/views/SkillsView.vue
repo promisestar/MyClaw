@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Card, Button, Switch, Empty, message, Popconfirm, Modal, Input, Tabs, Tag, Tooltip } from 'ant-design-vue'
+import { Card, Button, Switch, Empty, message, Popconfirm, Modal, Input, Tabs, Tag, Tooltip, Radio } from 'ant-design-vue'
 import {
   PlusOutlined,
   EditOutlined,
@@ -24,6 +24,7 @@ const importModalOpen = ref(false)
 const importLoading = ref(false)
 const importSourceType = ref<'path' | 'git'>('path')
 const importSource = ref('')
+const importScope = ref<'global' | 'workspace'>('workspace')
 
 const loadSkills = async () => {
   loading.value = true
@@ -126,7 +127,7 @@ const handleImport = async () => {
   }
   importLoading.value = true
   try {
-    const res = await skillsApi.import(importSourceType.value, importSource.value.trim())
+    const res = await skillsApi.import(importSourceType.value, importSource.value.trim(), importScope.value)
     message.success(res.message || '导入成功')
     importModalOpen.value = false
     importSource.value = ''
@@ -141,6 +142,7 @@ const handleImport = async () => {
 const openImportModal = () => {
   importSourceType.value = 'path'
   importSource.value = ''
+  importScope.value = 'workspace'
   importModalOpen.value = true
 }
 
@@ -280,6 +282,13 @@ onMounted(() => {
           </div>
         </Tabs.TabPane>
       </Tabs>
+      <div class="import-scope">
+        <p class="import-hint">导入层级</p>
+        <Radio.Group v-model:value="importScope" class="scope-radio">
+          <Radio value="workspace">项目级（仅当前工作区）</Radio>
+          <Radio value="global">用户级（跨工作区共享）</Radio>
+        </Radio.Group>
+      </div>
       <div class="import-deps-hint">
         💡 如果技能包含 <code>requirements.txt</code> 或在 SKILL.md frontmatter 中声明了
         <code>dependencies</code>，系统将自动为该技能创建专属 venv 并安装依赖（可能需要 1-5 分钟，依赖量大时更久）。
@@ -441,6 +450,18 @@ onMounted(() => {
   color: #999;
   margin: 0 0 12px 0;
   line-height: 1.5;
+}
+
+.import-scope {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #f0f0f0;
+}
+
+.import-scope .import-hint {
+  margin-bottom: 8px;
+  font-weight: 500;
+  color: #666;
 }
 
 .import-deps-hint {

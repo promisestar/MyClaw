@@ -3,6 +3,7 @@ import { RouterLink, RouterView, useRoute } from 'vue-router'
 import { Menu, ConfigProvider, theme } from 'ant-design-vue'
 import { MessageOutlined, SettingOutlined, HistoryOutlined, BookOutlined, FolderOutlined, FileTextOutlined, ThunderboltOutlined, HeartOutlined } from '@ant-design/icons-vue'
 import LobsterIcon from '@/assets/lobster.svg'
+import WorkspaceSwitcher from '@/components/WorkspaceSwitcher.vue'
 
 const route = useRoute()
 
@@ -25,6 +26,9 @@ const customTheme = {
         <div class="logo">
           <img :src="LobsterIcon" alt="HelloClaw" class="logo-icon" />
           <span class="logo-text">MyClaw</span>
+        </div>
+        <div class="workspace-area">
+          <WorkspaceSwitcher />
         </div>
         <Menu
           mode="inline"
@@ -122,6 +126,11 @@ const customTheme = {
   font-size: 18px;
   font-weight: 600;
   color: #333;
+}
+
+.workspace-area {
+  padding: 8px 16px 12px;
+  border-bottom: 1px solid #f0f0f0;
 }
 
 .sidebar-menu {

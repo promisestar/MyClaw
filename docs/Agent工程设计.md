@@ -19,7 +19,8 @@
 11. [工具调用去重与限量保护](#11-工具调用去重与限量保护)
 12. [Agent 循环可中断与协同取消](#12-agent-循环可中断与协同取消)
 13. [多模态 Token 估算与自适应压缩](#13-多模态-token-估算与自适应压缩)
-14. [面试展示策略](#14-面试展示策略)
+14. [身份与工作区解耦的运行时切换](#14-身份与工作区解耦的运行时切换)
+15. [面试展示策略](#15-面试展示策略)
 
 ---
 
@@ -875,7 +876,88 @@ strategies = [
 
 ---
 
-## 14. 面试展示策略
+## 14. 身份与工作区解耦的运行时切换
+
+### 设计动机
+
+Agent 的"灵魂"（身份、人格、用户画像）和"工位"（要操作的项目文件）原本挤在同一个 workspace 目录下。这导致三个矛盾：
+
+1. **切项目就丢人格**——`IDENTITY.md`/`SOUL.md`/`USER.md` 跟项目代码混在一起，换工作区后人设消失
+2. **工具根目录构造期锁死**——`BashTool.allowed_directories`、`ReadTool.project_root` 在 Agent 构造时写死，运行时不可变
+3. **用户无法选择工作区**——进程级单例锁定一个 workspace，无法像 Cursor/WorkBuddy 那样按任务切换
+
+### 实现方案
+
+**三层解耦架构**：
+
+```
+Layer 0: Agent 基座  ~/.helloclaw/          ← 进程固定，永不变化
+  ├── identity/  (IDENTITY/SOUL/USER/BOOTSTRAP)  身份/人格基座
+  └── AGENTS.md  (全局默认 prompt 骨架 fallback)
+Layer 1: 用户工作区  <project>/.myclaw/      ← 运行时切换
+  ├── AGENTS.md  (项目级行为规范，可选)
+  ├── sessions/ tasks/ uploads/ skills/
+Layer 2: 会话层      ← 不变（原有机制）
+```
+
+身份文件从工作区迁移到固定基座目录，工作区文件归拢到 `.myclaw/` 隐藏子目录。System Prompt 构建时：identity 从基座读（不随工作区变），AGENTS.md 优先用工作区的、基座作 fallback。
+
+**bind_workspace() 全量重绑**：Agent 构造期把 `workspace_path` 深度绑定到 13 处引用点（file tools、`config.session_dir`、`SkillLoader`、`TaskTracker`、`SubAgentOrchestrator`、`EnhancedSimpleAgent`、`uploads_root` 等），切换时全部运行时 setattr 更新：
+
+```python
+def bind_workspace(self, workspace_path: str):
+    if not is_allowed(workspace_path):
+        raise ValueError(f"工作区未授权")
+    abs_path = os.path.abspath(workspace_path)
+    self.workspace = WorkspaceManager(abs_path)
+    self.workspace.ensure_project_workspace()  # 部署 .myclaw/
+
+    # 全量重绑 13 处引用点
+    self._rebind_workspace_tools(abs_path)     # Read/Write/Edit/Bash/RAG
+    self.config.session_dir = self.workspace.sessions_path
+    self.skill_loader.skills_dir = Path(self.workspace.skills_path)
+    self.skill_loader.clear()                  # 清缓存重新加载
+    self._task_tracker._persist_dir = self.workspace.tasks_path
+    self._subagent_orchestrator.workspace_path = abs_path
+    self._agent.workspace_root = Path(abs_path).resolve()
+    self._memory_capture_manager.workspace_manager = self.workspace
+    self._agent.system_prompt = self._build_system_prompt()  # 重建（identity 不变）
+```
+
+**两阶段部署**：
+- Phase 1（启动时）：从 `templates/identity/` 部署身份文件到 `~/.helloclaw/identity/`，含 V1→V2 自动迁移
+- Phase 2（切工作区时）：懒部署 `.myclaw/` 子目录结构 + `.gitignore` 自动注入
+
+### 设计亮点
+
+**1. 毫秒级切换不重启进程**：通过 setter 全量重绑工具根目录，无需重建 Agent 实例，切换开销仅文件系统操作。
+
+**2. 配置读写分流**：`IDENTITY/SOUL/USER/BOOTSTRAP` 从 IdentityManager（基座）读写，`AGENTS/HEARTBEAT` 从 WorkspaceManager（当前工作区 `.myclaw/`）读写。切换工作区后身份不变。
+
+**3. V1→V2 自动迁移幂等**：`.v2_migration_done` 标记防止重复迁移；旧 workspace 的身份文件自动拷贝到基座 `identity/`。
+
+**4. 基座 AGENTS.md fallback 防崩溃**：工作区 AGENTS.md 是可选的，不存在时用基座 `~/.helloclaw/AGENTS.md` 作为 prompt 骨架，避免切换到新工作区时 RuntimeError。
+
+**5. BashTool `_cwd` 重置防跨工作区逃逸**：切换时重置 cd 历史，防止通过 `cd` 跳出白名单访问其他工作区文件。
+
+**6. 白名单授权模型**：用户须显式授权目录才能切换（`~/.helloclaw/workspaces.json`），防止前端传任意路径越级访问敏感目录。
+
+### 对比分析
+
+| 方案 | 身份/工作区关系 | 切换开销 | 沙箱机制 |
+|------|---------------|---------|---------|
+| OpenClaw per-agent workspace | 身份在 workspace 内 | 重建 agent | 可选 sandbox |
+| Cursor Multi-root | User Rules 全局 | 索引重建 | IDE 内置 |
+| WorkBuddy 空间切换 | 空间级身份 | 空间切换 | 本地/云双模 |
+| **MyClaw bind_workspace** | **基座/工作区分离** | **毫秒级 setter 重绑** | **allowed_directories 白名单** |
+
+### 面试展示要点
+
+> "Agent 的身份和工作区原本耦合在一个目录，切项目就丢人格。我把它们解耦成三层：身份文件固定在 ~/.helloclaw/identity/，工作区文件归拢到 .myclaw/ 子目录。切换工作区时 bind_workspace 全量重绑 13 处引用点——file tools、session_dir、skills_dir、tasks_dir、子代理编排器等全部运行时 setattr，毫秒级完成不重启进程。BashTool 切换时重置 cd 历史防跨工作区逃逸。还有 V1→V2 自动迁移和白名单授权模型。"
+
+---
+
+## 15. 面试展示策略
 
 ### 推荐展示顺序（15 分钟 talk）
 
@@ -887,7 +969,8 @@ strategies = [
 | 8-10 min | **错误分类重试 + 指数退避** | 展示工程严谨性 |
 | 10-12 min | **记忆系统四层设计 + 自动注入** | 展示产品思维 |
 | 12-13 min | **Agent 循环可中断 + SubAgent** | 展示架构扩展性与用户体验 |
-| 13-15 min | 优化方向 + 学习收获 | 展示反思能力 |
+| 13-14 min | **身份与工作区解耦的运行时切换** | 展示架构解耦与多项目管理 |
+| 14-15 min | 优化方向 + 学习收获 | 展示反思能力 |
 
 ### 核心原则
 

@@ -68,7 +68,7 @@ def _resolve_attachment_path(agent, stored_path: str) -> Path:
         raise HTTPException(status_code=400, detail="stored_path 不能为空")
 
     ws = Path(agent.workspace.workspace_path).resolve()
-    uploads_root = (ws / "uploads").resolve()
+    uploads_root = Path(agent.workspace.uploads_path).resolve()
 
     raw = Path(stored_path)
     target = raw if raw.is_absolute() else (ws / raw)
@@ -132,7 +132,7 @@ async def upload_file(
 
     ws = Path(agent.workspace.workspace_path).resolve()
     sub = _safe_segment(session_id or "")
-    dest_dir = ws / "uploads" / sub
+    dest_dir = Path(agent.workspace.uploads_path) / sub
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = _safe_filename(file.filename or "file")
