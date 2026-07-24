@@ -67,6 +67,48 @@ const assistantName = ref('HelloClaw')
 // 工作区 store（发送消息时附带当前 workspace_path）
 const workspaceStore = useWorkspaceStore()
 
+// 欢迎页问候语（按时段切换）
+const greeting = computed(() => {
+  const h = new Date().getHours()
+  if (h < 5) return '夜深了'
+  if (h < 11) return '早上好'
+  if (h < 14) return '中午好'
+  if (h < 18) return '下午好'
+  return '晚上好'
+})
+
+// 欢迎页快捷起始卡片：点击把示例文本填入输入框
+const welcomeCards = [
+  { icon: '⚡', title: '使用技能', desc: '输入 / 唤起技能列表', prompt: '/' },
+  { icon: '📄', title: '总结文档', desc: '拖拽文件到输入框，提炼要点', prompt: '请帮我总结这份文档的核心要点' },
+  { icon: '🖼️', title: '识别图片', desc: '上传图片，视觉理解问答', prompt: '请描述这张图片的内容' },
+  { icon: '💬', title: '随便聊聊', desc: '自由提问与对话', prompt: '你好，请介绍一下你自己' },
+]
+
+const inputRef = ref<{ focus: () => void } | null>(null)
+
+const fillPrompt = (text: string) => {
+  inputMessage.value = text
+  nextTick(() => inputRef.value?.focus())
+}
+
+// 代码块复制按钮：事件委托处理（v-html 内容无法直接绑定事件）
+const handleCodeCopyClick = (e: MouseEvent) => {
+  const btn = (e.target as HTMLElement).closest('.code-copy-btn') as HTMLElement | null
+  if (!btn) return
+  const code = btn.closest('.code-block')?.querySelector('pre')?.innerText ?? ''
+  if (!code) return
+  navigator.clipboard
+    .writeText(code)
+    .then(() => {
+      btn.textContent = '已复制'
+      setTimeout(() => {
+        btn.textContent = '复制'
+      }, 1500)
+    })
+    .catch(() => message.error('复制失败'))
+}
+
 // 消息段类型
 interface TextSegment {
   type: 'text'
@@ -1196,7 +1238,7 @@ const sendMessage = async () => {
   const skillMatch = effectiveText.match(/^\/(\S+)\s+([\s\S]*)/)
   if (skillMatch) {
     const skillName = skillMatch[1]
-    const userContent = skillMatch[2].trim()
+    const userContent = (skillMatch[2] ?? '').trim()
     if (!userContent) {
       message.warning('请在技能后输入具体内容')
       return
@@ -1223,7 +1265,8 @@ const createNewSession = async () => {
 <template>
   <div class="chat-view">
     <!-- 消息区域 -->
-    <div class="chat-messages" ref="messagesContainer">
+    <div class="chat-messages" ref="messagesContainer" @click="handleCodeCopyClick">
+      <div class="chat-messages-inner">
       <!-- 初始化加载状态 -->
       <div v-if="initializing" class="empty-state">
         <img :src="LobsterIcon" alt="HelloClaw" class="empty-icon loading" />
@@ -1379,10 +1422,27 @@ const createNewSession = async () => {
         </div>
       </template>
 
-      <!-- 空状态 -->
-      <div v-else class="empty-state">
-        <img :src="LobsterIcon" alt="HelloClaw" class="empty-icon" />
-        <p class="empty-hint">发送消息开始对话</p>
+      <!-- 空状态：欢迎页 -->
+      <div v-else class="empty-state welcome-state">
+        <div class="welcome-hero">
+          <div class="welcome-glow"></div>
+          <img :src="LobsterIcon" alt="MyClaw" class="welcome-logo" />
+        </div>
+        <h1 class="welcome-title">{{ greeting }}，我是 {{ assistantName }}</h1>
+        <p class="welcome-subtitle">你的个人 AI 助手 · 支持对话、工具调用、文档与图片理解</p>
+        <div class="welcome-cards">
+          <button
+            v-for="card in welcomeCards"
+            :key="card.title"
+            type="button"
+            class="welcome-card"
+            @click="fillPrompt(card.prompt)"
+          >
+            <span class="welcome-card-icon">{{ card.icon }}</span>
+            <span class="welcome-card-title">{{ card.title }}</span>
+            <span class="welcome-card-desc">{{ card.desc }}</span>
+          </button>
+        </div>
       </div>
 
       <!-- 加载指示器（助手消息组样式）- 等待响应时显示 -->
@@ -1399,6 +1459,7 @@ const createNewSession = async () => {
             </div>
           </div>
         </div>
+      </div>
       </div>
     </div>
 
@@ -1481,10 +1542,11 @@ const createNewSession = async () => {
         </Tooltip>
         <!-- 输入框 -->
         <Input.TextArea
+          ref="inputRef"
           v-model:value="inputMessage"
           placeholder="输入 / 使用技能 (Enter 发送, Shift+Enter 换行)"
           :auto-size="{ minRows: 1, maxRows: 4 }"
-          @press-enter="(e: KeyboardEvent) => { if (skillDropdownVisible.value) { handleSkillKeydown(e); return; } if (!e.shiftKey) { e.preventDefault(); sendMessage() } }"
+          @press-enter="(e: KeyboardEvent) => { if (skillDropdownVisible) { handleSkillKeydown(e); return; } if (!e.shiftKey) { e.preventDefault(); sendMessage() } }"
           @keydown="handleSkillKeydown"
         />
         <!-- 按钮区域（固定宽度） -->
@@ -1531,6 +1593,7 @@ const createNewSession = async () => {
           </button>
         </div>
       </div>
+      <div class="input-hint">Enter 发送 · Shift+Enter 换行 · 支持拖拽文件到输入框</div>
     </div>
 
     <Modal
@@ -1566,6 +1629,14 @@ const createNewSession = async () => {
   flex: 1;
   overflow-y: auto;
   padding: 24px;
+}
+
+/* 消息列限宽居中，收敛宽屏阅读线 */
+.chat-messages-inner {
+  max-width: 760px;
+  width: 100%;
+  min-height: 100%;
+  margin: 0 auto;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -1576,6 +1647,18 @@ const createNewSession = async () => {
   display: flex;
   gap: 12px;
   max-width: 85%;
+  animation: msg-fade-in 0.25s ease both;
+}
+
+@keyframes msg-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .message-group.user {
@@ -1629,9 +1712,9 @@ const createNewSession = async () => {
 
 .message-text {
   padding: 10px 14px;
-  border-radius: 12px;
+  border-radius: 4px 16px 16px 16px;
   background-color: var(--color-surface);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  box-shadow: var(--shadow-sm);
   line-height: 1.6;
   word-wrap: break-word;
 }
@@ -1639,6 +1722,7 @@ const createNewSession = async () => {
 .message-group.user .message-text {
   background-color: var(--color-primary-light);
   border: 1px solid rgba(255, 92, 92, 0.2);
+  border-radius: 16px 4px 16px 16px;
 }
 
 .message-bubble.user-editable {
@@ -1714,14 +1798,53 @@ const createNewSession = async () => {
   color: #d63384;
 }
 
-/* 代码块 */
+/* 代码块（含顶部语言栏与复制按钮） */
+.message-text :deep(.code-block) {
+  margin: 10px 0;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: #1e1e1e;
+}
+
+.message-text :deep(.code-header) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px 5px 14px;
+  background: #2a2a2a;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.message-text :deep(.code-lang) {
+  font-size: 11px;
+  color: #8f8f8f;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', 'Fira Code', Monaco, monospace;
+}
+
+.message-text :deep(.code-copy-btn) {
+  font-size: 11px;
+  color: #b3b3b3;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 3px 8px;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.message-text :deep(.code-copy-btn:hover) {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
 .message-text :deep(pre) {
   background-color: #1e1e1e;
   color: #d4d4d4;
   padding: 14px 16px;
-  border-radius: 8px;
   overflow-x: auto;
-  margin: 10px 0;
+  margin: 0;
   line-height: 1.5;
   font-size: 0.88em;
 }
@@ -1790,8 +1913,8 @@ const createNewSession = async () => {
   border-radius: 6px;
 }
 .message-text :deep(thead) {
-  background-color: var(--color-primary);
-  color: #fff;
+  background-color: var(--color-primary-light);
+  color: var(--color-primary);
 }
 .message-text :deep(th) {
   padding: 8px 12px;
@@ -1903,13 +2026,106 @@ const createNewSession = async () => {
   font-size: 14px;
 }
 
+/* 欢迎页 */
+.welcome-state {
+  gap: 0;
+  padding-bottom: 48px;
+}
+
+.welcome-hero {
+  position: relative;
+  width: 148px;
+  height: 148px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.welcome-glow {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle, rgba(255, 92, 92, 0.3) 0%, rgba(255, 92, 92, 0) 65%);
+  filter: blur(4px);
+}
+
+.welcome-logo {
+  position: relative;
+  width: 96px;
+  height: 96px;
+  animation: welcome-float 3.2s ease-in-out infinite;
+}
+
+@keyframes welcome-float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+.welcome-title {
+  margin-top: 12px;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.welcome-subtitle {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.welcome-cards {
+  margin-top: 28px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 230px));
+  gap: 12px;
+}
+
+.welcome-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  text-align: left;
+  padding: 14px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.welcome-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-md);
+}
+
+.welcome-card-icon {
+  font-size: 20px;
+}
+
+.welcome-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.welcome-card-desc {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
 /* 加载指示器 */
 .loading-group .message-bubble,
 .message-bubble:has(.loading-dots) {
   padding: 14px 12px;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
-  border-radius: 8px;
+  border-radius: 4px 16px 16px 16px;
 }
 
 .loading-dots {
@@ -1951,13 +2167,14 @@ const createNewSession = async () => {
   bottom: 100%;
   left: 0;
   right: 0;
-  margin: 0 0 6px;
-  background: #1e1e2e;
-  border: 1px solid #333;
-  border-radius: 10px;
+  max-width: 760px;
+  margin: 0 auto 6px;
+  background: var(--surface-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
   overflow: hidden;
   z-index: 100;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-lg);
   max-height: 320px;
   display: flex;
   flex-direction: column;
@@ -1969,14 +2186,14 @@ const createNewSession = async () => {
   align-items: center;
   padding: 10px 16px;
   font-size: 12px;
-  color: #999;
-  border-bottom: 1px solid #333;
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
 }
 
 .skill-dropdown-hint {
   font-size: 11px;
-  color: #666;
+  color: var(--color-text-tertiary);
 }
 
 .skill-dropdown-list {
@@ -2011,13 +2228,13 @@ const createNewSession = async () => {
 .skill-dropdown-item-name {
   font-size: 14px;
   font-weight: 600;
-  color: #e0e0e0;
+  color: var(--color-text);
   margin-bottom: 2px;
 }
 
 .skill-dropdown-item-desc {
   font-size: 12px;
-  color: #888;
+  color: var(--color-text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2044,18 +2261,36 @@ const createNewSession = async () => {
 
 /* 输入区域 */
 .chat-input-wrapper {
-  padding: 16px 24px 32px;
-  background-color: var(--color-surface);
-  border-top: 1px solid var(--color-border);
+  padding: 12px 24px 16px;
   position: relative;
 }
 
+/* 浮动胶囊输入卡片 */
 .chat-input {
   display: flex;
-  gap: 12px;
+  gap: 8px;
   align-items: center;
-  max-width: 800px;
+  max-width: 760px;
   margin: 0 auto;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-md);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.chat-input:focus-within {
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-glow);
+}
+
+.input-hint {
+  max-width: 760px;
+  margin: 8px auto 0;
+  text-align: center;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
 }
 
 .chat-file-input {
@@ -2064,7 +2299,7 @@ const createNewSession = async () => {
 
 /* 附件预览条（输入框上方） */
 .chat-attachments-preview {
-  max-width: 800px;
+  max-width: 760px;
   margin: 0 auto 10px;
   display: flex;
   flex-wrap: wrap;
@@ -2076,7 +2311,6 @@ const createNewSession = async () => {
 .chat-input.is-drag-over {
   outline: 2px dashed var(--color-primary);
   outline-offset: 4px;
-  border-radius: 12px;
   background: var(--color-primary-light, rgba(255, 92, 92, 0.04));
 }
 
@@ -2098,9 +2332,9 @@ const createNewSession = async () => {
   width: 40px;
   height: 40px;
   padding: 0;
-  border-radius: 8px;
-  border: 1px solid var(--color-border);
-  background: var(--color-surface);
+  border-radius: 50%;
+  border: none;
+  background: transparent;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2109,7 +2343,6 @@ const createNewSession = async () => {
 
 .chat-input-attach:hover:not(:disabled) {
   background: var(--color-primary-light);
-  border-color: var(--color-primary);
   color: var(--color-primary);
 }
 
@@ -2120,8 +2353,7 @@ const createNewSession = async () => {
 
 .chat-input :deep(.ant-input) {
   flex: 1;
-  border-radius: 16px;
-  padding: 10px 16px;
+  padding: 9px 8px;
   resize: none;
 }
 
@@ -2155,9 +2387,9 @@ const createNewSession = async () => {
   width: 40px;
   height: 40px;
   padding: 0;
-  border-radius: 8px;
-  border: 1px solid var(--color-border);
-  background: var(--color-surface);
+  border-radius: 50%;
+  border: none;
+  background: transparent;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2166,24 +2398,23 @@ const createNewSession = async () => {
 
 .input-actions .icon-btn:hover {
   background: var(--color-primary-light);
-  border-color: var(--color-primary);
   color: var(--color-primary);
 }
 
-/* 发送按钮 - 白底 + 黑色图标，输入后红底 + 白色图标 */
+/* 发送按钮 - 圆形，输入后品牌渐变底 + 白色图标 */
 .input-actions .send-btn {
   width: 40px;
   height: 40px;
   padding: 0;
-  border-radius: 8px;
+  border-radius: 50%;
   border: 1px solid var(--color-border);
-  background: var(--color-surface);
+  background: var(--surface-2);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   transition: all 0.2s ease;
-  color: #333;
+  color: var(--color-text-secondary);
 }
 
 .input-actions .send-btn:disabled {
@@ -2191,35 +2422,43 @@ const createNewSession = async () => {
   opacity: 0.5;
 }
 
-/* 输入文字后：红底 + 白色图标 */
 .input-actions .send-btn.active {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
+  background: var(--gradient-brand);
+  border-color: transparent;
   color: #fff;
+  box-shadow: 0 2px 10px rgba(255, 92, 92, 0.35);
 }
 
 .input-actions .send-btn.active:hover {
-  background: var(--color-primary-hover);
-  border-color: var(--color-primary-hover);
+  background: var(--gradient-brand);
+  border-color: transparent;
+  transform: scale(1.06);
+  box-shadow: var(--shadow-glow);
 }
 
-/* 停止按钮 - 红底 + 白色圆角方块图标 */
+.input-actions .send-btn.active:active {
+  transform: scale(0.94);
+}
+
+/* 停止按钮 - 圆形品牌渐变底 + 白色圆角方块图标 */
 .input-actions .stop-btn {
   width: 40px;
   height: 40px;
   padding: 0;
   border: none;
-  border-radius: 8px;
-  background: var(--color-primary);
+  border-radius: 50%;
+  background: var(--gradient-brand);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   transition: all 0.2s ease;
+  box-shadow: 0 2px 10px rgba(255, 92, 92, 0.35);
 }
 
 .input-actions .stop-btn:hover {
-  background: var(--color-primary-hover);
+  transform: scale(1.06);
+  box-shadow: var(--shadow-glow);
 }
 
 .stop-icon {

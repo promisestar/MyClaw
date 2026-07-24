@@ -24,9 +24,33 @@ const allowedAttrs = [
 ]
 
 /** DOMPurify 配置（复用，避免每次调用重建） */
-const purifyConfig: DOMPurify.Config = {
+const purifyConfig = {
   ALLOWED_TAGS: allowedTags,
   ALLOWED_ATTR: allowedAttrs,
+}
+
+/**
+ * 匹配 marked 输出的代码块，捕获语言标识与代码内容。
+ * 在 DOMPurify 清理之后执行包装，新增的 div/span/button 由本模块生成，安全可控。
+ */
+const CODE_BLOCK_RE = /<pre><code(?:\s+class="language-([^"]*)")?>([\s\S]*?)<\/code><\/pre>/g
+
+/** 为代码块包裹顶部栏（语言名 + 复制按钮），复制交互由消息容器事件委托处理 */
+function wrapCodeBlocks(html: string): string {
+  return html.replace(
+    CODE_BLOCK_RE,
+    (_match, lang: string | undefined, code: string) => {
+      const langLabel = lang || 'text'
+      const codeClass = lang ? ` class="language-${lang}"` : ''
+      return (
+        `<div class="code-block">` +
+        `<div class="code-header"><span class="code-lang">${langLabel}</span>` +
+        `<button type="button" class="code-copy-btn">复制</button></div>` +
+        `<pre><code${codeClass}>${code}</code></pre>` +
+        `</div>`
+      )
+    },
+  )
 }
 
 /**
@@ -42,9 +66,10 @@ export function renderMarkdown(text: string): string {
   const html = marked.parse(text, { async: false }) as string
 
   // 清理 HTML，防止 XSS
-  const clean = DOMPurify.sanitize(html, purifyConfig)
+  const clean = DOMPurify.sanitize(html, purifyConfig) as string
 
-  return clean
+  // 代码块包裹顶部栏（语言 + 复制按钮）
+  return wrapCodeBlocks(clean)
 }
 
 /**

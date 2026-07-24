@@ -4,19 +4,71 @@
   /* 主题色 - 龙虾红 */
   --color-primary: #ff5c5c;
   --color-primary-hover: #ff7070;
-  --color-primary-light: rgba(255, 92, 92, 0.15);
+  --color-primary-active: #e64a4a;
+  --color-primary-light: rgba(255, 92, 92, 0.12);
   --color-primary-glow: rgba(255, 92, 92, 0.25);
 
-  /* 背景色 */
-  --color-background: #f5f5f5;
-  --color-surface: #ffffff;
+  /* 表面层级 */
+  --surface-1: #f3f4f6;
+  --surface-2: #ffffff;
+  --surface-3: #ffffff;
+
+  /* 背景色（兼容旧变量） */
+  --color-background: var(--surface-1);
+  --color-surface: var(--surface-2);
 
   /* 文字色 */
-  --color-text: #333333;
-  --color-text-secondary: #999999;
+  --color-text: #1f2329;
+  --color-text-secondary: #8a8f99;
+  --color-text-tertiary: #b6bac3;
 
   /* 边框色 */
-  --color-border: #f0f0f0;
+  --color-border: #e8eaee;
+  --color-border-light: #f0f1f4;
+
+  /* 阴影梯度 */
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-md: 0 4px 16px rgba(16, 24, 40, 0.08);
+  --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.12);
+  --shadow-glow: 0 6px 24px rgba(255, 92, 92, 0.28);
+
+  /* 圆角梯度 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+
+  /* 品牌渐变 */
+  --gradient-brand: linear-gradient(135deg, #ff5c5c 0%, #ff8f6b 100%);
+  --gradient-brand-soft: linear-gradient(135deg, rgba(255, 92, 92, 0.12), rgba(255, 143, 107, 0.12));
+
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --color-primary: #ff6b6b;
+  --color-primary-hover: #ff8585;
+  --color-primary-active: #ff5252;
+  --color-primary-light: rgba(255, 107, 107, 0.18);
+  --color-primary-glow: rgba(255, 107, 107, 0.35);
+
+  --surface-1: #131318;
+  --surface-2: #1c1d24;
+  --surface-3: #26272f;
+
+  --color-text: #e8eaf0;
+  --color-text-secondary: #9aa0ae;
+  --color-text-tertiary: #666c7a;
+
+  --color-border: #2e303a;
+  --color-border-light: #26272f;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.5);
+  --shadow-glow: 0 6px 24px rgba(255, 107, 107, 0.3);
+
+  color-scheme: dark;
 }
 
 *,
@@ -47,6 +99,7 @@ body {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 /* 覆盖 Ant Design 主题色 */
@@ -85,6 +138,15 @@ body {
 .ant-input-number-focused {
   border-color: var(--color-primary) !important;
   box-shadow: 0 0 0 2px var(--color-primary-glow) !important;
+}
+
+/* 聊天输入胶囊内的 textarea：无边框，聚焦态由容器 focus-within 接管 */
+.chat-input .ant-input,
+.chat-input .ant-input:focus,
+.chat-input .ant-input-focused {
+  border-color: transparent !important;
+  box-shadow: none !important;
+  background: transparent;
 }
 
 .ant-tabs-tab-active .ant-tabs-tab-btn {

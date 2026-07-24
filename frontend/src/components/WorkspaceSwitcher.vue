@@ -20,11 +20,11 @@ function basename(path: string) {
   return path.split(/[/\\]/).pop() || path
 }
 
-async function handleMenuClick({ key }: { key: string }) {
+async function handleMenuClick({ key }: { key: string | number }) {
   if (key === '__pick__') {
     await pickAndSelect()
   } else {
-    await doSelect(key)
+    await doSelect(String(key))
   }
 }
 

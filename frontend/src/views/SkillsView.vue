@@ -184,7 +184,7 @@ onMounted(() => {
                 v-model:checked="skill.enabled"
                 :loading="toggleLoading === skill.name"
                 size="small"
-                @change="(checked: boolean) => handleToggle(skill, checked)"
+                @change="(checked: string | number | boolean) => handleToggle(skill, !!checked)"
               />
             </div>
             <p class="skill-desc">{{ skill.description }}</p>
