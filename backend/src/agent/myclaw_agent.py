@@ -563,6 +563,12 @@ class MyClawAgent:
         # 重绑 config.session_dir
         self.config.session_dir = self.workspace.sessions_path
 
+        # 同步更新 hello_agents 底层 SessionStore 的存储目录
+        # SessionStore.__init__() 缓存了 Path(self.config.session_dir) 到 self.session_dir，
+        # bind_workspace 只改了 Config 对象，底层 store 仍指向旧工作区，导致 save/list/load 写错位置
+        if self._agent is not None and hasattr(self._agent, 'session_store') and self._agent.session_store:
+            self._agent.session_store.session_dir = Path(self.workspace.sessions_path)
+
         # 重绑 SkillLoader（仅切工作区目录，全局目录不变）
         self.skill_loader.update_workspace_dir(Path(self.workspace.skills_path))
         self.refresh_skill_tool()
