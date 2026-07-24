@@ -34,6 +34,11 @@ from hello_agents.tools import (
 from ..workspace.manager import WorkspaceManager
 from ..workspace.identity import IdentityManager
 from ..tools import MemoryTool, BashTool, WebSearchTool, WebFetchTool, RAGTool, MCPTool
+from ..tools import SearchContentTool, SearchFileTool, ListDirTool
+from ..tools import HttpRequestTool
+from ..tools import BrowserTool, BrowserSession
+from ..tools import AutomationTool
+from ..automation import AutomationStore
 from ..tools.builtin.mcp_tool import reset_all_mcp_disclosed_tools
 from ..tools.builtin.skill_tool import SkillTool
 from ..skills.loader import SkillLoader
@@ -171,6 +176,12 @@ class MyClawAgent:
 
         # 初始化任务追踪器（带持久化）
         self._task_tracker = TaskTracker(persist_dir=self.workspace.tasks_path)
+
+        # 浏览器会话（在 _setup_tools 中实际创建，此处预声明供 shutdown 安全引用）
+        self._browser_session = None
+
+        # 定时任务存储（在 _setup_tools 中实际创建，此处预声明供 main.py 引用）
+        self._automation_store = None
 
         # 初始化工具注册表
         self.tool_registry = self._setup_tools()
@@ -450,6 +461,42 @@ class MyClawAgent:
             "这能确保你不会遗漏任何步骤。"
         )
 
+        # ══════════════════════════════════════════════════════════
+        # P0 工具使用指引
+        # ══════════════════════════════════════════════════════════
+        context_parts.append(
+            "\n## 代码检索\n"
+            "你拥有三个代码检索工具，优先使用它们而非 execute_command 拼 shell 命令：\n"
+            "- search_content：在文件内容中搜索正则匹配（类似 grep）\n"
+            "- search_file：按文件名 glob 模式搜索文件（如 *.py）\n"
+            "- list_dir：列出目录内容（单层，带类型标注）\n\n"
+            "这三个工具自动跳过 .git/node_modules/.venv 等忽略目录，跨平台通用。"
+        )
+
+        context_parts.append(
+            "\n## HTTP 请求\n"
+            "使用 http_request 工具调用 REST API 或 JSON 接口（不要绕道 bash curl）。\n"
+            "支持任意 HTTP 方法、自定义 headers、body（dict 自动 JSON 序列化）、"
+            "basic/bearer 认证。\n"
+            "return_format=auto 时自动美化 JSON 响应。"
+        )
+
+        context_parts.append(
+            "\n## 浏览器自动化\n"
+            "使用 browser 工具操控真实浏览器（Playwright headless）。\n"
+            "通过 action 参数执行操作：navigate/click/type/fill/screenshot/evaluate/text/press/scroll/wait/close。\n"
+            "用于处理 JS 渲染的 SPA 页面、表单交互、截图等 web_fetch 无法处理的场景。\n"
+            "selector 使用 CSS 选择器语法。浏览器状态在会话内持久化。"
+        )
+
+        context_parts.append(
+            "\n## 定时任务\n"
+            "使用 automation 工具创建定时任务（每日简报、定时提醒、周期巡检等）。\n"
+            "action=create 创建任务，需要 name/prompt/schedule_type/schedule_config。\n"
+            "调度类型：once（一次性）、interval（间隔循环）、rrule（RFC 5545 RRULE）。\n"
+            "可选 webhook_url 投递执行结果。时间均为 UTC ISO 8601。"
+        )
+
         if context_parts:
             return base_prompt + "\n" + "\n".join(context_parts)
 
@@ -496,6 +543,23 @@ class MyClawAgent:
         # 重绑工具沙箱根目录（Read/Write/Edit/Bash/RAG）
         self._rebind_workspace_tools(abs_path)
 
+        # 重绑定时任务存储（指向新工作区的 automations 目录）
+        if hasattr(self, '_automation_store') and self._automation_store is not None:
+            try:
+                from ..automation import AutomationStore
+                self._automation_store = AutomationStore(
+                    automations_dir=self.workspace.automations_path,
+                )
+            except Exception:
+                pass
+
+        # 重绑浏览器会话的上传目录（截图保存到新工作区）
+        if hasattr(self, '_browser_session') and self._browser_session is not None:
+            try:
+                self._browser_session._uploads_dir = Path(self.workspace.uploads_path)
+            except Exception:
+                pass
+
         # 重绑 config.session_dir
         self.config.session_dir = self.workspace.sessions_path
 
@@ -536,9 +600,15 @@ class MyClawAgent:
         for tool in self.tool_registry.get_all_tools():
             tool_name = getattr(tool, "name", "")
 
-            # ReadTool / WriteTool / EditTool
+            # ReadTool / WriteTool / EditTool / MultiEditTool
             if hasattr(tool, "project_root"):
                 tool.project_root = abs_path
+            # Read/Write/Edit/MultiEdit 的相对路径解析用的是 working_dir（file_tools.py:268
+            # `return self.working_dir / path`），而非 project_root。仅重绑 project_root
+            # 会导致切换工作区后 Read('.') 仍指向旧工作区，看不到新工作区文件。
+            # 必须同步重绑 working_dir（Path 对象，因 `/` 运算需 Path）。
+            if hasattr(tool, "working_dir"):
+                tool.working_dir = Path(abs_path).resolve()
 
             # BashTool（name 为 execute_command）：重置白名单 + 默认工作目录 + cd 历史（防跨工作区逃逸）
             if tool_name == "execute_command" and hasattr(tool, "allowed_directories"):
@@ -674,6 +744,29 @@ class MyClawAgent:
         # MyClaw自定义工具
         registry.register_tool(WebSearchTool())  # 网页搜索工具
         registry.register_tool(RAGTool(workspace_root=self.workspace_path))  # RAG：相对路径相对工作空间根
+
+        # 代码检索三件套（P0 补全）— project_root 属性自动被 _rebind_workspace_tools 处理
+        registry.register_tool(SearchContentTool(project_root=self.workspace_path))
+        registry.register_tool(SearchFileTool(project_root=self.workspace_path))
+        registry.register_tool(ListDirTool(project_root=self.workspace_path))
+
+        # 结构化 HTTP 请求工具（P0 补全）
+        registry.register_tool(HttpRequestTool())
+
+        # Playwright 浏览器自动化工具（P0 补全）— 线程隔离 + 懒初始化
+        self._browser_session = BrowserSession(
+            timeout_config=self._timeout_config,
+            uploads_dir=self.workspace.uploads_path,
+        )
+        registry.register_tool(BrowserTool(session=self._browser_session))
+
+        # 定时任务工具（P0 补全）— store 在此处创建，供 main.py 调度器引用
+        self._automation_store = AutomationStore(
+            automations_dir=self.workspace.automations_path,
+        )
+        registry.register_tool(AutomationTool(
+            store_getter=lambda: self._automation_store,
+        ))
 
         # 自实现 Skill 工具
         self._skill_tool = SkillTool(skill_loader=self.skill_loader)

@@ -18,10 +18,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health, workspace
+from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health, workspace, automation
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
+from .automation import AutomationExecutor, AutomationScheduler
 
 # 全局 Agent 实例
 _agent: MyClawAgent = None
@@ -108,11 +109,43 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ 启动 ExternalSoftwareReceiver 失败: {e}")
 
+    # 启动定时任务调度器（后台常驻）
+    automation_scheduler: AutomationScheduler | None = None
+    try:
+        # 用 store_getter 动态取值：工作区切换后 agent 重建 store，
+        # 调度器/执行器始终引用当前 store（C2）
+        def _automation_store_getter():
+            return _agent._automation_store if _agent else None
+
+        if _automation_store_getter():
+            automation_executor = AutomationExecutor(
+                agent_getter=lambda: _agent,
+                agent_lock_getter=lambda: _agent_lock,
+                store_getter=_automation_store_getter,
+            )
+            automation_scheduler = AutomationScheduler(
+                store_getter=_automation_store_getter,
+                executor=automation_executor,
+            )
+            automation_scheduler.start()
+            automation.set_automation_store_getter(_automation_store_getter)
+            print("AutomationScheduler started (background)")
+        else:
+            print("AutomationScheduler disabled (automation_store not initialized)")
+    except Exception as e:
+        print(f"⚠️ 启动 AutomationScheduler 失败: {e}")
+
     try:
         yield
     finally:
         # 关闭时清理
         print("HelloClaw Backend shutting down...")
+        # 先停止调度器（在 agent 仍存活时，让进行中的任务有机会完成）
+        if automation_scheduler is not None:
+            try:
+                await automation_scheduler.stop()
+            except Exception as e:
+                print(f"⚠️ 停止 AutomationScheduler 失败: {e}")
         # 持久化任务追踪器
         if _agent and hasattr(_agent, '_task_tracker'):
             try:
@@ -177,6 +210,7 @@ app.include_router(agent.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
 app.include_router(health.router, prefix="/api")
 app.include_router(workspace.router, prefix="/api")
+app.include_router(automation.router, prefix="/api")
 
 
 # 多模态：当 MULTIMODAL_IMAGE_MODE=url 时注册 /files 动态路由，从当前工作区 uploads 读取

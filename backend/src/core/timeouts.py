@@ -60,6 +60,13 @@ class TimeoutConfig:
     subagent_max_ms: int = 300_000          # 5 分钟：子代理超时上限
     subagent_min_ms: int = 30_000           # 30 秒：子代理超时下限
 
+    # ── P0 补全工具超时 ──
+    browser_default_ms: int = 30_000        # 30 秒：浏览器单次操作默认超时
+    browser_max_ms: int = 120_000           # 2 分钟：浏览器操作超时上限
+    http_request_default_ms: int = 30_000   # 30 秒：HTTP 请求默认超时
+    http_request_max_ms: int = 120_000      # 2 分钟：HTTP 请求超时上限
+    automation_run_ms: int = 300_000        # 5 分钟：定时任务执行超时
+
 
 # ──────────────────────────────────────────────────────────────────
 # 配置加载
@@ -153,6 +160,13 @@ def load_timeout_config(force_reload: bool = False) -> TimeoutConfig:
     cfg.llm_retry_max_delay = _env_float("LLM_RETRY_MAX_DELAY", cfg.llm_retry_max_delay)
     cfg.llm_retry_backoff = _env_float("LLM_RETRY_BACKOFF", cfg.llm_retry_backoff)
     cfg.llm_retry_jitter = _env_float("LLM_RETRY_JITTER", cfg.llm_retry_jitter)
+
+    # ── P0 补全工具超时（env 覆盖） ──
+    cfg.browser_default_ms = _env_int("BROWSER_DEFAULT_TIMEOUT_MS", cfg.browser_default_ms)
+    cfg.browser_max_ms = _env_int("BROWSER_MAX_TIMEOUT_MS", cfg.browser_max_ms)
+    cfg.http_request_default_ms = _env_int("HTTP_REQUEST_DEFAULT_TIMEOUT_MS", cfg.http_request_default_ms)
+    cfg.http_request_max_ms = _env_int("HTTP_REQUEST_MAX_TIMEOUT_MS", cfg.http_request_max_ms)
+    cfg.automation_run_ms = _env_int("AUTOMATION_RUN_TIMEOUT_MS", cfg.automation_run_ms)
 
     _instance = cfg
     return cfg

@@ -65,6 +65,13 @@ class ContextGuard:
         # subagent 工具本身输出是摘要，很小
         "subagent": 500,
         "task": 300,
+        # ── P0 补全工具 ──
+        "search_content": 3000,   # 搜索结果可能较长
+        "search_file": 1000,      # 文件名列表
+        "list_dir": 1500,         # 目录列表
+        "http_request": 4000,     # API 响应
+        "browser": 4000,          # 浏览器操作结果/截图
+        "automation": 500,        # 定时任务 CRUD 结果
     }
 
     # ── 不适合委托的工具 ──
@@ -83,6 +90,8 @@ class ContextGuard:
         "subagent",
         "Skill",
         "calculator",
+        "browser",      # 有状态（page 持久化），不可委托
+        "automation",    # 副作用（创建/删除定时任务），不可委托
     }
 
     def __init__(
@@ -263,6 +272,32 @@ class ContextGuard:
         }
 
         formatter = formatters.get(tool_name)
+        if formatter:
+            return formatter(arguments)
+
+        # ── P0 补全工具的委托描述 ──
+        p0_formatters = {
+            "search_content": lambda args: (
+                f"使用 search_content 工具搜索内容，正则 '{args.get('pattern', 'unknown')}'"
+                + (f"，目录 {args.get('path', '工作空间根')}" if args.get('path') else "")
+                + "。只输出搜索结果，不要做任何解释或总结。"
+            ),
+            "search_file": lambda args: (
+                f"使用 search_file 工具搜索文件，glob '{args.get('pattern', 'unknown')}'"
+                + "。只输出文件列表，不要做任何解释或总结。"
+            ),
+            "list_dir": lambda args: (
+                f"使用 list_dir 工具列出目录"
+                + (f" {args.get('target_directory', '')}" if args.get('target_directory') else "")
+                + "。只输出目录内容，不要做任何解释或总结。"
+            ),
+            "http_request": lambda args: (
+                f"使用 http_request 工具请求 {args.get('method', 'GET')} {args.get('url', 'unknown')}"
+                + "。只输出响应内容，不要做任何解释或总结。"
+            ),
+        }
+
+        formatter = p0_formatters.get(tool_name)
         if formatter:
             return formatter(arguments)
 

@@ -19,7 +19,7 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 WORKSPACE_TEMPLATES_DIR = TEMPLATES_DIR / "workspace"
 
 # 工作区级 .myclaw/ 子目录
-WORKSPACE_SUBDIRS = ["sessions", "tasks", "uploads", "skills"]
+WORKSPACE_SUBDIRS = ["sessions", "tasks", "uploads", "skills", "automations"]
 
 # 工作区级必需配置文件（不存在时从模板部署）
 WORKSPACE_CONFIG_FILES = ["AGENTS"]
@@ -33,6 +33,7 @@ _GITIGNORE_ENTRIES = [
     ".myclaw/sessions/",
     ".myclaw/tasks/",
     ".myclaw/uploads/",
+    ".myclaw/automations/runs/",
     ".myclaw/HEARTBEAT.md",
     "# 以下文件可选择提交到 Git 以与团队共享：",
     "# .myclaw/AGENTS.md      <- 项目行为规范，可选择性提交",
@@ -88,6 +89,14 @@ class WorkspaceManager:
     @property
     def skills_path(self) -> str:
         return os.path.join(self.claw_dir, "skills")
+
+    @property
+    def automations_path(self) -> str:
+        return os.path.join(self.claw_dir, "automations")
+
+    @property
+    def automations_runs_path(self) -> str:
+        return os.path.join(self.claw_dir, "automations", "runs")
 
     # ==================== 全局配置读取 ====================
 
