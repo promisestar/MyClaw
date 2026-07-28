@@ -1,6 +1,6 @@
 # Agent 工程设计 — MyClaw 面试亮点详解
 
-> 本文档从"实现一个生产级 Agent 助手"的工程视角，梳理 MyClaw 后端在架构设计上的核心亮点。每个亮点包含**设计动机**、**实现方案**、**代码引用**和**对比分析**，适用于面试展示和技术复盘。
+> 本文档从"实现一个生产级 Agent 助手"的工程视角，梳理 MyClaw 后端在架构设计上的核心亮点（前端部分见第 16 章）。每个亮点包含**设计动机**、**实现方案**、**代码引用**和**对比分析**，适用于面试展示和技术复盘。
 
 ---
 
@@ -21,7 +21,8 @@
 13. [多模态 Token 估算与自适应压缩](#13-多模态-token-估算与自适应压缩)
 14. [身份与工作区解耦的运行时切换](#14-身份与工作区解耦的运行时切换)
 15. [最难的部分：三道硬关与攻克方案](#15-最难的部分三道硬关与攻克方案)
-16. [面试展示策略](#16-面试展示策略)
+16. [前端 SSE 流式增量渲染与无损编辑](#16-前端-sse-流式增量渲染与无损编辑)
+17. [面试展示策略](#17-面试展示策略)
 
 ---
 
@@ -1225,7 +1226,134 @@ SIDE_EFFECT_BLACKLIST = {
 > "Agent 最稀缺的不是算力，是上下文窗口。它是一个有限资源（128K tokens）的多租户分配问题——系统提示词、对话历史、工具输出、记忆注入、子代理摘要全在抢。我用了三层防线：事前 Context Guard 预判大输出委托子代理，事中 Context Manager 截断 + 自动压缩，事后副作用黑名单防止误委托。图片用递进压缩先降质量再降尺寸，历史里不存 base64 只存路径引用。还有一个'条件注入'思路——入职引导完成后自动消失、低相关记忆不注入——不让不该占窗口的东西抢空间。每个阈值都是经验调出来的，没有正确解只有更优解。"
 
 ---
-## 16. 面试展示策略
+## 16. 前端 SSE 流式增量渲染与无损编辑
+
+### 设计动机
+
+AI 聊天前端通常只需要处理"用户发消息 → 流式接收文本"的简单流程。但 Agent 系统的对话远比这复杂——每一轮对话中包含多个 ReAct 步骤（思考 → 工具调用 → 再思考），SSE 事件流中文本片段（chunk）和工具调用卡片（tool_start / tool_finish）交替到达。如果每个事件都重新渲染整个消息体，性能很差；如果只追加到末尾，则无法表达"文本 → 工具卡片 → 更多文本"的交错布局。
+
+此外，用户编辑历史消息并重新发送是一种高频操作。传统做法是删除该消息之后的所有历史再重发，导致后续有价值的对话丢失。
+
+### 实现方案
+
+#### 16.1 SSE 事件驱动的混合增量渲染
+
+前端没有使用浏览器内置的 `EventSource`（它不支持 POST 请求和自定义请求体），而是基于 `fetch` + `ReadableStream` 手动实现了 SSE 解析器（`chatApi.sendMessageStream`，`chat.ts:84-197`）：
+
+```typescript
+// 手动 SSE 解析循环
+const reader = response.body?.getReader()
+const decoder = new TextDecoder()
+let buffer = ''
+
+while (true) {
+  const { done, value } = await reader.read()
+  if (done) break
+  buffer += decoder.decode(value, { stream: true })
+
+  // 按行分割，处理 event: / data: 配对
+  const lines = buffer.split('\n')
+  buffer = lines.pop() || ''  // 保留不完整的最后一行
+
+  for (const line of lines) {
+    if (line.startsWith('event:')) { currentEvent = line.substring(6).trim() }
+    else if (line.startsWith('data:')) {
+      const parsed = JSON.parse(data)
+      // 根据 currentEvent 类型分发给回调
+    }
+  }
+}
+```
+
+ChatView 收到事件后，不是简单地拼字符串，而是维护一个 **混合消息段列表**（`MessageSegment[]`），每段可以是 `TextSegment` 或 `ToolSegment`：
+
+```typescript
+interface TextSegment {
+  type: 'text'
+  id: number
+  content: string          // 增量拼接
+}
+
+interface ToolSegment {
+  type: 'tool'
+  id: number
+  tool: string
+  args: Record<string, unknown>
+  result?: string
+  status: 'running' | 'done' | 'error'  // 实时切换
+}
+```
+
+9 种 SSE 事件被映射为对段列表的操作：
+
+| SSE 事件 | 前端操作 |
+|----------|---------|
+| `step_start` | 新建 TextSegment，插入段列表 |
+| `chunk` | 找到当前 TextSegment，`content += event.content` |
+| `tool_start` | 插入 ToolSegment（status: running），显示加载动画 |
+| `tool_finish` | 找到对应 ToolSegment，更新 result 和 status |
+| `step_finish` | 标记当前步骤完成 |
+| `done` | 对话结束，保存会话 ID |
+| `cancelled` | 显示取消提示 |
+| `error` | 显示错误信息 |
+| `session` | 绑定会话 ID（首次对话时由后端分配） |
+
+工具调用卡片与文本段在同一列表中交替排列，Vue 模板中 `v-for="segment in msg.segments"` 根据 `segment.type` 渲染不同组件。整个过程只操作数组引用（`messages.value = [...messages.value]`），Vue 的响应式系统自动处理最小化 DOM 更新。
+
+#### 16.2 前端消息编辑与无损回执
+
+前端实现了与后端"时间线分叉"（§10）完美配合的前端编辑流程。`replaceUserTurnInUi` 是核心函数（`ChatView.vue:920-938`）：
+
+```typescript
+const replaceUserTurnInUi = (turn: number, newContent: string, attachments?) => {
+  const split = splitMessagesAtUserTurn(turn)
+  if (!split) return null
+
+  const userMsg: Message = {
+    id: Date.now(),
+    role: 'user',
+    content: newContent,
+    userTurnIndex: turn,
+    attachments,
+  }
+
+  // 无损替换：prefix + 新用户消息 + suffix（后续对话完整保留）
+  messages.value = [...split.prefix, userMsg, ...split.suffix]
+  return split.assistantInsertAt  // 返回插入点，供新回复使用
+}
+```
+
+`splitMessagesAtUserTurn` 根据 `userTurnIndex` 精确定位要替换的轮次，将消息列表拆为三部分：
+
+```
+原始消息列表:
+  [User-0] [Assistant-0] [User-1] [Assistant-1] [User-2] [Assistant-2]
+                                    ↑ 编辑这一轮
+
+splitMessagesAtUserTurn(1) 输出:
+  prefix:  [User-0] [Assistant-0]            ← 保留
+  suffix:  [User-2] [Assistant-2]            ← 保留
+  ↓ 替换 User-1 内容，清空旧的 Assistant-1
+```
+
+编辑弹窗还处理了一个细节：用户消息的 `content` 可能包含 `<file name="..." kind="...">...</file>` 文档注入块（由后端的 `build_user_content` 生成）。编辑时用正则 `USER_FILE_BLOCK_RE` 剥离这些块，只让用户编辑自然语言部分，提交时再原样拼回——用户不会看到或误删文档内容。
+
+### 与纯文本流式 UI 的对比
+
+| 特性 | 纯文本流式 | MyClaw 前端 |
+|------|----------|------------|
+| SSE 解析 | `EventSource`（仅 GET） | `fetch` + `ReadableStream` 手动解析（支持 POST + 自定义 body） |
+| 内容模型 | 单一字符串 | 混合段列表（文本 + 工具卡片交替） |
+| 编辑历史 | 删除后续所有消息 | `replaceUserTurnInUi` 无损替换，后续对话完整保留 |
+| 取消机制 | `AbortController` 断开 | `AbortController` + `POST /chat/cancel` 双向协同（§12） |
+
+### 面试展示要点
+
+> "前端的挑战在于 Agent 的对话不只是流式文本——每一轮 ReAct 中有多个工具调用卡片和文本块交替出现。我维护了一个混合段列表，9 种 SSE 事件映射为对段列表的增删改操作，Vue 响应式系统自动处理 DOM 更新。消息编辑也不是简单的删除重发——我用 splitMessagesAtUserTurn 精准拆分 prefix/suffix，替换单轮后无缝拼回，后续对话完整保留。编辑弹窗自动剥离 `<file>` 注入块，用户只看到自然语言。"
+
+---
+
+## 17. 面试展示策略
 
 ### 推荐展示顺序（15 分钟 talk）
 
@@ -1238,6 +1366,8 @@ SIDE_EFFECT_BLACKLIST = {
 | 12-13 min | **SubAgent 上下文隔离 + Task 依赖管理** | 展示架构扩展性 |
 | 13-14 min | 踩过的坑 + 如果重新来过会怎么做不同 | 展示反思能力 |
 | 14-15 min | 总结一句话 | 留下核心印象 |
+
+> **补充**：如果面试官对全栈能力感兴趣，可以在 12-13 min 或 13-14 min 顺带提一下[前端 SSE 流式增量渲染与无损编辑](#16-前端-sse-流式增量渲染与无损编辑)（混合段列表模型 + 消息无损编辑），展示对前端也有工程化思考。不作为主推点。
 
 ### 短版（5 分钟）
 

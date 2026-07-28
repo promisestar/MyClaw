@@ -13,6 +13,7 @@ import {
   HeartOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
+  ScheduleOutlined,
 } from '@ant-design/icons-vue'
 import LobsterIcon from '@/assets/lobster.svg'
 import WorkspaceSwitcher from '@/components/WorkspaceSwitcher.vue'
@@ -142,6 +143,12 @@ onBeforeUnmount(() => {
               <RouterLink to="/tool-logs">
                 <FileTextOutlined />
                 <span>工具日志</span>
+              </RouterLink>
+            </Menu.Item>
+            <Menu.Item key="automation">
+              <RouterLink to="/automation">
+                <ScheduleOutlined />
+                <span>定时任务</span>
               </RouterLink>
             </Menu.Item>
             <Menu.Item key="memory">

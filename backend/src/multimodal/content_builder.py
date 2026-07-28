@@ -58,6 +58,14 @@ def _format_doc_snippet(filename: str, kind: str, text: str, error: Optional[str
     return f"{header}\n{body}\n</file>"
 
 
+# 当用户上传文档附件时注入到消息中的提示，引导 Agent 直接基于已提取的内容回复，
+# 避免 Agent 画蛇添足地调用 Read 工具重复读取（二进制文档会导致 UnicodeDecodeError）。
+_DOC_ATTACHMENT_HINT = (
+    "[系统提示] 以下 <file> 标签内的内容是用户上传文档已自动提取的全文，"
+    "你可以直接基于此内容回复用户，无需使用 Read 工具读取该文件。"
+)
+
+
 def build_user_content(
     text: str,
     attachments: Iterable[dict],
@@ -85,6 +93,7 @@ def build_user_content(
     image_parts: list[dict] = []
 
     extractor = DocumentExtractor()
+    doc_hint_injected = False
 
     for att in attachments:
         abs_path = _attachment_abs_path(att, workspace_root)
@@ -111,6 +120,10 @@ def build_user_content(
             continue
 
         if kind == "doc":
+            # 首个文档附件前注入一次提示，引导 Agent 直接使用已提取内容
+            if not doc_hint_injected:
+                text_parts.append("\n\n" + _DOC_ATTACHMENT_HINT)
+                doc_hint_injected = True
             res = extractor.extract_text(abs_path)
             snippet = _format_doc_snippet(filename, res.kind, res.text, res.error)
             text_parts.append("\n\n" + snippet)

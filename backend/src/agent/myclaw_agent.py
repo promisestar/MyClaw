@@ -715,7 +715,10 @@ class MyClawAgent:
         registry = ToolRegistry()
 
         # HelloAgents 内置工具（设置元数据属性供 ContextGuard 动态路由）
-        read_tool = ReadTool(project_root=self.workspace_path)
+        # DocAwareReadTool 继承 ReadTool，遇到 PDF/DOCX/XLSX/PPTX 等二进制文档
+        # 时自动委托 DocumentExtractor 提取文本，而非 UnicodeDecodeError
+        from ..tools.builtin.doc_aware_read import DocAwareReadTool
+        read_tool = DocAwareReadTool(project_root=self.workspace_path)
         read_tool.output_size_hint = 5000
         read_tool.has_side_effects = False
         registry.register_tool(read_tool)

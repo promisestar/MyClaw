@@ -20,6 +20,19 @@ from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
 
+# markitdown 是 pyproject.toml 的必装依赖（markitdown[all]==0.1.5），
+# 在模块级导入一次并复用单例，避免每次 extract_text 都重建实例。
+# 若运行时因系统级依赖缺失导致导入失败，降级为 None 并记录警告。
+_markitdown_instance = None
+_markitdown_available = True
+
+try:
+    from markitdown import MarkItDown as _MarkItDown
+    _markitdown_instance = _MarkItDown()
+except Exception as _exc:  # pragma: no cover - 仅在系统依赖缺失时触发
+    logger.warning("markitdown 初始化失败，文档解析将降级: %s", _exc)
+    _markitdown_available = False
+
 
 DocKind = Literal["pdf", "docx", "xlsx", "pptx", "text", "html", "csv", "json", "unknown"]
 
@@ -116,15 +129,6 @@ def _fallback_plain_text(path: str) -> str:
         return ""
 
 
-def _get_markitdown():
-    try:
-        from markitdown import MarkItDown
-        return MarkItDown()
-    except Exception as exc:
-        logger.warning("markitdown 不可用: %s", exc)
-        return None
-
-
 def _extract_text_from_result(result) -> str:
     if result is None:
         return ""
@@ -163,9 +167,8 @@ class DocumentExtractor:
             text = _fallback_plain_text(str(p))
             return ExtractResult(text=text, kind=kind, chars=len(text))
 
-        # 2) 结构化文档：交给 markitdown
-        md = _get_markitdown()
-        if md is None:
+        # 2) 结构化文档：交给 markitdown（模块级单例）
+        if not _markitdown_available or _markitdown_instance is None:
             # markitdown 不可用：纯文本兜底（仅对安全格式）
             if _is_plain_text_safe(str(p)):
                 text = _fallback_plain_text(str(p))
@@ -175,7 +178,7 @@ class DocumentExtractor:
                                  error="markitdown 不可用，无法解析二进制文档")
 
         try:
-            result = md.convert(str(p))
+            result = _markitdown_instance.convert(str(p))
             text = _extract_text_from_result(result)
             if text:
                 return ExtractResult(text=text, kind=kind, chars=len(text))
