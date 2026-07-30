@@ -22,6 +22,8 @@ import AttachmentChip from '@/components/AttachmentChip.vue'
 import UserMessageContent from '@/components/UserMessageContent.vue'
 import TaskCard from '@/components/TaskCard.vue'
 import TaskPanel from '@/components/TaskPanel.vue'
+import AgentModeSelector, { type AgentMode } from '@/components/AgentModeSelector.vue'
+import { FileSearchOutlined } from '@ant-design/icons-vue'
 import LobsterIcon from '@/assets/lobster.svg'
 import { useWorkspaceStore } from '@/stores/workspace'
 
@@ -167,6 +169,13 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 const uploading = ref(false)
 const editModalOpen = ref(false)
 const editDraft = ref('')
+
+// Agent 模式选择器
+const agentMode = ref<AgentMode>('craft')
+// Plan 模式：LLM 生成的计划
+const planGenerated = ref(false)
+const renderedPlan = ref('')
+const pendingPlan = ref<import('@/api/chat').PlanTodoItem[] | null>(null)
 const editingUserTurnIndex = ref<number | null>(null)
 
 /** TaskPanel 组件引用（用于工具调用结束后刷新任务进度） */
@@ -1018,7 +1027,53 @@ interface ChatRequestOptions {
   attachments?: PendingAttachment[]
   /** 跳过自动清空 pendingAttachments（编辑/重发场景不要清掉当前输入框中的附件） */
   skipAttachmentsClear?: boolean
+  /** Agent 模式：ask/plan/craft，不传时使用当前 agentMode 状态 */
+  mode?: AgentMode
+  /** Plan 确认后重新发送时传 true */
+  planConfirmed?: boolean
+  /** 跳过在前端追加用户消息（Plan 确认场景，用户消息已在规划阶段显示） */
+  skipUserMessage?: boolean
 }
+
+// 输入框 placeholder 随模式联动
+const inputPlaceholder = computed(() => {
+  switch (agentMode.value) {
+    case 'ask':
+      return '只读模式：提问、搜索、分析，不能修改文件 (Enter 发送)'
+    case 'plan':
+      return '规划模式：先分析计划，确认后执行 (Enter 发送)'
+    default:
+      return '输入 / 使用技能 (Enter 发送, Shift+Enter 换行)'
+  }
+})
+
+// Plan 确认：用户点击"确认，开始执行"
+const confirmPlan = async () => {
+  if (!pendingPlan.value || !currentSessionId.value) return
+  planGenerated.value = false
+  // 以 craft 模式 + plan_confirmed 重新发送原消息
+  // skipUserMessage: 用户消息已在规划阶段显示，不重复追加
+  await runChatRequest(lastPlanMessage.value, {
+    mode: 'craft',
+    planConfirmed: true,
+    skipInputClear: true,
+    skipUserMessage: true,
+  })
+  pendingPlan.value = null
+  renderedPlan.value = ''
+  lastPlanMessage.value = ''
+}
+
+// Plan 取消：用户点击"取消"
+const cancelPlan = () => {
+  planGenerated.value = false
+  pendingPlan.value = null
+  renderedPlan.value = ''
+  lastPlanMessage.value = ''
+}
+
+// 暂存 Plan 模式的原始消息（确认时重新发送）
+const lastPlanMessage = ref('')
 
 const runChatRequest = async (userMessage: string, options: ChatRequestOptions = {}) => {
   // 允许「仅附件」无文字提交：当 options.attachments 或 pendingAttachments 非空时也放行
@@ -1041,7 +1096,7 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
 
   if (isResend) {
     assistantInsertAt = replaceUserTurnInUi(options.userTurnIndex!, userMessage, attachmentsSnapshot) ?? undefined
-  } else {
+  } else if (!options.skipUserMessage) {
     const userTurnIndex = countUserMessages()
     messages.value.push({
       id: Date.now(),
@@ -1185,6 +1240,25 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
           console.log('Agent generation cancelled:', event.error)
         } else if (event.type === 'error') {
           message.error(event.error || '发送消息失败')
+        } else if (event.type === 'plan_generated') {
+          // Plan 模式：LLM 生成了结构化 TODO 计划
+          pendingPlan.value = event.plan || []
+          // 渲染计划为 Markdown
+          const planLines: string[] = ['## 执行计划\n']
+          for (const item of event.plan || []) {
+            const deps = item.dependencies?.length > 0
+              ? ` *(依赖: ${item.dependencies.join(', ')})*`
+              : ''
+            const tools = item.tools_required?.length > 0
+              ? ` [工具: ${item.tools_required.join(', ')}]`
+              : ''
+            planLines.push(`- [ ] ${item.description}${deps}${tools}`)
+          }
+          renderedPlan.value = renderMarkdown(planLines.join('\n'))
+          planGenerated.value = true
+          lastPlanMessage.value = userMessage
+          // 滚动到底部展示计划卡片
+          scrollToBottom()
         }
       },
       {
@@ -1202,6 +1276,8 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
               size: a.size,
             }))
           : undefined,
+        mode: options.mode ?? agentMode.value,
+        planConfirmed: options.planConfirmed,
         signal: abortController.value.signal,
       }
     )
@@ -1472,6 +1548,21 @@ const createNewSession = async () => {
         :loading="loading"
       />
 
+      <!-- Plan 确认卡片（Plan 模式下 plan_generated 时显示） -->
+      <Transition name="plan-card-fade">
+        <div v-if="planGenerated" class="plan-card">
+          <div class="plan-card-header">
+            <FileSearchOutlined />
+            <span>执行计划</span>
+          </div>
+          <div class="plan-card-body" v-html="renderedPlan" />
+          <div class="plan-card-actions">
+            <Button @click="cancelPlan">取消</Button>
+            <Button type="primary" @click="confirmPlan">确认，开始执行</Button>
+          </div>
+        </div>
+      </Transition>
+
       <!-- 技能下拉选择器 -->
       <Transition name="skill-dropdown-fade">
         <div v-if="skillDropdownVisible" class="skill-dropdown">
@@ -1540,11 +1631,13 @@ const createNewSession = async () => {
             </template>
           </Button>
         </Tooltip>
+        <!-- 模式选择器（紧贴输入框左侧） -->
+        <AgentModeSelector v-model="agentMode" />
         <!-- 输入框 -->
         <Input.TextArea
           ref="inputRef"
           v-model:value="inputMessage"
-          placeholder="输入 / 使用技能 (Enter 发送, Shift+Enter 换行)"
+          :placeholder="inputPlaceholder"
           :auto-size="{ minRows: 1, maxRows: 4 }"
           @press-enter="(e: KeyboardEvent) => { if (skillDropdownVisible) { handleSkillKeydown(e); return; } if (!e.shiftKey) { e.preventDefault(); sendMessage() } }"
           @keydown="handleSkillKeydown"
@@ -2263,6 +2356,66 @@ const createNewSession = async () => {
 .chat-input-wrapper {
   padding: 12px 24px 16px;
   position: relative;
+}
+
+/* Plan 确认卡片 */
+.plan-card {
+  max-width: 760px;
+  margin: 0 auto 8px;
+  border-radius: 12px;
+  border: 1px solid var(--border-light-divider, #e9ebf0);
+  background: #fff;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .08);
+  overflow: hidden;
+}
+
+.plan-card-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-heavygray, #262e40);
+  border-bottom: 1px solid var(--border-light-divider, #e9ebf0);
+}
+
+.plan-card-body {
+  padding: 12px 16px;
+  max-height: 300px;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-midgray, #475166);
+}
+
+.plan-card-body ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.plan-card-body li {
+  margin-bottom: 6px;
+}
+
+.plan-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border-light-divider, #e9ebf0);
+}
+
+/* Plan 卡片淡入过渡 */
+.plan-card-fade-enter-active,
+.plan-card-fade-leave-active {
+  transition: all .3s ease;
+}
+
+.plan-card-fade-enter-from,
+.plan-card-fade-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
 }
 
 /* 浮动胶囊输入卡片 */

@@ -22,8 +22,19 @@ export interface ChatResponse {
   session_id: string | null
 }
 
+/** Agent 模式：ask（只读）| plan（规划→确认→执行）| craft（全自动） */
+export type AgentMode = 'ask' | 'plan' | 'craft'
+
+/** Plan 模式生成的结构化 TODO 项 */
+export interface PlanTodoItem {
+  id: string
+  description: string
+  dependencies: string[]
+  tools_required: string[]
+}
+
 export interface StreamEvent {
-  type: 'session' | 'step_start' | 'chunk' | 'tool_start' | 'tool_finish' | 'step_finish' | 'done' | 'cancelled' | 'error'
+  type: 'session' | 'step_start' | 'chunk' | 'tool_start' | 'tool_finish' | 'step_finish' | 'done' | 'cancelled' | 'error' | 'plan_generated'
   content?: string
   tool?: string
   args?: Record<string, unknown>
@@ -34,6 +45,8 @@ export interface StreamEvent {
   max_steps?: number
   /** 对话完成后由服务端推送的上下文窗口用量 */
   context_usage?: ContextUsage
+  /** plan_generated 事件：结构化 TODO 列表 */
+  plan?: PlanTodoItem[]
 }
 
 export type StreamCallback = (event: StreamEvent) => void
@@ -49,6 +62,10 @@ export interface SendMessageOptions {
   attachments?: ChatAttachment[]
   /** 工作区路径（指定后后端切换到该工作区再处理消息） */
   workspacePath?: string
+  /** Agent 模式：ask（只读）| plan（规划→确认→执行）| craft（全自动），默认 craft */
+  mode?: AgentMode
+  /** Plan 模式：用户确认计划后发起新请求时传 true，后端加载已生成的 TODO 进入执行阶段 */
+  planConfirmed?: boolean
   signal?: AbortSignal
 }
 
@@ -86,7 +103,7 @@ export const chatApi = {
     onChunk: StreamCallback,
     options: SendMessageOptions = {}
   ): Promise<ChatResponse> => {
-    const { sessionId, userTurnIndex, regenerate, skill, attachments, workspacePath, signal } = options
+    const { sessionId, userTurnIndex, regenerate, skill, attachments, workspacePath, mode, planConfirmed, signal } = options
     const body: Record<string, unknown> = {
       message,
       session_id: sessionId,
@@ -103,6 +120,12 @@ export const chatApi = {
     }
     if (workspacePath) {
       body.workspace_path = workspacePath
+    }
+    if (mode) {
+      body.mode = mode
+    }
+    if (planConfirmed) {
+      body.plan_confirmed = true
     }
 
     const response = await fetch(`${API_BASE}/api/chat/send/stream`, {
@@ -180,6 +203,13 @@ export const chatApi = {
                   onChunk({ type: 'cancelled', error: parsed.reason || 'cancelled' })
                 } else if (currentEvent === 'error') {
                   onChunk({ type: 'error', error: parsed.error })
+                } else if (currentEvent === 'plan_generated') {
+                  // Plan 模式：LLM 生成的结构化 TODO 计划
+                  onChunk({
+                    type: 'plan_generated',
+                    plan: parsed.plan || [],
+                    content: parsed.content || '',
+                  })
                 }
               } catch {
                 // 忽略解析错误

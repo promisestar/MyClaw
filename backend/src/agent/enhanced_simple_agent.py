@@ -117,6 +117,12 @@ class EnhancedSimpleAgent(SimpleAgent):
         # 模块级超时配置
         self._timeout_config = timeout_config or TimeoutConfig()
 
+        # 工具模式过滤器（Ask/Plan 规划期屏蔽副作用工具）
+        from .tool_mode_filter import ToolMode, ToolModeFilter
+        self._tool_mode_filter: Optional[ToolModeFilter] = None
+        if self.tool_registry:
+            self._tool_mode_filter = ToolModeFilter(self.tool_registry)
+
         # 统一重试执行器（同步/异步共享错误分类和延迟计算）
         self._retry_executor = RetryExecutor(
             max_retries=max_tool_retries,
@@ -138,6 +144,43 @@ class EnhancedSimpleAgent(SimpleAgent):
             llm=self.llm,
         )
         self.context_manager.recalculate_history_tokens()
+
+    # ------------------------------------------------------------------ #
+    # 工具模式过滤（Ask/Plan 规划期屏蔽副作用工具）
+    # ------------------------------------------------------------------ #
+
+    def set_tool_mode(self, mode) -> None:
+        """设置工具访问模式。
+
+        Args:
+            mode: ToolMode.READ_ONLY（只读）或 ToolMode.FULL（全部）
+        """
+        if self._tool_mode_filter:
+            self._tool_mode_filter.set_mode(mode)
+
+    def _build_tool_schemas(self) -> list:
+        """构建工具 schema 列表 — 覆盖父类方法，应用模式过滤。
+
+        READ_ONLY 模式下过滤掉副作用工具（write/edit/bash/automation），
+        仅暴露只读工具给 LLM。
+        """
+        if not self.tool_registry:
+            return []
+
+        # 优先使用 ToolModeFilter 过滤
+        if self._tool_mode_filter:
+            return self._tool_mode_filter.get_filtered_schemas()
+
+        # 降兜：无 filter 时调用父类
+        return super()._build_tool_schemas()
+
+    def _get_available_tool_names(self) -> list:
+        """获取当前模式下可用的工具名列表。"""
+        if self._tool_mode_filter:
+            return self._tool_mode_filter.get_available_tool_names()
+        if self.tool_registry:
+            return self.tool_registry.list_tools()
+        return []
 
     @property
     def _history(self) -> List[Message]:
@@ -609,6 +652,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         tracked_temp_files: Set[Path],
         tool_call_records: List[Dict[str, Any]],
         tool_results_by_id: Dict[str, str],
+        executed_ids: Set[str],
         cancel_token: Optional[CancellationToken] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """批量执行工具调用，无副作用工具并行，有副作用工具串行。
@@ -633,7 +677,22 @@ class EnhancedSimpleAgent(SimpleAgent):
         serial_calls: List[Dict[str, Any]] = []
         for tc in tool_calls:
             tool_name = tc["name"]
-            tool = self.tool_registry.get_tool(tool_name) if self.tool_registry else None
+            # 工具门控：READ_ONLY 模式下副作用工具返回 None
+            if self._tool_mode_filter:
+                tool = self._tool_mode_filter.get_tool(tool_name)
+            else:
+                tool = self.tool_registry.get_tool(tool_name) if self.tool_registry else None
+            # 工具被模式过滤时，跳过并返回拒绝信息
+            if tool is None and self.tool_registry and self.tool_registry.get_tool(tool_name):
+                # 工具存在但被模式过滤
+                from .tool_mode_filter import SIDE_EFFECT_TOOLS
+                if tool_name in SIDE_EFFECT_TOOLS:
+                    tool_results_by_id[tc["id"]] = (
+                        f"⚠️ 当前为只读模式，工具 '{tool_name}' 被禁用。"
+                        f"请切换到 Craft 或 Plan 模式执行修改操作。"
+                    )
+                    executed_ids.add(tc["id"])
+                    continue
             has_side_effects = getattr(tool, "has_side_effects", True) if tool else True
             if has_side_effects:
                 serial_calls.append(tc)
@@ -759,7 +818,7 @@ class EnhancedSimpleAgent(SimpleAgent):
             tool_schemas = self._build_tool_schemas()
             print(
                 f"🔧 同步第 {current_iteration} 轮可用工具 "
-                f"({len(tool_schemas)}): {self.tool_registry.list_tools()}"
+                f"({len(tool_schemas)}): {self._get_available_tool_names()}"
             )
 
             try:
@@ -1011,11 +1070,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                 current_iteration += 1
 
                 tool_schemas = self._build_tool_schemas()
-                tool_names = (
-                    list(self.tool_registry._tools.keys())
-                    if self.tool_registry
-                    else []
-                )
+                tool_names = self._get_available_tool_names()
                 print(
                     f"🔧 第 {current_iteration} 轮可用工具 "
                     f"({len(tool_schemas)}): {tool_names}"
@@ -1226,6 +1281,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                                         tracked_temp_files=tracked_temp_files,
                                         tool_call_records=iteration_tool_records,
                                         tool_results_by_id=tool_results_by_id,
+                                        executed_ids=executed_ids,
                                         cancel_token=cancel_token,
                                     ):
                                         yield tool_event
@@ -1359,6 +1415,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                         tracked_temp_files=tracked_temp_files,
                         tool_call_records=iteration_tool_records,
                         tool_results_by_id=tool_results_by_id,
+                        executed_ids=executed_ids,
                         cancel_token=cancel_token,
                     ):
                         yield tool_event

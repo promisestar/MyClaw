@@ -53,6 +53,10 @@ class ChatRequest(BaseModel):
     attachments: List[Attachment] = Field(default_factory=list)
     # 工作区路径（可选，指定后切换到该工作区再处理消息）
     workspace_path: Optional[str] = None
+    # Agent 模式：ask（只读）| plan（规划→确认→执行）| craft（全自动），默认 craft
+    mode: Optional[str] = "craft"
+    # Plan 模式：用户确认计划后传 true，后端加载已生成的 TODO 进入执行阶段
+    plan_confirmed: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -177,6 +181,8 @@ async def send_message_stream(request: ChatRequest, http_request: Request):
                     regenerate=request.regenerate,
                     attachments=attachments,
                     cancel_token=cancel_token,
+                    mode=request.mode,
+                    plan_confirmed=request.plan_confirmed,
                 ):
                     event_type = event.type.value
                     event_data = event.data
@@ -234,6 +240,16 @@ async def send_message_stream(request: ChatRequest, http_request: Request):
                             "event": "step_finish",
                             "data": json.dumps({
                                 "step": event_data.get("step", 1)
+                            }, ensure_ascii=False)
+                        }
+
+                    elif event_type == "plan_generated":
+                        # Plan 模式：LLM 生成的结构化 TODO 计划
+                        yield {
+                            "event": "plan_generated",
+                            "data": json.dumps({
+                                "plan": event_data.get("plan", []),
+                                "content": event_data.get("content", ""),
                             }, ensure_ascii=False)
                         }
 

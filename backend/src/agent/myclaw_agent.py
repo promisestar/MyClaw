@@ -2,8 +2,11 @@
 
 import os
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from hello_agents import Config
 from hello_agents.core.message import Message
@@ -47,6 +50,9 @@ from ..core.timeouts import TimeoutConfig, get_timeout_config
 # SubAgent 编排器 + 任务追踪器
 from .subagent_orchestrator import SubAgentOrchestrator, SubAgentTask, SubAgentResultMode
 from .task_tracker import TaskTracker
+from .todo_scheduler import TodoScheduler
+from .tool_mode_filter import ToolMode
+from .profile_aggregator import ProfileAggregator
 from ..tools.builtin.subagent_tool import SubAgentTool
 from ..tools.builtin.task_tool import TaskTool
 
@@ -176,6 +182,11 @@ class MyClawAgent:
 
         # 初始化任务追踪器（带持久化）
         self._task_tracker = TaskTracker(persist_dir=self.workspace.tasks_path)
+        # Plan 模式 DAG 调度器
+        self._todo_scheduler = TodoScheduler()
+        # 用户画像聚合器（对话驱动自动聚合）
+        self._profile_aggregator: Optional[ProfileAggregator] = None
+        self._chat_turn_count = 0  # 对话轮次计数（用于画像聚合触发）
 
         # 浏览器会话（在 _setup_tools 中实际创建，此处预声明供 shutdown 安全引用）
         self._browser_session = None
@@ -234,6 +245,13 @@ class MyClawAgent:
         self._memory_capture_manager = MemoryCaptureManager(
             memory_store=self._memory_store,
             workspace_manager=self.workspace,  # 过渡期回退
+        )
+
+        # 初始化用户画像聚合器
+        self._profile_aggregator = ProfileAggregator(
+            memory_store=self._memory_store,
+            identity_manager=self.identity,
+            llm=self._llm,  # 复用主 LLM（后续可降级为轻量模型）
         )
 
     def _ensure_base_agents_md(self):
@@ -554,6 +572,148 @@ class MyClawAgent:
             if hasattr(tool, "workspace_manager"):
                 tool.workspace_manager = self.workspace
 
+    # ------------------------------------------------------------------ #
+    # Plan 模式辅助方法
+    # ------------------------------------------------------------------ #
+
+    def _parse_plan_from_response(self, response: str) -> List[Dict[str, Any]]:
+        """从 LLM 响应中解析结构化 TODO JSON。
+
+        LLM 在规划期输出包含 JSON 代码块的响应，
+        本方法提取并解析其中的 TODO 列表。
+
+        Args:
+            response: LLM 的完整文本响应
+
+        Returns:
+            TODO 列表，每项含 id/description/dependencies/tools_required。
+            解析失败返回空列表。
+        """
+        import re
+        import json
+
+        # 尝试提取 ```json ... ``` 代码块
+        json_pattern = r'```json\s*\n(.*?)\n```'
+        matches = re.findall(json_pattern, response, re.DOTALL)
+
+        for match in matches:
+            try:
+                data = json.loads(match.strip())
+                if isinstance(data, list) and len(data) > 0:
+                    # 验证每项有 description 字段
+                    valid = all(
+                        isinstance(item, dict) and item.get("description")
+                        for item in data
+                    )
+                    if valid:
+                        return data
+            except json.JSONDecodeError:
+                continue
+
+        # 尝试直接提取裸 JSON 数组
+        bare_pattern = r'\[\s*\{.*?\}\s*\]'
+        bare_matches = re.findall(bare_pattern, response, re.DOTALL)
+        for match in bare_matches:
+            try:
+                data = json.loads(match)
+                if isinstance(data, list) and len(data) > 0:
+                    valid = all(
+                        isinstance(item, dict) and item.get("description")
+                        for item in data
+                    )
+                    if valid:
+                        return data
+            except json.JSONDecodeError:
+                continue
+
+        logger.warning("无法从 LLM 响应中解析 TODO JSON")
+        return []
+
+    def _store_pending_plan(
+        self, session_id: str, todo_list: List[Dict], plan_text: str
+    ) -> None:
+        """暂存 Plan 到会话（供 plan_confirmed 请求恢复）。
+
+        存储位置：会话对应的 tasks 持久化目录下的 pending_plan.json
+        """
+        import json
+        import os
+
+        if not hasattr(self, '_task_tracker') or not self._task_tracker._persist_dir:
+            # 内存暂存
+            if not hasattr(self, '_pending_plans'):
+                self._pending_plans = {}
+            self._pending_plans[session_id] = (todo_list, plan_text)
+            return
+
+        plan_path = os.path.join(self._task_tracker._persist_dir, f"{session_id}_plan.json")
+        try:
+            os.makedirs(os.path.dirname(plan_path), exist_ok=True)
+            with open(plan_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "session_id": session_id,
+                    "todo_list": todo_list,
+                    "plan_text": plan_text,
+                }, f, ensure_ascii=False, indent=2)
+            print(f"📋 Plan 暂存到 {plan_path}")
+        except Exception as e:
+            print(f"⚠️ Plan 暂存失败: {e}")
+
+    def _load_pending_plan(
+        self, session_id: str
+    ) -> Optional[tuple]:
+        """恢复暂存的 Plan。
+
+        Returns:
+            (todo_list, plan_text) 或 None
+        """
+        import json
+        import os
+
+        # 优先从文件加载
+        if hasattr(self, '_task_tracker') and self._task_tracker._persist_dir:
+            plan_path = os.path.join(
+                self._task_tracker._persist_dir, f"{session_id}_plan.json"
+            )
+            if os.path.exists(plan_path):
+                try:
+                    with open(plan_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return (data.get("todo_list", []), data.get("plan_text", ""))
+                except Exception as e:
+                    print(f"⚠️ Plan 加载失败: {e}")
+
+        # 从内存加载
+        if hasattr(self, '_pending_plans') and session_id in self._pending_plans:
+            return self._pending_plans[session_id]
+
+        return None
+
+    def _create_plan_event(self, todo_list: List[Dict], content: str):
+        """创建 plan_generated 流式事件。
+
+        使用与 StreamEvent 兼容的接口（.type.value + .data），
+        避免修改外部包的 StreamEventType 枚举。
+        """
+        from dataclasses import dataclass
+        from enum import Enum
+
+        class _PlanEventType(Enum):
+            PLAN_GENERATED = "plan_generated"
+
+        @dataclass
+        class _PlanEvent:
+            type: _PlanEventType
+            data: dict
+
+        return _PlanEvent(
+            type=_PlanEventType.PLAN_GENERATED,
+            data={
+                "plan": todo_list,
+                "content": content,
+            },
+        )
+
     def _inject_relevant_memories(self, user_message: str) -> str:
         """检索与用户消息相关的记忆，返回格式化的记忆上下文文本。
 
@@ -666,6 +826,7 @@ class MyClawAgent:
         registry.register_tool(MemoryTool(
             memory_store=self._memory_store,
             workspace_manager=self.workspace,  # 过渡期回退
+            profile_aggregator=self._profile_aggregator,  # 用户画像聚合器
         ))
         registry.register_tool(BashTool(
             allowed_directories=[self.workspace_path],  # 限制在工作空间目录
@@ -1005,6 +1166,8 @@ class MyClawAgent:
         regenerate: bool = False,
         attachments: Optional[List[Dict[str, Any]]] = None,
         cancel_token: Optional['CancellationToken'] = None,
+        mode: Optional[str] = "craft",
+        plan_confirmed: bool = False,
     ):
         """异步聊天（支持流式输出）
 
@@ -1014,6 +1177,8 @@ class MyClawAgent:
             user_turn_index: 要替换回复的用户轮次（0 起）；保留该轮之后的对话
             regenerate: 是否为重新生成（与编辑共用替换逻辑）
             cancel_token: 取消令牌，用于中断 Agent 循环
+            mode: Agent 模式 — "ask"（只读）| "plan"（规划→确认→执行）| "craft"（全自动）
+            plan_confirmed: Plan 模式下用户确认计划后传 True，进入执行阶段
 
         Yields:
             StreamEvent: 流式事件
@@ -1022,13 +1187,23 @@ class MyClawAgent:
         import time
 
         t0 = time.time()
-        print(f"[⏱️ {t0:.3f}] achat 开始")
+        print(f"[⏱️ {t0:.3f}] achat 开始 (mode={mode}, plan_confirmed={plan_confirmed})")
 
         # 热加载配置（检测 config.json 变化）
         self._reload_llm_if_changed()
 
         # 动态更新系统提示词（检查 BOOTSTRAP 状态、读取最新配置）
         self._agent.system_prompt = self._build_system_prompt()
+
+        # 工具模式设置
+        if mode == "ask":
+            self._agent.set_tool_mode(ToolMode.READ_ONLY)
+        elif mode == "plan" and not plan_confirmed:
+            # Plan 规划期：只读模式
+            self._agent.set_tool_mode(ToolMode.READ_ONLY)
+        else:
+            # Craft 模式 或 Plan 执行期：全部工具
+            self._agent.set_tool_mode(ToolMode.FULL)
 
         # 自动注入相关记忆（后台语义检索 top-K）
         memory_context = self._inject_relevant_memories(message)
@@ -1068,6 +1243,103 @@ class MyClawAgent:
         # 构造（可能含多模态附件）输入
         agent_input = self._prepare_message_with_attachments(message, attachments)
 
+        # ════════════════════════════════════════════════════════════
+        # Plan 模式：两阶段分离
+        # ════════════════════════════════════════════════════════════
+        if mode == "plan" and not plan_confirmed:
+            # ── Planning Phase ──
+            # 注入规划指令到系统提示词，要求 LLM 分析任务并输出结构化 TODO
+            planning_instruction = (
+                "\n\n## 规划模式指令\n"
+                "你正处于规划模式。请使用只读工具（read/search_content/search_file/"
+                "web_search/web_fetch 等）分析任务，然后输出一个结构化的执行计划。\n\n"
+                "**输出格式要求：**\n"
+                "在分析完成后，在你的最终回复中包含一个 JSON 代码块，格式如下：\n"
+                "```json\n"
+                '[\n'
+                '  {\n'
+                '    "id": "todo_1",\n'
+                '    "description": "任务描述（自然语言）",\n'
+                '    "dependencies": [],\n'
+                '    "tools_required": ["read", "edit"]\n'
+                '  }\n'
+                "]\n"
+                "```\n"
+                "规则：\n"
+                "- id 使用 todo_1, todo_2, ... 格式\n"
+                "- dependencies 是前置任务的 id 列表（可为空）\n"
+                "- tools_required 是完成任务需要的工具名列表\n"
+                "- 计划应包含 3-10 个可执行的步骤\n"
+                "- 在 JSON 之前先用自然语言解释你的分析\n"
+            )
+            self._agent.system_prompt += planning_instruction
+
+            # 运行 ReAct 循环（READ_ONLY 模式已设置）
+            final_response = ""
+            async for event in self._agent.arun_stream_with_tools(
+                agent_input, cancel_token=cancel_token, **llm_kwargs
+            ):
+                if first_chunk and event.type.value == "llm_chunk":
+                    print(f"[⏱️ {time.time():.3f}] 首个 token 到达 (LLM 延迟: {time.time()-t_llm:.3f}s)")
+                    first_chunk = False
+                # 收集最终响应文本
+                if event.type.value == "llm_chunk":
+                    final_response += event.data.get("chunk", "")
+                yield event
+
+            # 解析 TODO JSON
+            todo_list = self._parse_plan_from_response(final_response)
+
+            if todo_list:
+                # 暂存到 scheduler（供确认后执行使用）
+                self._todo_scheduler.load_from_plan(todo_list)
+                self._todo_scheduler.set_plan_text(final_response)
+
+                # 暂存到会话（供 plan_confirmed 请求恢复）
+                self._store_pending_plan(session_id, todo_list, final_response)
+
+                # 发送 plan_generated 事件
+                yield self._create_plan_event(todo_list, final_response)
+            else:
+                # Plan 解析失败 → 终止对话
+                from hello_agents.core.streaming import StreamEvent, StreamEventType
+                yield StreamEvent.create(
+                    StreamEventType.ERROR,
+                    self._agent.name,
+                    error="规划失败：无法从 LLM 响应中解析出结构化 TODO。请重新描述任务或切换到 Craft 模式。",
+                )
+                return
+
+            # 规划阶段结束，不进入执行
+            print(f"[⏱️ {time.time():.3f}] Plan 规划阶段完成 (总耗时: {time.time()-t0:.3f}s)")
+            return
+
+        elif plan_confirmed:
+            # ── Execution Phase ──
+            # 从会话恢复暂存的 TODO
+            pending_plan = self._load_pending_plan(session_id)
+            if pending_plan:
+                todo_list, plan_text = pending_plan
+                self._todo_scheduler.load_from_plan(todo_list)
+                self._todo_scheduler.set_plan_text(plan_text)
+            else:
+                from hello_agents.core.streaming import StreamEvent, StreamEventType
+                yield StreamEvent.create(
+                    StreamEventType.ERROR,
+                    self._agent.name,
+                    error="找不到待执行的计划。请重新发起规划请求。",
+                )
+                return
+
+            # 注入计划进度到系统提示词
+            plan_summary = self._todo_scheduler.get_progress_summary()
+            if plan_summary:
+                self._agent.system_prompt += f"\n\n{plan_summary}"
+
+        # ════════════════════════════════════════════════════════════
+        # 正常 ReAct 循环（Craft / Ask / Plan 执行期）
+        # ════════════════════════════════════════════════════════════
+
         async for event in self._agent.arun_stream_with_tools(agent_input, cancel_token=cancel_token, **llm_kwargs):
             if first_chunk and event.type.value == "llm_chunk":
                 print(f"[⏱️ {time.time():.3f}] 首个 token 到达 (LLM 延迟: {time.time()-t_llm:.3f}s)")
@@ -1076,8 +1348,18 @@ class MyClawAgent:
 
         print(f"[⏱️ {time.time():.3f}] LLM 调用完成 (总耗时: {time.time()-t0:.3f}s)")
 
+        # Plan 执行完成后清理暂存文件
+        if plan_confirmed:
+            self._cleanup_plan_file(session_id)
+            if hasattr(self, '_pending_plans'):
+                self._pending_plans.pop(session_id, None)
+
         # 对话结束后自动捕获记忆（异步执行，不阻塞用户）
         await self._capture_memories(message)
+
+        # 检查是否需要触发用户画像聚合
+        self._chat_turn_count += 1
+        await self._maybe_aggregate_profile()
 
         # 对话结束后检查是否需要触发 Memory Flush（异步执行，不阻塞用户）
         await self._check_and_run_memory_flush()
@@ -1101,6 +1383,44 @@ class MyClawAgent:
                     print(f"   - [{m['category']}] {m['content'][:50]}...")
         except Exception as e:
             print(f"⚠️ 记忆捕获失败: {e}")
+
+    async def _maybe_aggregate_profile(self):
+        """检查是否需要触发用户画像聚合。
+
+        触发条件：
+        - 每 10 轮对话后
+        - preference 记忆超过 20 条（自动触发）
+        聚合失败不影响主流程。
+        """
+        if not self._profile_aggregator:
+            return
+
+        try:
+            # 检查 preference 记忆数量（精确统计）
+            preference_count = 0
+            if self._memory_store:
+                try:
+                    recent = self._memory_store._list_recent(top_k=200)
+                    preference_count = sum(
+                        1 for m in recent if m.get("category") == "preference"
+                    )
+                except Exception:
+                    pass
+
+            if self._profile_aggregator.should_trigger(
+                self._chat_turn_count, preference_count
+            ):
+                print(f"🔄 触发用户画像聚合 (turn={self._chat_turn_count})")
+                result = await self._profile_aggregator.aggregate()
+                if result.get("updated_regions"):
+                    self._profile_aggregator.update_turn(self._chat_turn_count)
+                    print(
+                        f"✅ 画像聚合完成：更新区域 {result['updated_regions']}，"
+                        f"基于 {result['memory_count']} 条记忆"
+                    )
+        except Exception as e:
+            print(f"⚠️ 用户画像聚合失败: {e}")
+            logger.exception("画像聚合失败")
 
     async def _check_and_run_memory_flush(self):
         """检查并执行 Memory Flush
@@ -1284,12 +1604,33 @@ class MyClawAgent:
         return sorted(sessions, key=lambda x: x["updated_at"], reverse=True)
 
     def delete_session(self, session_id: str) -> bool:
-        """删除会话"""
+        """删除会话（同时清理关联的 Plan 暂存文件）"""
+        deleted = False
         filepath = os.path.join(self.workspace.sessions_path, f"{session_id}.json")
         if os.path.exists(filepath):
             os.remove(filepath)
-            return True
-        return False
+            deleted = True
+
+        # 清理 Plan 暂存文件
+        self._cleanup_plan_file(session_id)
+
+        # 清理内存中的暂存
+        if hasattr(self, '_pending_plans'):
+            self._pending_plans.pop(session_id, None)
+
+        return deleted
+
+    def _cleanup_plan_file(self, session_id: str) -> None:
+        """删除会话对应的 Plan 暂存文件。"""
+        if hasattr(self, '_task_tracker') and self._task_tracker._persist_dir:
+            plan_path = os.path.join(
+                self._task_tracker._persist_dir, f"{session_id}_plan.json"
+            )
+            if os.path.exists(plan_path):
+                try:
+                    os.remove(plan_path)
+                except OSError as e:
+                    logger.warning("删除 Plan 文件失败 %s: %s", plan_path, e)
 
     def get_session_history(self, session_id: str) -> List[dict]:
         """获取会话历史消息（兼容多模态 list-content 与编码字符串形式）。

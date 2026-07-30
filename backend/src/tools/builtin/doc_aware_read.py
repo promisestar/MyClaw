@@ -17,9 +17,9 @@ from typing import Any, Dict
 
 from hello_agents.tools import ToolResponse
 from hello_agents.tools.builtin.file_tools import ReadTool
-from hello_agents.tools.response import ToolErrorCode
+from hello_agents.tools.errors import ToolErrorCode
 
-from ..multimodal.extractor import DocumentExtractor, _DOC_EXTENSIONS, _is_plain_text_safe
+from ...multimodal.extractor import DocumentExtractor, _DOC_EXTENSIONS, _is_plain_text_safe
 
 
 class DocAwareReadTool(ReadTool):

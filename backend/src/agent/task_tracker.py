@@ -60,6 +60,7 @@ class Task:
     completed_at: Optional[float] = None
     owner: str = ""                           # 分派给哪个子代理（可选）
     notes: str = ""                           # 备注（完成/失败时补充）
+    tools_required: List[str] = field(default_factory=list)  # 完成任务需要的工具列表（Plan 模式）
 
     @property
     def is_blocked(self) -> bool:
@@ -172,6 +173,29 @@ class TaskTracker:
         self._tasks[tid] = task
         logger.info("task created: %s — %s", tid, subject)
         return task
+
+    def create_batch(
+        self,
+        tasks: List[Dict[str, Any]],
+    ) -> List[Task]:
+        """批量创建任务（Plan 模式确认后加载 TODO 用）。
+
+        Args:
+            tasks: 任务列表，每项含 subject, description?, blocked_by?, tools_required?
+
+        Returns:
+            创建的 Task 对象列表
+        """
+        created: List[Task] = []
+        for item in tasks:
+            task = self.create(
+                subject=item.get("subject", item.get("description", "")),
+                description=item.get("description", ""),
+                blocked_by=item.get("blocked_by") or item.get("dependencies"),
+            )
+            task.tools_required = item.get("tools_required", [])
+            created.append(task)
+        return created
 
     def start(self, task_id: str) -> Task:
         """将任务标记为进行中。
@@ -375,6 +399,7 @@ class TaskTracker:
                         "completed_at": t.completed_at,
                         "owner": t.owner,
                         "notes": t.notes,
+                        "tools_required": t.tools_required,
                     }
                     for t in self._tasks.values()
                 ],
@@ -425,6 +450,7 @@ class TaskTracker:
                     completed_at=raw.get("completed_at"),
                     owner=raw.get("owner", ""),
                     notes=raw.get("notes", ""),
+                    tools_required=raw.get("tools_required", []),
                 )
                 self._tasks[task.id] = task
 

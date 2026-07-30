@@ -21,24 +21,27 @@ class MemoryTool(Tool):
     记忆检索由 Agent 按需调用（与 RAGTool 使用方式一致）。
     """
 
-    def __init__(self, memory_store=None, workspace_manager=None):
+    def __init__(self, memory_store=None, workspace_manager=None, profile_aggregator=None):
         """初始化记忆工具
 
         Args:
             memory_store: MemoryVectorStore 实例（优先使用）
             workspace_manager: WorkspaceManager 实例（过渡期回退）
+            profile_aggregator: ProfileAggregator 实例（用于手动画像聚合）
         """
         super().__init__(
             name="memory",
             description="长期记忆管理工具：支持语义检索(memory_search)、按ID查询(memory_get)、"
                         "写入记忆(memory_add)、列出近期记忆(memory_list)、清除过期记忆(memory_cleanup)、"
-                        "删除指定记忆(memory_delete)。"
+                        "删除指定记忆(memory_delete)、"
+                        "聚合用户画像(memory_aggregate_profile)。"
                         "当需要回忆之前的对话内容、用户偏好、历史决策、个人实体信息时，"
                         "优先使用 memory_search 进行语义检索。",
             expandable=True,
         )
         self.memory_store = memory_store
         self.workspace = workspace_manager  # 过渡期回退
+        self.profile_aggregator = profile_aggregator  # 用户画像聚合器
         # 工具元数据（供 ContextGuard 动态路由）
         self.output_size_hint = 1000
         self.has_side_effects = False  # memory_search 无副作用，可委托
@@ -365,3 +368,46 @@ class MemoryTool(Tool):
             )
 
         return ToolResponse.error(code="NO_STORE", message="记忆存储未初始化")
+
+    # ── memory_aggregate_profile: 手动触发画像聚合 ──────────────
+
+    @tool_action(
+        "memory_aggregate_profile",
+        "手动触发用户画像聚合 — 从长期记忆中提取偏好信息，更新用户画像文件",
+    )
+    def _aggregate_profile(self) -> ToolResponse:
+        """手动触发画像聚合
+
+        从 Memory 的 preference/entity/decision 记忆中聚合为结构化文本，
+        更新到 ~/.helloclaw/identity/USER.md 的自动区域。
+        """
+        if not self.profile_aggregator:
+            return ToolResponse.error(
+                code="NO_AGGREGATOR",
+                message="画像聚合器未初始化",
+            )
+
+        try:
+            # 使用同步聚合方法，避免在异步上下文中创建新事件循环
+            result = self.profile_aggregator.aggregate_sync()
+
+            if result.get("updated_regions"):
+                return ToolResponse.success(
+                    text=(
+                        f"✅ 用户画像聚合完成\n"
+                        f"更新区域: {result['updated_regions']}\n"
+                        f"基于 {result['memory_count']} 条记忆"
+                    ),
+                    data=result,
+                )
+            else:
+                return ToolResponse.success(
+                    text="画像聚合完成，但无区域需要更新（可能记忆不足）",
+                    data=result,
+                )
+
+        except Exception as e:
+            return ToolResponse.error(
+                code="AGGREGATE_FAILED",
+                message=f"画像聚合失败: {e}",
+            )
