@@ -19,7 +19,8 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 WORKSPACE_TEMPLATES_DIR = TEMPLATES_DIR / "workspace"
 
 # 工作区级 .myclaw/ 子目录
-WORKSPACE_SUBDIRS = ["sessions", "tasks", "uploads", "skills", "automations"]
+# sessions 和 tasks 已迁移到全局 ~/.helloclaw/，跨工作区共享
+WORKSPACE_SUBDIRS = ["uploads", "skills", "automations"]
 
 # 工作区级必需配置文件（不存在时从模板部署）
 WORKSPACE_CONFIG_FILES = ["AGENTS"]
@@ -30,8 +31,6 @@ WORKSPACE_OPTIONAL_FILES = ["HEARTBEAT"]
 # .gitignore 中自动追加的条目（幂等）
 _GITIGNORE_ENTRIES = [
     "# MyClaw Agent 工作区文件 (自动生成)",
-    ".myclaw/sessions/",
-    ".myclaw/tasks/",
     ".myclaw/uploads/",
     ".myclaw/automations/runs/",
     ".myclaw/HEARTBEAT.md",
@@ -76,11 +75,17 @@ class WorkspaceManager:
 
     @property
     def sessions_path(self) -> str:
-        return os.path.join(self.claw_dir, "sessions")
+        """会话存储路径（全局共享，跨工作区）。"""
+        path = os.path.expanduser("~/.helloclaw/sessions")
+        os.makedirs(path, exist_ok=True)
+        return path
 
     @property
     def tasks_path(self) -> str:
-        return os.path.join(self.claw_dir, "tasks")
+        """任务追踪器存储路径（全局共享，跨工作区）。"""
+        path = os.path.expanduser("~/.helloclaw/tasks")
+        os.makedirs(path, exist_ok=True)
+        return path
 
     @property
     def uploads_path(self) -> str:
