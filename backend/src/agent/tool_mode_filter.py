@@ -123,10 +123,10 @@ class ToolModeFilter:
     def get_filtered_schemas(self) -> List[Dict[str, Any]]:
         """获取当前模式下可用工具的 schema 列表（用于 LLM function calling）。
 
-        schema 格式与 Tool.to_schema() 输出一致。
+        schema 格式为 OpenAI function calling 标准（Tool.to_openai_schema()）。
         """
         tools = self.get_available_tools()
-        return [tool.to_schema() for tool in tools if hasattr(tool, 'to_schema')]
+        return [tool.to_openai_schema() for tool in tools if hasattr(tool, 'to_openai_schema')]
 
     def get_tool(self, name: str) -> Optional["Tool"]:
         """按名获取工具。

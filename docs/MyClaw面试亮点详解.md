@@ -1,6 +1,6 @@
 # Agent 工程设计 — MyClaw 面试亮点详解
 
-> 本文档从"实现一个生产级 Agent 助手"的工程视角，梳理 MyClaw 后端在架构设计上的核心亮点（前端部分见第 16 章）。每个亮点包含**设计动机**、**实现方案**、**代码引用**和**对比分析**，适用于面试展示和技术复盘。
+> 本文档从"实现一个生产级 Agent 助手"的工程视角，梳理 MyClaw 在架构设计上的核心亮点（前端部分见第 18 章）。每个亮点包含**设计动机**、**实现方案**、**代码引用**和**对比分析**，适用于面试展示和技术复盘。
 
 ---
 
@@ -20,9 +20,11 @@
 12. [Agent 循环可中断与协同取消](#12-agent-循环可中断与协同取消)
 13. [多模态 Token 估算与自适应压缩](#13-多模态-token-估算与自适应压缩)
 14. [身份与工作区解耦的运行时切换](#14-身份与工作区解耦的运行时切换)
-15. [最难的部分：三道硬关与攻克方案](#15-最难的部分三道硬关与攻克方案)
-16. [前端 SSE 流式增量渲染与无损编辑](#16-前端-sse-流式增量渲染与无损编辑)
-17. [面试展示策略](#17-面试展示策略)
+15. [意图识别：三模式 Agent 路由与 Plan 两阶段执行](#15-意图识别三模式-agent-路由与-plan-两阶段执行)
+16. [用户画像：对话驱动的自动聚合系统](#16-用户画像对话驱动的自动聚合系统)
+17. [最难的部分：三道硬关与攻克方案](#17-最难的部分三道硬关与攻克方案)
+18. [前端 SSE 流式增量渲染与无损编辑](#18-前端-sse-流式增量渲染与无损编辑)
+19. [面试展示策略](#19-面试展示策略)
 
 ---
 
@@ -904,7 +906,7 @@ Layer 2: 会话层      ← 不变（原有机制）
 
 身份文件从工作区迁移到固定基座目录，工作区文件归拢到 `.myclaw/` 隐藏子目录。System Prompt 构建时：identity 从基座读（不随工作区变），AGENTS.md 优先用工作区的、基座作 fallback。
 
-**bind_workspace() 全量重绑**：Agent 构造期把 `workspace_path` 深度绑定到 13 处引用点（file tools、`config.session_dir`、`SkillLoader`、`TaskTracker`、`SubAgentOrchestrator`、`EnhancedSimpleAgent`、`uploads_root` 等），切换时全部运行时 setattr 更新：
+**bind_workspace() 全量重绑**：Agent 构造期把 `workspace_path` 深度绑定到 12 处引用点（file tools、`SkillLoader`、`SubAgentOrchestrator`、`EnhancedSimpleAgent`、`uploads_root` 等），切换时全部运行时 setattr 更新（sessions 和 tasks 已于 v2 全局化，不再需要重绑）：
 
 ```python
 def bind_workspace(self, workspace_path: str):
@@ -914,16 +916,15 @@ def bind_workspace(self, workspace_path: str):
     self.workspace = WorkspaceManager(abs_path)
     self.workspace.ensure_project_workspace()  # 部署 .myclaw/
 
-    # 全量重绑 13 处引用点
+    # 全量重绑 12 处引用点
     self._rebind_workspace_tools(abs_path)     # Read/Write/Edit/Bash/RAG
-    self.config.session_dir = self.workspace.sessions_path
     self.skill_loader.skills_dir = Path(self.workspace.skills_path)
     self.skill_loader.clear()                  # 清缓存重新加载
-    self._task_tracker._persist_dir = self.workspace.tasks_path
     self._subagent_orchestrator.workspace_path = abs_path
     self._agent.workspace_root = Path(abs_path).resolve()
     self._memory_capture_manager.workspace_manager = self.workspace
     self._agent.system_prompt = self._build_system_prompt()  # 重建（identity 不变）
+    # sessions/tasks 已全局化（~/.helloclaw/），无需重绑
 ```
 
 **两阶段部署**：
@@ -955,15 +956,283 @@ def bind_workspace(self, workspace_path: str):
 
 ### 面试展示要点
 
-> "Agent 的身份和工作区原本耦合在一个目录，切项目就丢人格。我把它们解耦成三层：身份文件固定在 ~/.helloclaw/identity/，工作区文件归拢到 .myclaw/ 子目录。切换工作区时 bind_workspace 全量重绑 13 处引用点——file tools、session_dir、skills_dir、tasks_dir、子代理编排器等全部运行时 setattr，毫秒级完成不重启进程。BashTool 切换时重置 cd 历史防跨工作区逃逸。还有 V1→V2 自动迁移和白名单授权模型。"
+> "Agent 的身份和工作区原本耦合在一个目录，切项目就丢人格。我把它们解耦成三层：身份文件固定在 ~/.helloclaw/identity/，全局共享数据在 ~/.helloclaw/（sessions/tasks/config），工作区项目文件归拢到 .myclaw/ 子目录。切换工作区时 bind_workspace 全量重绑 12 处引用点——file tools、skills_dir、子代理编排器等全部运行时 setattr，毫秒级完成不重启进程。v2 把会话和任务全局化后引用点从 14 减到 12，彻底解决了切工作区丢历史的痛点。BashTool 切换时重置 cd 历史防跨工作区逃逸。还有 V1→V2 自动迁移和白名单授权模型。"
 
 ---
 
-## 15. 最难的部分：三道硬关与攻克方案
+## 15. 意图识别：三模式 Agent 路由与 Plan 两阶段执行
+
+### 设计动机
+
+传统 Agent 只有"全自动"一种模式——LLM 自由调用所有工具，包括文件写入和命令执行。但很多场景不需要副作用工具：
+- 用户只是想问"这个函数怎么用"，不希望 Agent 擅自修改代码
+- 用户需要先看 Agent 打算怎么做，确认后再动手
+
+正则自动分类会误判（"帮我写个脚本读文件"→ 到底是只读还是写？），而误判比不分类更糟——用户预期被违背。
+
+### 实现方案
+
+MyClaw 参考 WorkBuddy 的做法，让用户**显式选择模式**，后端根据模式过滤工具集：
+
+| 模式 | 允许的工具 | 禁止的工具 | 执行流程 |
+|------|-----------|-----------|---------|
+| **Ask** | Read/Search/Web/List/RAG/Memory/Skill/MCP | Write/Edit/Execute/Automation | 单轮 ReAct，LLM 直接回复 |
+| **Plan** | 规划期间 Ask；执行期全部 | 规划期禁止副作用工具 | 两阶段：规划→用户确认→执行 |
+| **Craft** | 全部 | 无 | 自动 ReAct 循环，无需确认 |
+
+#### Plan 两阶段执行流程
+
+Plan 模式是整个系统中交互最复杂的模式，需要在无状态的 HTTP 请求之间传递状态：
+
+```
+[用户选择 Plan 模式发送消息]
+  ↓
+[后端] 设置 READ_ONLY 模式 → ReAct 循环
+  ├── 注入规划指令："先分析问题，输出结构化 TODO JSON"
+  ├── LLM 在 READ_ONLY 模式下收集信息
+  └── 解析 LLM 输出中的 TODO JSON
+  ↓
+[后端] _store_pending_plan(session_id, ...) → {session_id}_plan.json
+  ↓
+[后端] yield _create_plan_event(todo_list) → SSE: plan_generated
+  ↓ (SSE 流结束，等待用户操作)
+[前端] 解析 PlanTodoItem[] → 渲染 Markdown TODO 确认卡片
+  ├── 用户点击「确认」→ POST /api/chat/stream { mode: "craft", planConfirmed: true, skipUserMessage: true }
+  └── 用户点击「取消」→ 清理状态，对话结束
+  ↓
+[后端] _load_pending_plan(session_id) 恢复计划
+  ├── 注入进度摘要到系统提示词
+  ├── 设置 FULL 模式 → ReAct 循环执行
+  └── 完成后 _cleanup_plan_file(session_id)
+```
+
+#### 三个关键子问题
+
+**① 如何在不修改外部库的前提下过滤工具？**
+
+`hello_agents` 的 `ToolRegistry` 是外部包，不能直接加 mode 参数。MyClaw 设计了 `ToolModeFilter` 包装器：
+
+```python
+class ToolModeFilter:
+    """包装外部 ToolRegistry，通过 wrapper 模式实现模式切换。
+    
+    不修改 ToolRegistry 源码，通过代理模式拦截 get_tools()/get_tool()。
+    """
+    _SIDE_EFFECT_TOOLS = frozenset({"write", "edit", "execute_command", "automation"})
+
+    def set_mode(self, mode: ToolMode):
+        self._mode = mode  # READ_ONLY 时屏蔽副作用工具
+
+    def get_tools(self) -> List[Tool]:
+        all_tools = self._registry.get_tools()
+        if self._mode == ToolMode.FULL:
+            return all_tools
+        return [t for t in all_tools if t.name not in self._SIDE_EFFECT_TOOLS]
+```
+
+**② 如何在无状态 HTTP 间传递 Plan？**
+
+Plan 生成和确认执行是**两次独立的 HTTP POST 请求**，中间 SSE 流已结束。MyClaw 通过**文件暂存 + 内存双通道**解决：
+
+```python
+# 规划阶段结束 → 写入文件
+def _store_pending_plan(self, session_id, todo_list, plan_text):
+    plan_file = os.path.join(self._task_tracker._persist_dir, f"{session_id}_plan.json")
+    json.dump({"todo": todo_list, "plan_text": plan_text, "timestamp": time.time()}, fp)
+    self._pending_plans[session_id] = {"todo": todo_list, "plan_text": plan_text}
+
+# 确认后新请求到达 → 从文件恢复
+def _load_pending_plan(self, session_id):
+    # 优先内存，降级到文件
+    if session_id in self._pending_plans:
+        return self._pending_plans.pop(session_id)
+    plan_file = os.path.join(..., f"{session_id}_plan.json")
+    return json.load(fp) if os.path.exists(plan_file) else None
+```
+
+**③ 如何发送自定义 SSE 事件而不修改外部 StreamEventType 枚举？**
+
+`hello_agents` 的 `StreamEventType` 枚举不支持 `plan_generated` 类型。MyClaw 创建了与 `StreamEvent` 接口兼容的自定义 dataclass：
+
+```python
+@dataclass
+class _PlanEvent:
+    type: StreamEventType  # 复用枚举字段名
+    data: dict             # 复用 data 字段名
+
+# 创建时：type 设置为 StreamEventType.PHRASE_FINISH 做类型占位，
+# data 中携带 plan 列表。前端检查 data.plan 字段判断是否为 plan 事件。
+```
+
+### 设计亮点
+
+1. **零误判**：用户显式选择模式，不需要 LLM/正则做意图分类
+2. **双重工具门控**：`ToolModeFilter` 过滤 schema（LLM 看不到禁用的工具）+ `_execute_tools_batch` 运行时检查（LLM 即使幻觉调用了也会被拦截）
+3. **Plan 两阶段**：规划期 READ_ONLY 确保 LLM 不会提前动手，确认后才解锁全部工具
+4. **Plan 失败终止**：Plan 生成失败或用户拒绝时直接终止对话，不降兜到 Craft——避免用户预期违背
+5. **资源清理**：Plan 执行完成后自动删除 `_plan.json`；`delete_session` 时间步清理
+
+### DAG 任务调度器
+
+Plan 生成的 TODO 列表有依赖关系（"写函数"依赖"创建文件"），`TodoScheduler` 负责：
+
+```python
+# 依赖解析 → 拓扑排序 → 按依赖顺序调度
+def get_ready_tasks(self) -> List[TodoItem]:
+    """返回所有依赖已满足的 pending/ready 任务"""
+    ready = []
+    for todo in self._todos.values():
+        if todo.status not in ("pending", "ready"):
+            continue
+        deps_met = all(
+            self._todos[dep_id].status == "completed"
+            for dep_id in todo.dependencies
+        )
+        if deps_met:
+            ready.append(todo)
+    return ready
+
+def fail_downstream(self, todo_id: str) -> None:
+    """BFS 级联标记所有下游依赖为 failed（迭代式，避免递归栈溢出）"""
+    queue = [todo_id]
+    visited = set()
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        for tid, todo in self._todos.items():
+            if current in todo.dependencies and todo.status in ("pending", "ready"):
+                todo.status = "failed"
+                queue.append(tid)
+```
+
+### 面试展示要点
+
+> "Agent 有三种运行模式：Ask 只读问答、Plan 先规划再执行、Craft 全自动。核心设计有两个：ToolModeFilter 包装器不修改外部库就能过滤工具；Plan 两阶段通过文件暂存解决无状态 HTTP 之间的状态传递——规划期 READ_ONLY 生成 TODO JSON，SSE 推送给前端确认，确认后新请求从文件恢复计划继续执行。任务之间有依赖就用 DAG 调度器按拓扑排序调度，失败自动 BFS 级联阻塞下游。"
+
+### 为什么不是"最难部分"
+
+意图识别和 Plan 执行的核心挑战是**集成复杂度**（状态在 HTTP 请求间传递、外部库接口绕过），而非算法或并发安全层面的根本性难题。文件暂存 + SSE 事件流的方案是成熟的工程模式，DAG 调度器也是经典的拓扑排序变体。它体现了良好的工程设计，但不需要像流式工具并发安全那样遍历所有状态组合来验证正确性。
+
+---
+
+## 16. 用户画像：对话驱动的自动聚合系统
+
+### 设计动机
+
+参考 Mercedes-Benz AG 和乌尔姆大学 2025 年的研究："画像不是一次性创建，而是对话的自然副产品"。传统 Agent 需要用户手动填写技术栈、代码风格等偏好，但用户通常不会主动维护。理想的方案是：Agent 在每次对话后自动从记忆中发现用户的偏好和特点，更新到画像中。
+
+### 实现方案
+
+```
+对话结束 (achat() 末尾)
+  ↓
+ProfileAggregator.should_trigger() — 检查条件：
+  ├── 每 10 轮对话触发一次
+  └── preference 记忆超过 20 条时触发（_list_recent 精确统计）
+  ↓
+ProfileAggregator._collect_memories() — 从 Qdrant 检索 preference/entity/decision
+  ↓
+LLM 聚合 (_llm_aggregate / _llm_aggregate_sync)
+  ├── 调用轻量 LLM 聚合为结构化摘要（~2000 token/次）
+  └── 降兜：_text_aggregate() — 纯文本分组 + tech_keywords 区分技术栈/工作领域
+  ↓
+ProfileAggregator._update_user_md() — 原子写入 USER.md
+  ├── HTML 注释标记区域边界（<!-- AUTO:tech_stack --> ... <!-- /AUTO:tech_stack -->）
+  ├── _replace_region() 精确替换（不触碰手动编辑区域）
+  ├── _atomic_save_user_md()：tempfile + os.replace 原子写入
+  └── 注入防护：清理 LLM 输出中的 <!-- AUTO:xxx --> 标记
+  ↓
+下次对话 — _build_system_prompt() 自动注入 USER.md 到系统提示词
+```
+
+#### USER.md 的 AUTO 区域模板
+
+```markdown
+## 技术栈
+<!-- AUTO:tech_stack -->
+（暂无数据）
+<!-- /AUTO:tech_stack -->
+
+## 工作领域
+<!-- AUTO:work_domain -->
+（暂无数据）
+<!-- /AUTO:work_domain -->
+
+## 沟通偏好
+<!-- AUTO:communication -->
+（暂无数据）
+<!-- /AUTO:communication -->
+
+## 代码风格
+<!-- AUTO:code_style -->
+（暂无数据）
+<!-- /AUTO:code_style -->
+```
+
+#### 三个关键子问题
+
+**① 同步和异步两种调用场景如何统一？**
+
+画像聚合有两个调用入口：`achat()` 末尾（异步）和 `memory_aggregate_profile` 工具（同步 `MemoryTool.run()`）。如果在同步上下文中创建新事件循环调用 `async aggregate()`，会触发 `RuntimeError`。
+
+MyClaw 提供双接口：
+
+```python
+# 异步接口（achat() 中调用）
+async def aggregate(self) -> dict:
+    return await self._do_aggregate_async()
+
+# 同步接口（MemoryTool 中直接调用，不创建新事件循环）
+def aggregate_sync(self) -> dict:
+    return self._do_aggregate(sync_llm=True)
+```
+
+两者共享 `_do_llm_aggregate` 核心方法（LLM 的 `invoke()` 本身是同步调用），只是外层接口签名不同。
+
+**② LLM 不可用时的降兜方案？**
+
+`_text_aggregate()` 不依赖 LLM，通过关键词分类完成聚合：
+
+```python
+tech_keywords = {"python", "java", "typescript", "vue", "react", "fastapi", "docker", ...}
+tech_items = [e for e in entities if any(kw in e.lower() for kw in tech_keywords)]
+domain_items = [e for e in entities if e not in tech_items]
+# 用 decision 记忆补充 work_domain，避免永远为空
+```
+
+**③ 如何防止并发写入冲突？**
+
+`USER.md` 可能同时被 Agent 对话和用户手动编辑。`_atomic_save_user_md` 写入临时文件后用 `os.replace` 原子替换，失败时降兜到 `identity.save_file()` 直接写入。
+
+同时，写入前清理 LLM 输出中可能包含的 `<!-- AUTO:xxx -->` 标记，防止 LLM 注入破坏区域边界。
+
+### 设计亮点
+
+1. **画像跟随用户而非项目**：存于 `~/.helloclaw/identity/USER.md`，切换工作区不影响画像
+2. **自动 + 手动共存**：AUTO 区域由系统维护，其他区域用户自由编辑，互不干扰
+3. **触发条件精确计数**：用 `_list_recent(top_k=200)` 遍历所有记忆再按 `category == "preference"` 过滤，而非 `top_k=1 * 20` 的粗略估算
+4. **平均成本极低**：聚合使用轻量 LLM，每触发一次 ~2000 token，10 轮触发一次，平均每轮仅 +200 token
+5. **系统提示词天然感知**：USER.md 已被 `_build_system_prompt()` 注入，Agent 无需额外逻辑就能以用户画像为参考
+
+### 面试展示要点
+
+> "用户画像不是让用户填表，而是在对话中自动发现的。每次对话结束检查是否需要聚合——每 10 轮或偏好记忆超过 20 条就触发一次，用轻量 LLM 把 preference/entity/decision 记忆提炼成结构化文本，写入 USER.md 的 AUTO 区域。有同步和异步两个调用入口——achat 末尾和 memory_aggregate_profile 工具，共享同一个聚合核心。LLM 不可用时降兜到纯关键词分类。写入用 os.replace 原子替换防并发冲突，同时清理 LLM 输出中的区域标记防注入。"
+
+### 为什么不是"最难部分"
+
+画像聚合的每个子问题都有清晰的解决方向：LLM 聚合有降兜方案、并发写入有原子操作、同步异步分离有双接口模式。它们的组合体现了良好的工程设计，但没有一个问题是"遍历所有可能性才能验证正确性"或"阈值全靠经验调"的那种根本性认知挑战。
+
+---
+
+## 17. 最难的部分：三道硬关与攻克方案
 
 > 如果面试官问"这个项目最难的是什么"，以下三道关是真正花时间啃下来的硬骨头。每个问题都记录了从**发现 → 误判 → 推翻 → 找到正确解法**的完整过程。
+>
+> **说明**：意图识别（§15）和用户画像（§16）虽然也有设计决策，但核心挑战是**集成复杂度**（状态在 HTTP 请求间传递、外部库接口绕过）而非**根本性认知挑战**（正确性证明、遍历全状态验证、无最优解的阈值权衡）。三道硬关的共同特征是：**没有正确解，只有更优解，需要反复验证才能确信不会出错**。
 
-### 15.1 第一道关：流式工具调用的并发安全性
+### 17.1 第一道关：流式工具调用的并发安全性
 
 #### 问题描述
 
@@ -1040,11 +1309,11 @@ FINISH            →  分组 + 并行/串行             ← has_side_effects �
 
 ---
 
-### 15.2 第二道关：跨 14 个引用点的运行时工作区切换
+### 17.2 第二道关：跨 12 个引用点的运行时工作区切换
 
 #### 问题描述
 
-Agent 在构造期间将当前工作区路径**深度绑定**到了整个系统：文件工具（Read/Write/Edit/Bash）的根目录、会话持久化目录、Skill 加载目录、任务追踪目录、子代理编排器的 workspace_root、浏览器截图上传目录……多达 14 个独立的引用点。
+Agent 在构造期间将当前工作区路径**深度绑定**到了整个系统：文件工具（Read/Write/Edit/Bash）的根目录、Skill 加载目录、子代理编排器的 workspace_root、浏览器截图上传目录、自动化任务存储……多达 12 个独立的引用点。
 
 最初的设计是"一个进程 = 一个工作区"，用户想换项目就得重启服务。这显然不可接受——Cursor 和 WorkBuddy 都能运行时切换项目。
 
@@ -1062,7 +1331,11 @@ Agent 在构造期间将当前工作区路径**深度绑定**到了整个系统�
 
 ```python
 def bind_workspace(self, workspace_path: str):
-    """切换到指定工作区（运行时动态重绑 14 处引用点）"""
+    """切换到指定工作区（运行时动态重绑 12 处引用点）
+    
+    注：sessions 和 tasks 已于 v2 迁移至 ~/.helloclaw/（全局共享），
+    切换工作区时不再重绑，会话历史跨工作区保持可见。
+    """
     # 1. 白名单鉴权
     if not is_allowed(workspace_path):
         raise ValueError("工作区未授权")
@@ -1071,20 +1344,17 @@ def bind_workspace(self, workspace_path: str):
     self.workspace = WorkspaceManager(abs_path)
     self.workspace.ensure_project_workspace()
 
-    # 3. 全量重绑（14 处 setattr）
+    # 3. 全量重绑（12 处 setattr）
     self._rebind_workspace_tools(abs_path)          # ① Read/Write/Edit/Bash/RAG/Search
-    self.config.session_dir = sessions_path          # ② Config（session 目录）
-    self._agent.session_store.session_dir = Path(sessions_path)  # ③ SessionStore 底层
-    self.skill_loader.update_workspace_dir(...)       # ④ Skill 加载器
-    self.refresh_skill_tool()                        # ⑤ Skill 工具重新注册
-    self._task_tracker._persist_dir = tasks_path     # ⑥ 任务追踪
-    self._subagent_orchestrator.workspace_path = ...  # ⑦ 子代理编排
-    self._agent.workspace_root = Path(abs_path)       # ⑧ Agent 工作区根
-    self._browser_session._uploads_dir = Path(...)    # ⑨ 浏览器上传
-    self._automation_store = AutomationStore(...)     # ⑩ 定时任务
-    self._memory_capture_manager.workspace_manager = ...  # ⑪ 记忆捕获
-    self._agent.system_prompt = self._build_system_prompt()  # ⑫ 系统提示词（identity 不变）
-    # ⑬⑭ ... 更多引用点
+    self.skill_loader.update_workspace_dir(...)       # ② Skill 加载器
+    self.refresh_skill_tool()                        # ③ Skill 工具重新注册
+    self._subagent_orchestrator.workspace_path = ...  # ④ 子代理编排
+    self._agent.workspace_root = Path(abs_path)       # ⑤ Agent 工作区根
+    self._browser_session._uploads_dir = Path(...)    # ⑥ 浏览器上传
+    self._automation_store = AutomationStore(...)     # ⑦ 定时任务
+    self._memory_capture_manager.workspace_manager = ...  # ⑧ 记忆捕获
+    self._agent.system_prompt = self._build_system_prompt()  # ⑨ 系统提示词（identity 不变）
+    # ⑩⑪⑫ ... 更多引用点
 
     print(f"🔄 已切换工作区: {abs_path}")
 ```
@@ -1098,14 +1368,18 @@ def bind_workspace(self, workspace_path: str):
 | 目录 | 内容 | 切换时行为 |
 |------|------|----------|
 | `~/.helloclaw/identity/` | IDENTITY、SOUL、USER、BOOTSTRAP | **不变**（人格跟随用户，不跟随项目） |
-| `~/.helloclaw/` | 全局 skills、AGENTS.md fallback、config.json | **不变** |
-| `<workspace>/.myclaw/` | AGENTS.md（项目级）、sessions、tasks、uploads、skills | **清空引用，指向新目录** |
+| `~/.helloclaw/` | sessions、tasks、全局 skills、AGENTS.md fallback、config.json | **不变**（跨工作区共享） |
+| `<workspace>/.myclaw/` | AGENTS.md（项目级）、uploads、skills（项目级）、automations | **清空引用，指向新目录** |
 
 System Prompt 构建时：`IDENTITY/SOUL/USER` 从 `~/.helloclaw/identity/` 读取（永远不变），`AGENTS.md` 优先用工作区的、基座那份作为 fallback（防止切换到空项目时 RuntimeError）。
 
-#### 踩过的坑：SessionStore 缓存了旧路径
+> **v2 变更**：sessions 和 tasks 从 `<workspace>/.myclaw/` 迁移到 `~/.helloclaw/`，解决了切换工作区后会话历史全部丢失的痛点。迁移后 `bind_workspace` 引用点从 14 减少到 12，不再需要重绑 session_dir 和 tasks_dir。
 
-最隐蔽的 bug 是 `hello_agents` 库的 `SessionStore`。它在 `__init__` 时把 `session_dir` 存为 `self.session_dir = Path(session_dir)`，之后所有 `save()/load()/list_sessions()` 都用这个缓存的路径。我更新了 `self.config.session_dir`，但 `self._agent.session_store.session_dir` 还是旧的——导致切换工作区后，前端发起的对话结束时 session 仍然保存到了旧工作区。兜了一圈发现是第三方库的缓存问题，补了一行 `self._agent.session_store.session_dir = Path(new_path)`。
+#### v1→v2 演进：SessionStore 缓存问题已随全局化解决
+
+在 v1 架构中（sessions 存于 `<workspace>/.myclaw/sessions/`），最隐蔽的 bug 是 `hello_agents` 库的 `SessionStore` 在 `__init__` 时缓存了 `session_dir`，更新 `Config` 后不自动同步。导致切换工作区后 session 仍保存到旧目录——切换工作区 ="丢失"对话历史。
+
+**v2 解决方式**：将 sessions 迁移到 `~/.helloclaw/sessions/`（全局固定路径），`sessions_path` 属性返回 `os.path.expanduser("~/.helloclaw/sessions")` 并在 getter 中 `os.makedirs(exist_ok=True)` 自动创建。由于路径不随工作区变化，SessionStore 的缓存问题自然消失，`bind_workspace` 中不再需要重绑这一对引用点。
 
 #### V1→V2 兼容迁移
 
@@ -1133,15 +1407,17 @@ def ensure_exists(self, old_workspace=None):
 
 #### 这个为什么难
 
-**难在"不漏引用"**。Agent 系统中工作区路径被引用的位置远超预期——每个人写工具时都自然地把路径存为实例属性、类属性或闭包变量。初次实现 `bind_workspace` 时以为只有 5-6 个引用点，实际排查发现 14 个。每次漏一个就产生一个隐藏 bug：Read 工具读的是旧目录、浏览器截图画到了旧项目、定时任务写到错误的位置……这些 bug 不会立即报错，而是在用户操作到某个具体功能时才暴露。
+**难在"不漏引用"**。Agent 系统中工作区路径被引用的位置远超预期——每个人写工具时都自然地把路径存为实例属性、类属性或闭包变量。初次实现 `bind_workspace` 时以为只有 5-6 个引用点，实际排查发现 12 个。每次漏一个就产生一个隐藏 bug：Read 工具读的是旧目录、浏览器截图画到了旧项目、定时任务写到错误的位置……这些 bug 不会立即报错，而是在用户操作到某个具体功能时才暴露。
+
+> **v2 演进**：随着 sessions 和 tasks 全局化，引用点从最初的 14 减少到 12。每个引用点减少都意味着切换工作区后少一个"幽灵状态"的风险来源。
 
 #### 面试表述
 
-> "Agent 的工作区路径被深度绑定到 14 个引用点。切换工作区时不能销毁重建（开销大、中断对话），也不能只改 WorkspaceManager 对象（所有工具和子系统的路径还是旧的）。我用了运行时 setattr 全量重绑，保持 Agent 实例存活的情况下毫秒级切换。整体架构把目录拆成三组：基座身份目录（不随切换变化）、全局配置目录、工作区数据目录。切换时身份不变、文件工具和会话存储全部重定向到新工作区。还有一个 V1→V2 的幂等自动迁移机制。最隐蔽的 bug 是第三方库 SessionStore 缓存了旧路径，更新 Config 后底层 store 没同步。"
+> "Agent 的工作区路径被深度绑定到 12 个引用点。切换工作区时不能销毁重建（开销大、中断对话），也不能只改 WorkspaceManager 对象（所有工具和子系统的路径还是旧的）。我用了运行时 setattr 全量重绑，保持 Agent 实例存活的情况下毫秒级切换。整体架构把目录拆成三组：基座身份目录（不随切换变化）、全局共享目录（sessions/tasks/config，跨工作区可见）、工作区数据目录（项目文件/定时任务）。v2 迭代中把 sessions 和 tasks 从工作区迁移到全局，引用点从 14 减到 12，同时解决了切换工作区丢会话历史的核心痛点。"
 
 ---
 
-### 15.3 第三道关：上下文窗口的精细化管控
+### 17.3 第三道关：上下文窗口的精细化管控
 
 #### 问题描述
 
@@ -1226,7 +1502,7 @@ SIDE_EFFECT_BLACKLIST = {
 > "Agent 最稀缺的不是算力，是上下文窗口。它是一个有限资源（128K tokens）的多租户分配问题——系统提示词、对话历史、工具输出、记忆注入、子代理摘要全在抢。我用了三层防线：事前 Context Guard 预判大输出委托子代理，事中 Context Manager 截断 + 自动压缩，事后副作用黑名单防止误委托。图片用递进压缩先降质量再降尺寸，历史里不存 base64 只存路径引用。还有一个'条件注入'思路——入职引导完成后自动消失、低相关记忆不注入——不让不该占窗口的东西抢空间。每个阈值都是经验调出来的，没有正确解只有更优解。"
 
 ---
-## 16. 前端 SSE 流式增量渲染与无损编辑
+## 18. 前端 SSE 流式增量渲染与无损编辑
 
 ### 设计动机
 
@@ -1236,7 +1512,7 @@ AI 聊天前端通常只需要处理"用户发消息 → 流式接收文本"的�
 
 ### 实现方案
 
-#### 16.1 SSE 事件驱动的混合增量渲染
+#### 18.1 SSE 事件驱动的混合增量渲染
 
 前端没有使用浏览器内置的 `EventSource`（它不支持 POST 请求和自定义请求体），而是基于 `fetch` + `ReadableStream` 手动实现了 SSE 解析器（`chatApi.sendMessageStream`，`chat.ts:84-197`）：
 
@@ -1300,7 +1576,7 @@ interface ToolSegment {
 
 工具调用卡片与文本段在同一列表中交替排列，Vue 模板中 `v-for="segment in msg.segments"` 根据 `segment.type` 渲染不同组件。整个过程只操作数组引用（`messages.value = [...messages.value]`），Vue 的响应式系统自动处理最小化 DOM 更新。
 
-#### 16.2 前端消息编辑与无损回执
+#### 18.2 前端消息编辑与无损回执
 
 前端实现了与后端"时间线分叉"（§10）完美配合的前端编辑流程。`replaceUserTurnInUi` 是核心函数（`ChatView.vue:920-938`）：
 
@@ -1353,27 +1629,27 @@ splitMessagesAtUserTurn(1) 输出:
 
 ---
 
-## 17. 面试展示策略
+## 19. 面试展示策略
 
 ### 推荐展示顺序（15 分钟 talk）
 
 | 时间 | 内容 | 目的 |
 |------|------|------|
 | 0-2 min | 项目定位 + 架构全景图（三组目录解耦 + 画一张中文示意图） | 建立整体印象 |
-| 2-8 min | **三道硬关**（详见[第 15 章](#15-最难的部分三道硬关与攻克方案)）：<br/>① 流式工具并发安全 — 状态机 + 三层保障<br/>② 14 点运行时重绑 — setattr 全量切换<br/>③ 上下文窗口经济学 — 三道防线 + 条件注入 | 展示"解决真正难的问题"的能力 |
+| 2-8 min | **三道硬关**（详见[第 17 章](#17-最难的部分三道硬关与攻克方案)）：<br/>① 流式工具并发安全 — 状态机 + 三层保障<br/>② 14 点运行时重绑 — setattr 全量切换<br/>③ 上下文窗口经济学 — 三道防线 + 条件注入 | 展示"解决真正难的问题"的能力 |
 | 8-10 min | **记忆系统四层设计 + 自动注入**（画记忆生命周期图） | 展示产品思维 |
 | 10-12 min | **Agent 循环可中断 + 双向协同取消** | 展示对可靠性边界的理解 |
-| 12-13 min | **SubAgent 上下文隔离 + Task 依赖管理** | 展示架构扩展性 |
+| 12-13 min | **意图识别 + 用户画像**（三模式路由、Plan 两阶段、对话驱动画像） | 展示产品设计 + 多系统联动 |
 | 13-14 min | 踩过的坑 + 如果重新来过会怎么做不同 | 展示反思能力 |
 | 14-15 min | 总结一句话 | 留下核心印象 |
 
-> **补充**：如果面试官对全栈能力感兴趣，可以在 12-13 min 或 13-14 min 顺带提一下[前端 SSE 流式增量渲染与无损编辑](#16-前端-sse-流式增量渲染与无损编辑)（混合段列表模型 + 消息无损编辑），展示对前端也有工程化思考。不作为主推点。
+> **补充**：如果面试官对全栈能力感兴趣，可以在 12-13 min 或 13-14 min 顺带提一下[前端 SSE 流式增量渲染与无损编辑](#18-前端-sse-流式增量渲染与无损编辑)（混合段列表模型 + 消息无损编辑），展示对前端也有工程化思考。可作为补充点，主推点仍是三道硬关 + 意图识别 + 用户画像。
 
 ### 短版（5 分钟）
 
-如果时间紧，只讲**三道硬关**（第 15 章）。这三个问题是整个项目中真正"需要动脑子才能解决"的问题，其他功能虽然也有设计思考，但更多是"做出来了"而不是"啃下来的"。
+如果时间紧，只讲**三道硬关**（第 17 章）+ 挑意图识别或用户画像其一。这三道硬关是整个项目中真正"需要动脑子才能解决"的问题；意图识别和用户画像体现了"如何设计一个让用户觉得好用的 Agent"的产品思维。
 
-> "这个项目花了大量时间在三道硬关上：流式工具调用的并发安全——LLM 输出不可预测但必须保证没有数据竞争；14 个引用点的运行时工作区切换——不销毁不重建、毫秒级重定向；上下文窗口的精细化管控——这不是二进制对错问题，每个阈值都是经验调出来的有损压缩。"
+> "这个项目花了大量时间在三道硬关上：流式工具调用的并发安全——LLM 输出不可预测但必须保证没有数据竞争；12 个引用点的运行时工作区切换——不销毁不重建、毫秒级重定向，v2 把会话和任务全局化后引用点从 14 减到 12、彻底解决了切工作区丢历史的痛点；上下文窗口的精细化管控——这不是二进制对错问题，每个阈值都是经验调出来的有损压缩。"
 
 ### 核心原则
 

@@ -32,9 +32,22 @@ class DocAwareReadTool(ReadTool):
     纯文本格式和目录列表行为与原版完全一致，不影响 offset/limit/元数据缓存。
     """
 
+    # 覆盖父类描述，明确声明支持的文档格式，避免 LLM 误选 rag 入库
+    _read_description: str = (
+        "读取文件或列出目录内容。支持纯文本格式（.py/.ts/.md/.json/.vue/.html/.css 等）"
+        "和文档格式（.pdf/.docx/.xlsx/.pptx — 自动提取为纯文本）。"
+        "JSON/CSV 等结构化文件可直接读取。"
+        "读取文档格式时无需先用 rag 入库，直接 Read 即可获取文本内容。"
+        "参数: path (必需) — 文件路径或目录路径。"
+        "对于文件: offset (起始行, 默认0), limit (最大行数, 默认2000)。"
+        "目录参数: depth (递归深度, 默认1), limit (最大条目数, 默认200)。"
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._doc_extractor = DocumentExtractor()
+        # 覆盖父类 Init 设置的通用描述，显式声明文档格式支持
+        self.description = self._read_description
 
     def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         path = parameters.get("path")
