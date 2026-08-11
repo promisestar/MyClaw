@@ -121,6 +121,13 @@ class MyClawAgent:
         self.workspace.ensure_global_config_exists()
         self.workspace.ensure_project_workspace()  # Phase 2 部署
 
+        # 启动默认工作区写入白名单，避免「已在此目录运行却报未授权」
+        try:
+            from ..workspace.auth import ensure_authorized
+            ensure_authorized(self._current_workspace)
+        except Exception as e:
+            logger.warning("默认工作区自动授权失败: %s", e)
+
         # 保留 workspace_path 属性（供 SubAgentOrchestrator 等外部引用，指向当前工作区）
         self.workspace_path = self._current_workspace
 
@@ -572,10 +579,14 @@ class MyClawAgent:
         """
         from ..workspace.auth import is_allowed
 
+        abs_path = os.path.abspath(os.path.expanduser(workspace_path))
+        # 已是当前工作区：幂等返回（仍要求目录存在；不重复校验白名单，
+        # 避免启动路径与前端路径规范化细微差异导致误报）
+        if os.path.realpath(abs_path) == os.path.realpath(self._current_workspace):
+            return
+
         if not is_allowed(workspace_path):
             raise ValueError(f"工作区未授权: {workspace_path}")
-
-        abs_path = os.path.abspath(os.path.expanduser(workspace_path))
         self._current_workspace = abs_path
 
         # Phase 2 部署：确保 .myclaw/ 子目录结构存在
@@ -911,6 +922,15 @@ class MyClawAgent:
         edit_tool.output_size_hint = 800
         edit_tool.has_side_effects = True
         registry.register_tool(edit_tool)
+
+        # 身份文件别名 → ~/.helloclaw/identity/（与工作区解耦）
+        from ..tools.builtin.identity_paths import (
+            identity_dir_from_home,
+            install_identity_path_resolver,
+        )
+        _id_dir = identity_dir_from_home(self.home_path)
+        for _t in (read_tool, write_tool, edit_tool):
+            install_identity_path_resolver(_t, _id_dir)
 
         calc_tool = CalculatorTool()
         calc_tool.output_size_hint = 100

@@ -2,11 +2,14 @@
 
 用户须显式授权一个本地目录后才能切换为当前工作区。白名单持久化到
 `~/.helloclaw/workspaces.json`，防止前端传任意路径越级访问敏感目录。
+
+启动时绑定的默认工作区（WORKSPACE_PATH / Agent 当前目录）会自动写入白名单，
+避免「进程已在该目录运行，但切换/发消息仍报未授权」。
 """
 
 import json
 import os
-from typing import List
+from typing import List, Optional
 
 
 # 授权白名单文件
@@ -58,6 +61,22 @@ def authorize(workspace_path: str) -> bool:
         current.append(abs_path)
         _save(current)
     return True
+
+
+def ensure_authorized(workspace_path: str) -> Optional[str]:
+    """确保路径在白名单中（幂等）。
+
+    用于启动默认工作区 / 当前工作区自愈。
+
+    Returns:
+        规范化绝对路径；路径无效则返回 None
+    """
+    abs_path = os.path.realpath(os.path.expanduser(workspace_path))
+    if not os.path.isdir(abs_path):
+        return None
+    if authorize(abs_path):
+        return abs_path
+    return None
 
 
 def revoke(workspace_path: str):

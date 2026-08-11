@@ -47,15 +47,16 @@ MyClaw 基于开源框架 Hello-Agents 构建，后端使用 Python/FastAPI，�
 
 ```
 ~/.helloclaw/                      # Agent 基座（全局，不随工作区变化）
-├── identity/                      #   IDENTITY.md 人格定义
-│   └── USER.md                    #   用户画像（对话中自动聚合）
+├── identity/                      #   IDENTITY / USER / SOUL / BOOTSTRAP（人格基座）
+│   └── …                          #   Agent 经 Read/Write/Edit 别名读写此处，勿写到工作区根
 ├── config.json                    #   LLM / MCP 全局配置
 ├── sessions/                      #   会话历史（所有工作区共享）
 ├── tasks/                         #   任务追踪与计划暂存（所有工作区共享）
 ├── skills/                        #   全局 Skill（所有工作区共享）
-└── workspaces.json                #   已授权的工作区白名单
+├── AGENTS.md                      #   全局行为规范骨架（工作区无 AGENTS 时 fallback）
+└── workspaces.json                #   已授权的工作区白名单（当前工作区可自愈写入）
 
-<workspace>/                       # 工作区（可运行时切换）
+<workspace>/                       # 工作区（可运行时切换；默认 ~/.helloclaw/workspace）
 └── .myclaw/
     ├── AGENTS.md                  #   项目级行为规范（叠加到人格之上）
     ├── HEARTBEAT.md               #   项目上下文（每轮对话前自动读取）
@@ -67,16 +68,17 @@ MyClaw 基于开源框架 Hello-Agents 构建，后端使用 Python/FastAPI，�
 **三层解耦设计**：
 | 层级 | 内容 | 随工作区变化？ |
 |------|------|:---:|
-| 基座 `~/.helloclaw/` | 人格、用户画像、全局配置、会话历史 | ✗ 不变 |
+| 基座 `~/.helloclaw/` | 人格、用户画像、全局配置、会话历史、白名单 | ✗ 不变 |
 | 工作区 `<project>/.myclaw/` | 项目行为规范、文件、Skills、定时任务 | ✓ 切换时重定向 |
-| 运行时内存 | Agent 实例、LLM 连接池、工具注册表 | R/W 运行时切换 |
+| 运行时内存 | Agent 实例、LLM 连接池、工具注册表（含身份路径别名） | R/W 运行时切换 |
 
 ### 进程模型
 
 - 单个 Python 进程运行一个 MyClaw Agent 实例
 - 使用全局 `asyncio.Lock` 保证所有请求串行处理
-- 工作区切换时 `bind_workspace()` 全量重绑引用点，无需重启进程
+- 工作区切换时 `bind_workspace()` 全量重绑引用点，无需重启进程；同路径幂等
 - 切换开销：毫秒级（仅文件系统 setattr 操作）
+- 启动时对当前工作区自动写入白名单（`ensure_authorized`）
 
 ---
 
@@ -93,9 +95,11 @@ MyClaw 基于开源框架 Hello-Agents 构建，后端使用 Python/FastAPI，�
 
 MyClaw 将"灵魂"（身份、人格、用户画像）和"工位"（项目文件、项目规范）**彻底分离**：
 
-1. **基座层**：`~/.helloclaw/` 存放永不随工作区变化的内容（人格、画像、全局配置）
-2. **工作区层**：`<project>/.myclaw/` 存放项目专属内容（项目行为规范、上传文件、项目 Skills）
-3. **切换机制**：`bind_workspace()` 不销毁 Agent 实例，而是通过运行时 setattr 更新文件工具根目录、Skill 目录、浏览器上传目录等引用点
+1. **基座层**：`~/.helloclaw/` 存放永不随工作区变化的内容（人格、画像、全局配置、会话/任务）
+2. **工作区层**：`<project>/.myclaw/` 存放项目专属内容（项目行为规范、上传文件、项目 Skills、定时任务）
+3. **切换机制**：`bind_workspace()` 不销毁 Agent 实例，而是通过运行时 setattr 更新文件工具根目录、Skill 目录、浏览器上传目录等引用点；**已是当前路径则幂等返回**
+4. **授权自愈**：白名单在 `workspaces.json`；启动与列表接口对**当前**工作区 `ensure_authorized`，避免「已在跑却报未授权」；切到新目录仍须显式授权。默认工作区 `WORKSPACE_PATH=~/.helloclaw/workspace`
+5. **身份工具路径**：Read/Write/Edit 对 `IDENTITY.md` 等做基座别名重定向（`identity_paths`），防止入职/改人设写到项目根
 
 ### 最终效果
 
@@ -103,6 +107,7 @@ MyClaw 将"灵魂"（身份、人格、用户画像）和"工位"（项目文件
 - 切换后身份不变、项目行为规范自动更新为当前项目的
 - 会话历史**跨工作区共享**（存储在 `~/.helloclaw/sessions/`），切项目不丢对话
 - Shell 命令被限制在当前工作区根目录内，防止跨工作区访问
+- 模型用裸文件名编辑身份时落到 `~/.helloclaw/identity/`，不会污染项目目录
 
 ---
 
@@ -536,11 +541,13 @@ MyClaw 的配置分为三层：
 └── WORKSPACE_PATH
 
 身份配置文件 (~/.helloclaw/identity/)
-├── AGENTS.md    — 全局行为规范骨架
 ├── IDENTITY.md  — Agent 身份认知（名称、角色）
 ├── USER.md      — 用户画像（手动 + 自动聚合）
 ├── SOUL.md      — 性格特征（语气、风格）
 └── BOOTSTRAP.md — 入职引导（完成后自动消失）
+（基座另有 ~/.helloclaw/AGENTS.md 作全局 prompt 骨架 fallback）
+
+工具约定：模型可用裸文件名 `IDENTITY.md` 等；系统经 `identity_paths` 写到本目录，禁止写到工作区根。
 
 工作区配置文件 (<workspace>/.myclaw/)
 ├── AGENTS.md    — 项目级行为规范（叠加到全局之上）

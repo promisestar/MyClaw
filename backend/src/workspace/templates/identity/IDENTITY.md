@@ -18,5 +18,5 @@ _在第一次对话时填写。让它成为你自己的。_
 这不仅仅是元数据。这是开始了解你是谁的第一步。
 
 注意：
-- 将此文件保存在工作空间根目录，命名为 `IDENTITY.md`。
-- 头像可以使用工作空间相对路径，如 `avatars/helloclaw.png`。
+- 本文件位于基座 `~/.helloclaw/identity/IDENTITY.md`（与工作区无关）；不要写到工作区根。
+- 头像可用工作区相对路径（如 `avatars/helloclaw.png`）、http(s) URL 或 data URI。

@@ -1,6 +1,12 @@
 # AGENTS.md — MyClaw 工作指南
 
-你是运行在本工作空间内的 AI 助手。路径均相对于工作空间根目录；可在根目录内自由 **Read / Write / Edit** 文件。
+你是运行在本工作空间内的 AI 助手。
+
+**路径分层（必须分清）**：
+- **工作区文件**（代码、文档、`.myclaw/`）：路径相对于**当前工作区根目录**；用 Read / Write / Edit。
+- **身份 / 人设文件**（全局，与工作区无关）：位于基座目录 `~/.helloclaw/identity/`（Windows 上多为 `C:\\Users\\<你>\\.helloclaw\\identity\\`）。
+  - 文件：`IDENTITY.md`、`USER.md`、`SOUL.md`、`BOOTSTRAP.md`
+  - 可用裸文件名（如 `IDENTITY.md`）或完整路径；**禁止**写到工作区根下的同名文件。
 
 > 约束标定：**【必须】** = 不可违反；**【禁止】** = 绝对不做；**【推荐】** = 优先选择。
 
@@ -10,7 +16,7 @@
 
 每次新会话开始，按序检查：
 
-1. **【必须】** 系统提示词已注入 `IDENTITY.md` / `USER.md` / `SOUL.md` → 无需再 Read 这些文件
+1. **【必须】** 系统提示词已注入身份内容（来自 `~/.helloclaw/identity/` 的 IDENTITY / USER / SOUL）→ 一般无需再 Read；若要**修改**身份，再 Read/Edit 身份文件
 2. **【推荐】** 用户问题涉及过往偏好、人名、项目名 → 调 `memory_search`
 3. **【推荐】** 问题依赖用户已入库资料 → 调 `rag`（`ask` 或 `search`）
 4. **【推荐】** 任务匹配某领域技能 → 在写代码或改文件**之前**加载 `Skill`
@@ -68,6 +74,7 @@
 | 查看工作区文件/列目录 | **Read** | `BashTool` 的 cat/type/dir |
 | 新建文件或整文件重写 | **Write** | `Edit`（局部替换）、`BashTool` 重定向写文件 |
 | 改已有文件中的一处文本 | **Edit**（`old_string` 须唯一且与 Read 一致） | `Write` 覆盖全文 |
+| 更新身份/人设（IDENTITY/USER/SOUL） | **Edit** 基座身份文件（见 §6） | 写到工作区根下的同名文件 |
 | 运行测试、git、安装依赖、构建 | **BashTool** | `Read`/`Write` |
 | 精确数学计算 | **calculator** | 心算或 shell |
 | 查历史对话/偏好（长期记忆） | **memory_search** / **memory_get** | 凭猜测回答 |
@@ -151,14 +158,27 @@
 
 ---
 
-## 6. 工作区文件
+## 6. 工作区文件与全局身份文件
+
+### 6.1 当前工作区（相对路径 → 工作区根）
 
 | 文件 | 说明 |
 |------|------|
-| AGENTS.md | 本指南 |
-| IDENTITY.md / USER.md / SOUL.md | 已注入系统提示词，更新时用 Edit |
+| AGENTS.md / `.myclaw/AGENTS.md` | 本指南（项目级可覆盖） |
 | HEARTBEAT.md | 心跳任务 |
-| BOOTSTRAP.md | 首次初始化引导 |
+
+### 6.2 全局身份（基座，与工作区无关）
+
+路径：`~/.helloclaw/identity/`（**【必须】** 用下列文件名或该目录下的路径；**【禁止】** 写到工作区根）
+
+| 文件 | 说明 |
+|------|------|
+| IDENTITY.md | Agent 名称、物种、风格、签名表情 |
+| USER.md | 用户称呼、时区、备注；含 AUTO 画像区 |
+| SOUL.md | 人格与行为边界 |
+| BOOTSTRAP.md | 仅首次入职引导；完成后删除 |
+
+编辑示例：`Edit` 的 `path` 填 `IDENTITY.md` 或 `~/.helloclaw/identity/IDENTITY.md`。
 
 ---
 
@@ -273,9 +293,11 @@ MCP 采用**两阶段**模式：
 
 从对话得知用户或自身新信息时：
 
-1. **【必须】** Read 目标文件（已注入文件仍要先 Read 当前磁盘内容）
-2. **Edit** 修改对应字段，**【必须】** 保持原有 Markdown 结构
-3. 简要告知用户已记录
+1. **【必须】** 身份类改动目标为基座 `~/.helloclaw/identity/` 下的文件（`IDENTITY.md` / `USER.md` / `SOUL.md`），**【禁止】** 写到工作区根
+2. **【必须】** 先 Read 目标文件（已注入内容仍要先 Read 当前磁盘内容）
+3. **Edit** 修改对应字段，**【必须】** 保持原有 Markdown 结构
+4. 简要告知用户已记录
+5. 偏好/事实类可同时 `memory_add`；**【禁止】** 用工作区文件代替长期记忆
 
 ---
 

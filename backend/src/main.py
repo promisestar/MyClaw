@@ -51,7 +51,8 @@ async def lifespan(app: FastAPI):
 
     # 初始化工作空间（home_path 基座 + workspace_path 默认工作区分离）
     home_path = os.getenv("AGENT_HOME", "~/.helloclaw")
-    workspace_path = os.getenv("WORKSPACE_PATH", "~")
+    # 与 CLI / .env 示例对齐：默认 ~/.helloclaw/workspace（而非用户家目录）
+    workspace_path = os.getenv("WORKSPACE_PATH", "~/.helloclaw/workspace")
     print(f"Agent home: {os.path.expanduser(home_path)}")
 
     # 初始化全局 Agent 实例（构造函数内完成 Phase 1 identity 部署 + Phase 2 工作区部署）

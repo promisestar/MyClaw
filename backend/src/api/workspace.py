@@ -58,9 +58,15 @@ def get_agent():
 
 @router.get("/list", response_model=WorkspaceListResponse)
 async def list_workspaces():
-    """列出所有已授权工作区及当前工作区。"""
+    """列出所有已授权工作区及当前工作区。
+
+    若当前工作区不在白名单中（例如旧进程、手工删了 workspaces.json），
+    自动补授权，避免 UI 显示「当前目录却未授权」。
+    """
     agent = get_agent()
     current = agent.current_workspace if agent else ""
+    if current:
+        workspace_auth.ensure_authorized(current)
     return WorkspaceListResponse(
         workspaces=workspace_auth.list_allowed_workspaces(),
         current=current,

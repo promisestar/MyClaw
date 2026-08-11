@@ -363,17 +363,18 @@ def _compute_retry_delay(attempt, base_delay, max_delay, backoff, jitter):
 
 ### 实现方案
 
-`MyClawAgent._build_system_prompt` 从多个配置文件组合系统提示词：
+`MyClawAgent._build_system_prompt` 从多个配置文件组合系统提示词（**身份从基座 IdentityManager 读，AGENTS 从当前工作区读、基座 fallback**）：
 
 ```
-AGENTS.md      → 主体行为规范（必须存在）
-BOOTSTRAP.md   → 启动引导（入职未完成时注入）
-IDENTITY.md    → 身份认知（名称、角色定位）
-USER.md        → 用户画像（偏好、习惯）
-SOUL.md        → 性格特征（语气、风格）
+AGENTS.md      → 主体行为规范（工作区 .myclaw/ 优先，否则 ~/.helloclaw/AGENTS.md）
+BOOTSTRAP.md   → 启动引导（入职未完成时从 identity/ 注入）
+IDENTITY.md    → 身份认知（~/.helloclaw/identity/）
+USER.md        → 用户画像（~/.helloclaw/identity/）
+SOUL.md        → 性格特征（~/.helloclaw/identity/）
 + 子代理使用指引（自动注入）
 + 任务管理指引（自动注入）
 + 长期记忆使用指引（自动注入）
++ 回忆通道指引（session_search 启用时）
 + 当前时间（每次构建时动态注入）
 ```
 
@@ -383,28 +384,25 @@ SOUL.md        → 性格特征（语气、风格）
 def _build_system_prompt(self) -> str:
     agents_content = self.workspace.load_config("AGENTS")
     if not agents_content:
-        raise RuntimeError("AGENTS.md 配置文件不存在")
-
-    base_prompt = agents_content
+        # 基座 AGENTS.md fallback
+        base_agents_path = os.path.join(self.home_path, "AGENTS.md")
+        ...
     context_parts = []
 
-    # 检查入职是否完成
-    if not self.workspace.is_onboarding_completed():
-        bootstrap = self.workspace.load_config("BOOTSTRAP")
+    if not self.identity.is_onboarding_completed():
+        bootstrap = self.identity.bootstrap
         if bootstrap:
             context_parts.append(f"\n## 初始化引导\n\n{bootstrap}")
 
-    # 身份信息
-    identity = self.workspace.load_config("IDENTITY")
+    identity = self.identity.identity
     if identity:
         context_parts.append(f"\n## 你的身份信息\n{identity}")
 
-    # 用户信息
-    user_info = self.workspace.load_config("USER")
+    user_info = self.identity.user
     if user_info:
         context_parts.append(f"\n## 用户信息\n{user_info}")
 
-    # ... 子代理指引、任务管理指引、记忆指引 ...
+    # ... SOUL、子代理指引、任务管理、记忆、session_search 指引 ...
 
     return base_prompt + "\n" + "\n".join(context_parts)
 ```
@@ -936,28 +934,32 @@ Agent 的"灵魂"（身份、人格、用户画像）和"工位"（要操作的�
 **三层解耦架构**：
 
 ```
-Layer 0: Agent 基座  ~/.helloclaw/          ← 进程固定，永不变化
+Layer 0: Agent 基座  ~/.helloclaw/          ← 进程固定，永不随切工作区变化
   ├── identity/  (IDENTITY/SOUL/USER/BOOTSTRAP)  身份/人格基座
-  └── AGENTS.md  (全局默认 prompt 骨架 fallback)
+  ├── sessions/ tasks/ config.json / skills/     全局共享
+  ├── AGENTS.md  (全局默认 prompt 骨架 fallback)
+  └── workspaces.json  (已授权工作区白名单)
 Layer 1: 用户工作区  <project>/.myclaw/      ← 运行时切换
   ├── AGENTS.md  (项目级行为规范，可选)
-  ├── sessions/ tasks/ uploads/ skills/
-Layer 2: 会话层      ← 不变（原有机制）
+  ├── uploads/ skills/ automations/
+Layer 2: 会话层      ← 不变（原有机制；落点在 Layer 0 sessions/）
 ```
 
 身份文件从工作区迁移到固定基座目录，工作区文件归拢到 `.myclaw/` 隐藏子目录。System Prompt 构建时：identity 从基座读（不随工作区变），AGENTS.md 优先用工作区的、基座作 fallback。
 
-**bind_workspace() 全量重绑**：Agent 构造期把 `workspace_path` 深度绑定到 12 处引用点（file tools、`SkillLoader`、`SubAgentOrchestrator`、`EnhancedSimpleAgent`、`uploads_root` 等），切换时全部运行时 setattr 更新（sessions 和 tasks 已于 v2 全局化，不再需要重绑）：
+**bind_workspace() 全量重绑**：Agent 构造期把 `workspace_path` 深度绑定到约 12 处引用点（file tools、`SkillLoader`、`SubAgentOrchestrator`、`EnhancedSimpleAgent`、`uploads_root` 等），切换时全部运行时 setattr 更新（sessions 和 tasks 已于 v2 全局化，不再需要重绑）。**已是当前路径则幂等返回**，避免路径规范化差异误报未授权：
 
 ```python
 def bind_workspace(self, workspace_path: str):
+    abs_path = os.path.abspath(os.path.expanduser(workspace_path))
+    if os.path.realpath(abs_path) == os.path.realpath(self._current_workspace):
+        return  # 幂等
     if not is_allowed(workspace_path):
         raise ValueError(f"工作区未授权")
-    abs_path = os.path.abspath(workspace_path)
     self.workspace = WorkspaceManager(abs_path)
     self.workspace.ensure_project_workspace()  # 部署 .myclaw/
 
-    # 全量重绑 12 处引用点
+    # 全量重绑约 12 处引用点
     self._rebind_workspace_tools(abs_path)     # Read/Write/Edit/Bash/RAG
     self.skill_loader.skills_dir = Path(self.workspace.skills_path)
     self.skill_loader.clear()                  # 清缓存重新加载
@@ -969,8 +971,10 @@ def bind_workspace(self, workspace_path: str):
 ```
 
 **两阶段部署**：
-- Phase 1（启动时）：从 `templates/identity/` 部署身份文件到 `~/.helloclaw/identity/`，含 V1→V2 自动迁移
+- Phase 1（启动时）：从 `templates/identity/` 部署身份文件到 `~/.helloclaw/identity/`，含 V1→V2 自动迁移；并对当前工作区 `ensure_authorized`
 - Phase 2（切工作区时）：懒部署 `.myclaw/` 子目录结构 + `.gitignore` 自动注入
+
+**身份工具路径别名（解耦后的关键修补）**：hello_agents 的相对路径默认落在工作区。若不处理，模型 `Write("IDENTITY.md")` 会写到项目根而非基座。`identity_paths.install_identity_path_resolver` 包装 Read/Write/Edit 的 `_resolve_path`（裸名 / `identity/` / 工作区根同名 → 基座），并对 Write/Edit 临时切换 `working_dir` 以免备份路径 `relative_to` 失败。AGENTS/BOOTSTRAP 模板同步禁止写到工作区根。
 
 ### 设计亮点
 
@@ -984,7 +988,9 @@ def bind_workspace(self, workspace_path: str):
 
 **5. BashTool `_cwd` 重置防跨工作区逃逸**：切换时重置 cd 历史，防止通过 `cd` 跳出白名单访问其他工作区文件。
 
-**6. 白名单授权模型**：用户须显式授权目录才能切换（`~/.helloclaw/workspaces.json`），防止前端传任意路径越级访问敏感目录。
+**6. 白名单 + 当前工作区自愈**：新路径须显式授权（`workspaces.json`）；启动与 `GET /api/workspace/list` 对**当前**工作区 `ensure_authorized`，避免「进程已绑定却报未授权」。默认 `WORKSPACE_PATH=~/.helloclaw/workspace`。
+
+**7. 身份文件工具别名**：不新增核心工具，用 monkey-patch 把身份四件套接到基座，提示词与工具层双重约束，防止入职流程污染项目目录。
 
 ### 对比分析
 
@@ -993,11 +999,11 @@ def bind_workspace(self, workspace_path: str):
 | OpenClaw per-agent workspace | 身份在 workspace 内 | 重建 agent | 可选 sandbox |
 | Cursor Multi-root | User Rules 全局 | 索引重建 | IDE 内置 |
 | WorkBuddy 空间切换 | 空间级身份 | 空间切换 | 本地/云双模 |
-| **MyClaw bind_workspace** | **基座/工作区分离** | **毫秒级 setter 重绑** | **allowed_directories 白名单** |
+| **MyClaw bind_workspace** | **基座/工作区分离 + 路径别名** | **毫秒级 setter 重绑** | **白名单 + 身份别名通道** |
 
 ### 面试展示要点
 
-> "Agent 的身份和工作区原本耦合在一个目录，切项目就丢人格。我把它们解耦成三层：身份文件固定在 ~/.helloclaw/identity/，全局共享数据在 ~/.helloclaw/（sessions/tasks/config），工作区项目文件归拢到 .myclaw/ 子目录。切换工作区时 bind_workspace 全量重绑 12 处引用点——file tools、skills_dir、子代理编排器等全部运行时 setattr，毫秒级完成不重启进程。v2 把会话和任务全局化后引用点从 14 减到 12，彻底解决了切工作区丢历史的痛点。BashTool 切换时重置 cd 历史防跨工作区逃逸。还有 V1→V2 自动迁移和白名单授权模型。"
+> "Agent 的身份和工作区原本耦合在一个目录，切项目就丢人格。我把它们解耦成三层：身份固定在 ~/.helloclaw/identity/，会话/任务/配置全局共享，项目文件归拢到 .myclaw/。切换时 bind_workspace 全量重绑约 12 处引用点，毫秒级、不重启；同路径幂等。白名单防任意路径越权，但对启动默认工作区做 ensure_authorized 自愈。解耦后还有第二道坑：模型仍按相对路径 Write IDENTITY.md，会写到工作区根——用 identity_paths 包装 Read/Write/Edit 重定向到基座，并临时切 working_dir 兼容工具备份逻辑。"
 
 ---
 
@@ -1414,7 +1420,11 @@ def bind_workspace(self, workspace_path: str):
 
 System Prompt 构建时：`IDENTITY/SOUL/USER` 从 `~/.helloclaw/identity/` 读取（永远不变），`AGENTS.md` 优先用工作区的、基座那份作为 fallback（防止切换到空项目时 RuntimeError）。
 
+工具层：`identity_paths` 把模型常用的裸文件名重定向到基座，避免「Prompt 读基座、Write 却落到工作区根」的半解耦状态。白名单对**当前**工作区启动/list 自愈，对新路径仍强制 authorize。
+
 > **v2 变更**：sessions 和 tasks 从 `<workspace>/.myclaw/` 迁移到 `~/.helloclaw/`，解决了切换工作区后会话历史全部丢失的痛点。迁移后 `bind_workspace` 引用点从 14 减少到 12，不再需要重绑 session_dir 和 tasks_dir。
+
+> **v1.2 变更**：默认工作区与 CLI 对齐为 `~/.helloclaw/workspace`；`ensure_authorized` + list 自愈；身份文件 Read/Write/Edit 别名。
 
 #### v1→v2 演进：SessionStore 缓存问题已随全局化解决
 
@@ -1454,7 +1464,7 @@ def ensure_exists(self, old_workspace=None):
 
 #### 面试表述
 
-> "Agent 的工作区路径被深度绑定到 12 个引用点。切换工作区时不能销毁重建（开销大、中断对话），也不能只改 WorkspaceManager 对象（所有工具和子系统的路径还是旧的）。我用了运行时 setattr 全量重绑，保持 Agent 实例存活的情况下毫秒级切换。整体架构把目录拆成三组：基座身份目录（不随切换变化）、全局共享目录（sessions/tasks/config，跨工作区可见）、工作区数据目录（项目文件/定时任务）。v2 迭代中把 sessions 和 tasks 从工作区迁移到全局，引用点从 14 减到 12，同时解决了切换工作区丢会话历史的核心痛点。"
+> "Agent 的工作区路径被深度绑定到约 12 个引用点。切换时不能销毁重建（开销大、中断对话），也不能只改 WorkspaceManager（工具路径仍是旧的）。用运行时 setattr 全量重绑，实例存活、毫秒级切换；同路径幂等。目录拆三组：基座身份、全局 sessions/tasks/config、工作区 .myclaw。解耦后还要修工具相对路径：identity_paths 把 IDENTITY 等重定向到基座。白名单防越权，当前工作区 ensure_authorized 自愈。"
 
 ---
 
