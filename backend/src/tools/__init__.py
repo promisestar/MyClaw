@@ -24,6 +24,9 @@ from .builtin.browser import BrowserTool, BrowserSession
 # 定时任务工具（P0 补全）
 from .builtin.automation_tool import AutomationTool
 
+# 跨会话原文回忆
+from .builtin.session_search_tool import SessionSearchTool
+
 __all__ = [
     "MemoryTool",
     "BashTool",
@@ -41,4 +44,5 @@ __all__ = [
     "BrowserTool",
     "BrowserSession",
     "AutomationTool",
+    "SessionSearchTool",
 ]

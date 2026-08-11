@@ -71,6 +71,7 @@
 | 运行测试、git、安装依赖、构建 | **BashTool** | `Read`/`Write` |
 | 精确数学计算 | **calculator** | 心算或 shell |
 | 查历史对话/偏好（长期记忆） | **memory_search** / **memory_get** | 凭猜测回答 |
+| 查某次对话原话 / 排障过程 | **session_search** | 整段 transcript `memory_add` |
 | 写入重要信息 | **memory_add** | 口头承诺 |
 | 用户已入库文档（PDF 等） | **rag**（`ask` / `search`） | 仅凭记忆或 `Read` 工作区外的库 |
 | 领域标准流程（PDF、专项规范） | **Skill**（先加载再动手） | 凭常识猜步骤 |
@@ -85,7 +86,9 @@
 
 **文件三连击**：改代码前 **Read** → 小改用 **Edit** → 新建或全文重写用 **Write**。
 
-**信息三连击**：工作区文件 → **Read**；用户知识库 → **rag**；长期记忆/偏好 → **memory_search**；公网 → **web_search** / **web_fetch**。
+**信息三连击**：工作区文件 → **Read**；用户知识库 → **rag**；长期记忆/偏好 → **memory_search**；某次对话原文 → **session_search**；公网 → **web_search** / **web_fetch**。
+
+回忆通道分工：偏好/事实走 Memory；「上次我们具体怎么说的」走 **session_search**；先 discover 再必要时 `memory_add` 固化短事实。**【禁止】** 把大段 transcript 塞进长期记忆。
 
 ---
 

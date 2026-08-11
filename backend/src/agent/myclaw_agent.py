@@ -41,11 +41,20 @@ from ..tools import SearchContentTool, SearchFileTool, ListDirTool
 from ..tools import HttpRequestTool
 from ..tools import BrowserTool, BrowserSession
 from ..tools import AutomationTool
+from ..tools import SessionSearchTool
 from ..automation import AutomationStore
 from ..tools.builtin.mcp_tool import reset_all_mcp_disclosed_tools
 from ..tools.builtin.skill_tool import SkillTool
 from ..skills.loader import SkillLoader
 from ..core.timeouts import TimeoutConfig, get_timeout_config
+from ..session_store import (
+    SessionIndexDB,
+    SessionIndexer,
+    SessionSearch,
+    probe_sqlite_fts_capabilities,
+    resolve_index_db_path,
+    resolve_session_recall_config,
+)
 
 # SubAgent 编排器 + 任务追踪器
 from .subagent_orchestrator import SubAgentOrchestrator, SubAgentTask, SubAgentResultMode
@@ -176,6 +185,13 @@ class MyClawAgent:
         # 初始化 MemoryVectorStore（长期记忆的 Qdrant 存储层）
         # 必须在 _setup_tools() 之前，因为 MemoryTool 依赖它
         self._memory_store = MemoryVectorStore()
+
+        # 跨会话原文索引（SQLite FTS / LIKE）— 须在 _setup_tools 之前
+        self._session_index_db = None
+        self._session_indexer = None
+        self._session_search = None
+        self._session_recall_cfg = {}
+        self._init_session_recall()
 
         # 初始化子代理编排器（延迟创建，在 _setup_tools 中实例化）
         self._subagent_orchestrator = None
@@ -439,10 +455,97 @@ class MyClawAgent:
         if soul:
             context_parts.append(f"\n## 人格模板\n{soul}")
 
+        # 静态三通道回忆指引（仅工具启用时；不随轮次变化）
+        if getattr(self, "_session_search", None) is not None:
+            context_parts.append(
+                "\n## 回忆通道\n"
+                "- 偏好/事实/「我是谁」→ memory_search 或自动注入记忆 / USER.md\n"
+                "- 某次对话原话、排障过程 → session_search（按需，勿整段 memory_add）\n"
+            )
+
         if context_parts:
             return base_prompt + "\n" + "\n".join(context_parts)
 
         return base_prompt
+
+    def _init_session_recall(self) -> None:
+        """初始化跨会话回忆索引与检索（config.session_recall.enabled）。"""
+        try:
+            global_config = self.workspace.load_global_config()
+        except Exception:
+            global_config = {}
+        cfg = resolve_session_recall_config(global_config)
+        self._session_recall_cfg = cfg
+        if not cfg.get("enabled", True):
+            print("ℹ️ session_recall 已禁用（session_recall.enabled=false）")
+            return
+
+        sessions_dir = self.workspace.sessions_path
+        db_path = resolve_index_db_path(cfg, sessions_dir)
+        probe = probe_sqlite_fts_capabilities()
+        force_like = bool(cfg.get("force_like", False))
+        try:
+            db = SessionIndexDB(db_path, force_like=force_like, probe=probe)
+            db.ensure_schema()
+            indexer = SessionIndexer(
+                db,
+                sessions_dir,
+                index_tool_messages=bool(cfg.get("index_tool_messages", False)),
+                workspace_id_getter=lambda: getattr(self, "_current_workspace", None),
+            )
+            search = SessionSearch(
+                db,
+                sessions_dir,
+                discover_limit=int(cfg.get("discover_limit", 3)),
+                fts_scan_limit=int(cfg.get("fts_scan_limit", 100)),
+                default_window=int(cfg.get("default_window", 5)),
+                cjk_like_fallback=bool(cfg.get("cjk_like_fallback", True)),
+                exclude_current_session=bool(cfg.get("exclude_current_session", True)),
+            )
+            self._session_index_db = db
+            self._session_indexer = indexer
+            self._session_search = search
+            print(
+                f"🔎 session_recall 就绪: index_mode={db.index_mode}, "
+                f"sqlite={probe.get('sqlite_version')}, fts5={probe.get('fts5')}, "
+                f"db={db_path}"
+            )
+        except Exception as e:
+            logger.warning("session_recall 初始化失败，已跳过: %s", e)
+            self._session_index_db = None
+            self._session_indexer = None
+            self._session_search = None
+
+    def _index_session_safe(self, session_id: str) -> None:
+        """索引会话；失败只打日志，不阻断对话保存。"""
+        if not self._session_indexer or not session_id:
+            return
+        try:
+            self._session_indexer.upsert_session(session_id)
+        except Exception as e:
+            logger.warning("session index upsert 失败 (%s): %s", session_id, e)
+
+    def start_session_index_rebuild_background(self) -> None:
+        """后台全量重建索引（lifespan 调用）。"""
+        if not self._session_indexer:
+            return
+        indexer = self._session_indexer
+
+        def _run():
+            try:
+                result = indexer.rebuild_if_needed()
+                if result is not None:
+                    print(
+                        f"🔎 session_recall 索引重建完成: "
+                        f"total={result.get('total')} indexed={result.get('indexed')} "
+                        f"failed={result.get('failed')}"
+                    )
+            except Exception as e:
+                logger.warning("session_recall 后台重建失败: %s", e)
+
+        import threading
+
+        threading.Thread(target=_run, name="session-recall-rebuild", daemon=True).start()
 
     # ==================== 工作区动态切换 ====================
 
@@ -820,6 +923,17 @@ class MyClawAgent:
             workspace_manager=self.workspace,  # 过渡期回退
             profile_aggregator=self._profile_aggregator,  # 用户画像聚合器
         ))
+
+        # 跨会话原文回忆（只读；Ask 模式可用）
+        if self._session_search is not None:
+            cfg = self._session_recall_cfg or {}
+            registry.register_tool(SessionSearchTool(
+                self._session_search,
+                current_session_id_getter=lambda: getattr(self, "_current_session_id", None),
+                default_limit=int(cfg.get("discover_limit", 3)),
+                default_window=int(cfg.get("default_window", 5)),
+            ))
+
         registry.register_tool(BashTool(
             allowed_directories=[self.workspace_path],  # 限制在工作空间目录
             default_workdir=self.workspace_path,  # 与 Read/Write 根目录一致，避免 uvicorn CWD 下找不到脚本
@@ -1144,6 +1258,8 @@ class MyClawAgent:
         save_id = session_id or self.create_session()
         try:
             self._agent.save_session(save_id)
+            self._current_session_id = save_id
+            self._index_session_safe(save_id)
         except Exception as e:
             print(f"⚠️ 保存会话失败: {e}")
 
@@ -1565,6 +1681,8 @@ class MyClawAgent:
                 # 持久化任务追踪器
                 if hasattr(self, '_task_tracker') and self._task_tracker:
                     self._task_tracker.save(self._current_session_id)
+                # 增量更新跨会话原文索引（失败不阻断）
+                self._index_session_safe(self._current_session_id)
                 return self._current_session_id
             except Exception as e:
                 print(f"⚠️ 保存会话失败: {e}")
@@ -1609,6 +1727,13 @@ class MyClawAgent:
         # 清理内存中的暂存
         if hasattr(self, '_pending_plans'):
             self._pending_plans.pop(session_id, None)
+
+        # 从跨会话索引删除
+        if self._session_indexer:
+            try:
+                self._session_indexer.delete_session(session_id)
+            except Exception as e:
+                logger.warning("session index delete 失败 (%s): %s", session_id, e)
 
         return deleted
 

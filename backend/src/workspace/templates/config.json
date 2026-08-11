@@ -46,5 +46,16 @@
     "auto_inject": true,
     "auto_inject_top_k": 3,
     "auto_inject_threshold": 0.3
+  },
+  "session_recall": {
+    "enabled": true,
+    "db_path": null,
+    "discover_limit": 3,
+    "fts_scan_limit": 100,
+    "default_window": 5,
+    "index_tool_messages": false,
+    "exclude_current_session": true,
+    "cjk_like_fallback": true,
+    "auto_hint_in_prompt": false
   }
 }

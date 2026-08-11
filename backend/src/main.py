@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health, workspace, automation
+from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health, workspace, automation, session_search
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
@@ -68,6 +68,14 @@ async def lifespan(app: FastAPI):
 
     # 将 agent 引用传递给 agent API 模块
     agent.set_agent(_agent)
+
+    # 跨会话回忆：探测结果已在 Agent 初始化时打印；后台重建存量索引
+    session_search.set_agent_getter(lambda: _agent)
+    if getattr(_agent, "_session_indexer", None):
+        try:
+            _agent.start_session_index_rebuild_background()
+        except Exception as e:
+            print(f"⚠️ session_recall 后台重建启动失败: {e}")
 
     # 将 skill_loader 传递给 skills API 模块
     if hasattr(_agent, "skill_loader") and _agent.skill_loader:
@@ -211,6 +219,7 @@ app.include_router(upload.router, prefix="/api")
 app.include_router(health.router, prefix="/api")
 app.include_router(workspace.router, prefix="/api")
 app.include_router(automation.router, prefix="/api")
+app.include_router(session_search.router, prefix="/api")
 
 
 # 多模态：当 MULTIMODAL_IMAGE_MODE=url 时注册 /files 动态路由，从当前工作区 uploads 读取

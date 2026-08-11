@@ -72,6 +72,7 @@ class ContextGuard:
         "http_request": 4000,     # API 响应
         "browser": 4000,          # 浏览器操作结果/截图
         "automation": 500,        # 定时任务 CRUD 结果
+        "session_search": 4000,   # 跨会话原文窗口
     }
 
     # ── 不适合委托的工具 ──

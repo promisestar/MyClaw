@@ -455,46 +455,8 @@ get_anchored_view(session_id, message_id, window=5, bookend=3)
 
 ---
 
-## 12. 分阶段落地计划
 
-### Phase 0 — 验证（0.5～1 天）
-
-- [ ] **目标环境探测**（见 §13.1）：在开发机 / CI / 拟发布 OS 上确认 `sqlite3` 是否带 FTS5（及可选 trigram）  
-- [ ] 确认压缩后 JSON 是否保留原文 / `original_content`  
-- [ ] 统计典型用户 sessions 数量与单文件大小，估算 FTS 体积  
-- [ ] 定 `sessions_path` 解析（Identity 基座路径，与 `WorkspaceManager` 全局 sessions 一致）
-
-### Phase 1 — MVP（核心，约 3～5 天）
-
-- [ ] `session_store`：schema + upsert/delete + FTS search + anchored view  
-- [ ] 启动时调用环境探测结果选择 FTS 或 LIKE-only 路径（见 §13.1.3）  
-- [ ] 启动时存量 rebuild（可后台）  
-- [ ] `save_session` / `delete_session` 挂钩  
-- [ ] `SessionSearchTool`：discover / scroll / read / browse  
-- [ ] 注册到 `MyClawAgent._setup_tools`；Ask 模式放行  
-- [ ] 更新 `AGENTS.md` Memory / Session 分工说明  
-- [ ] 单元测试：索引往返、中文 LIKE fallback、排除当前会话、**环境探测用例**  
-
-### Phase 2 — 硬化（约 2～3 天）
-
-- [ ] 查询 sanitize 完善、snippet 高亮  
-- [ ] 索引重建进度提示、损坏自愈  
-- [ ] HTTP 调试 API  
-- [ ] 压缩原文优先索引 `original_content`（若 Phase 0 证明需要）  
-- [ ] `workspace_id` 可选过滤  
-- [ ] 文档：更新 `MyClaw_Memory实现文档` 增加「Session Recall」交叉引用；更新工具集总结  
-
-### Phase 3 — 增强（可选）
-
-- [ ] 会话自动标题（轻量 LLM）  
-- [ ] FTS trigram / 更好中文分词（仅当 §13.1 探测到 trigram 可用，或引入可选分词依赖后）  
-- [ ] 可选：消息级向量「语义补召回」合并进 discover（独立 collection，如 `helloclaw_session_msgs`）  
-- [ ] 前端搜索面板 + session 深链  
-- [ ] 自动 hint（`auto_hint_in_prompt`）  
-
----
-
-## 13. 测试计划
+## 12. 测试计划
 
 测试分两层：**目标环境探测**（能否用 FTS5）与 **功能回归**（召回行为是否正确）。前者是后者的前置门禁，并写入 CI / 启动自检。
 
