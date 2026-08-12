@@ -11,6 +11,13 @@
 
 from .loader import SkillLoader, Skill
 from .state_manager import SkillStateManager
+from .usage import (
+    SkillUsageStore,
+    STATE_ACTIVE,
+    STATE_STALE,
+    STATE_ARCHIVED,
+    latest_activity_at,
+)
 from .exceptions import (
     SkillError,
     SkillImportError,
@@ -25,6 +32,11 @@ __all__ = [
     "SkillLoader",
     "Skill",
     "SkillStateManager",
+    "SkillUsageStore",
+    "STATE_ACTIVE",
+    "STATE_STALE",
+    "STATE_ARCHIVED",
+    "latest_activity_at",
     # 异常
     "SkillError",
     "SkillImportError",

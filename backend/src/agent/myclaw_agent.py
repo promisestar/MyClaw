@@ -45,6 +45,7 @@ from ..tools import SessionSearchTool
 from ..automation import AutomationStore
 from ..tools.builtin.mcp_tool import reset_all_mcp_disclosed_tools
 from ..tools.builtin.skill_tool import SkillTool
+from ..tools.builtin.skill_manage_tool import SkillManageTool
 from ..skills.loader import SkillLoader
 from ..core.timeouts import TimeoutConfig, get_timeout_config
 from ..session_store import (
@@ -189,6 +190,14 @@ class MyClawAgent:
             global_dir=global_skills_dir,
         )
 
+        from ..skills.curator import SkillCurator
+
+        self._skill_curator = SkillCurator(
+            self.skill_loader,
+            config_getter=self.workspace.load_global_config,
+            refresh_callback=self.refresh_skill_tool,
+        )
+
         # 初始化 MemoryVectorStore（长期记忆的 Qdrant 存储层）
         # 必须在 _setup_tools() 之前，因为 MemoryTool 依赖它
         self._memory_store = MemoryVectorStore()
@@ -240,6 +249,14 @@ class MyClawAgent:
             subagent_orchestrator=self._subagent_orchestrator,
             timeout_config=self._timeout_config,
         )
+        # 会话内冻结基座 system（易变内容走 turn_context）
+        self._system_prompt_frozen = True
+        self._system_prompt_fingerprint = (
+            getattr(self, "_current_session_id", None),
+            self._current_workspace,
+            self.identity.is_onboarding_completed(),
+        )
+        self._onboarding_was_incomplete = not self.identity.is_onboarding_completed()
 
         # 注入模型信息到 ContextManager，启用精确 token 统计
         if hasattr(self._agent, "context_manager") and self._agent.context_manager:
@@ -475,6 +492,83 @@ class MyClawAgent:
 
         return base_prompt
 
+    def ensure_session_system_prompt(self, *, force: bool = False) -> None:
+        """确保会话内基座 system 已冻结；仅在 force 或指纹变化时重建。
+
+        易变内容（相关记忆、Plan 指令）不得写入 system，应走 turn_context。
+        """
+        if self._agent is None:
+            return
+
+        onboarding_done = self.identity.is_onboarding_completed()
+        # 入职中途完成：去掉 BOOTSTRAP 段
+        if getattr(self, "_onboarding_was_incomplete", False) and onboarding_done:
+            force = True
+            self._onboarding_was_incomplete = False
+
+        fingerprint = (
+            getattr(self, "_current_session_id", None),
+            self._current_workspace,
+            onboarding_done,
+        )
+        if (
+            not force
+            and getattr(self, "_system_prompt_frozen", False)
+            and getattr(self, "_system_prompt_fingerprint", None) == fingerprint
+        ):
+            return
+
+        self._agent.system_prompt = self._build_system_prompt()
+        self._system_prompt_frozen = True
+        self._system_prompt_fingerprint = fingerprint
+        self._onboarding_was_incomplete = not onboarding_done
+
+    def _rebind_system_prompt_fingerprint(self) -> None:
+        """仅同步冻结指纹中的 session/workspace/入职状态，不重读磁盘。
+
+        用于 session_id 在冻结后才落定（或保存后回写）的场景，避免下一轮误重建。
+        """
+        if not getattr(self, "_system_prompt_frozen", False):
+            return
+        self._system_prompt_fingerprint = (
+            getattr(self, "_current_session_id", None),
+            self._current_workspace,
+            self.identity.is_onboarding_completed(),
+        )
+
+    def _compose_turn_context(self, *parts: str) -> Optional[str]:
+        """拼接非空轮次上下文块；全空则返回 None。"""
+        blocks = [p.strip() for p in parts if p and str(p).strip()]
+        if not blocks:
+            return None
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _plan_planning_instruction() -> str:
+        return (
+            "## 规划模式指令\n"
+            "你正处于规划模式。请使用只读工具（read/search_content/search_file/"
+            "web_search/web_fetch 等）分析任务，然后输出一个结构化的执行计划。\n\n"
+            "**输出格式要求：**\n"
+            "在分析完成后，在你的最终回复中包含一个 JSON 代码块，格式如下：\n"
+            "```json\n"
+            '[\n'
+            '  {\n'
+            '    "id": "todo_1",\n'
+            '    "description": "任务描述（自然语言）",\n'
+            '    "dependencies": [],\n'
+            '    "tools_required": ["read", "edit"]\n'
+            '  }\n'
+            "]\n"
+            "```\n"
+            "规则：\n"
+            "- id 使用 todo_1, todo_2, ... 格式\n"
+            "- dependencies 是前置任务的 id 列表（可为空）\n"
+            "- tools_required 是完成任务需要的工具名列表\n"
+            "- 计划应包含 3-10 个可执行的步骤\n"
+            "- 在 JSON 之前先用自然语言解释你的分析\n"
+        )
+
     def _init_session_recall(self) -> None:
         """初始化跨会话回忆索引与检索（config.session_recall.enabled）。"""
         try:
@@ -638,7 +732,7 @@ class MyClawAgent:
 
         # 重建系统提示词（identity 不变 + 新工作区 AGENTS 叠加）
         if self._agent is not None:
-            self._agent.system_prompt = self._build_system_prompt()
+            self.ensure_session_system_prompt(force=True)
 
         print(f"🔄 已切换工作区: {abs_path}")
 
@@ -821,9 +915,10 @@ class MyClawAgent:
         )
 
     def _inject_relevant_memories(self, user_message: str) -> str:
-        """检索与用户消息相关的记忆，返回格式化的记忆上下文文本。
+        """检索与用户消息相关的记忆，返回格式化的轮次上下文文本。
 
-        每轮用户消息到达时后台语义检索 top-K 记忆，作为 system context 静默注入。
+        每轮用户消息到达时后台语义检索 top-K 记忆，作为 ephemeral turn_context
+        注入本轮发给模型的 user 前缀（不写入 system、不入会话历史）。
         如果记忆系统不可用或无相关记忆，返回空字符串。
 
         配置项（config.json 的 memory 段）：
@@ -882,7 +977,7 @@ class MyClawAgent:
 
             # 格式化记忆上下文
             lines = [
-                '\n## 相关记忆（自动注入）',
+                '## 相关记忆（自动注入）',
                 '以下是从长期记忆中检索到的与当前对话相关的信息：\n',
             ]
             for i, m in enumerate(memories, 1):
@@ -988,9 +1083,15 @@ class MyClawAgent:
             store_getter=lambda: self._automation_store,
         ))
 
-        # 自实现 Skill 工具
+        # 自实现 Skill 工具（只读加载 + 写入变异面）
         self._skill_tool = SkillTool(skill_loader=self.skill_loader)
         registry.register_tool(self._skill_tool)
+        self._skill_manage_tool = SkillManageTool(
+            skill_loader=self.skill_loader,
+            on_changed=self.refresh_skill_tool,
+            agent_created_default=False,
+        )
+        registry.register_tool(self._skill_manage_tool)
 
         self._register_mcp_tools(registry)
 
@@ -1122,9 +1223,12 @@ class MyClawAgent:
         prefix, suffix = self._split_history_at_user_turn(history, user_turn_index)
         self._agent._history = prefix
         self._resend_suffix = suffix
+        session_changed = getattr(self, "_current_session_id", None) != session_id
         self._current_session_id = session_id
         if hasattr(self._agent, "context_manager"):
             self._agent.context_manager.recalculate_history_tokens()
+        if session_changed:
+            self.ensure_session_system_prompt(force=True)
 
     def activate_session(self, session_id: str) -> None:
         """将 Agent 内存切换到指定会话（打开历史会话 / 开始对话前调用）。
@@ -1150,6 +1254,8 @@ class MyClawAgent:
         self._current_session_id = session_id
         if hasattr(self._agent, "context_manager"):
             self._agent.context_manager.recalculate_history_tokens()
+        # 会话边界：冻结新的基座 system
+        self.ensure_session_system_prompt(force=True)
 
     def _finalize_turn_replace_if_needed(self) -> None:
         """将保留的后续对话拼回历史（在保存会话前调用）。"""
@@ -1246,22 +1352,21 @@ class MyClawAgent:
         # 热加载配置（检测 config.json 变化）
         self._reload_llm_if_changed()
 
-        # 动态更新系统提示词（检查 BOOTSTRAP 状态、读取最新配置）
-        self._agent.system_prompt = self._build_system_prompt()
-
-        # 自动注入相关记忆（后台语义检索 top-K）
+        # 自动注入相关记忆 → ephemeral turn_context（不入 system / 历史）
         memory_context = self._inject_relevant_memories(message)
-        if memory_context:
-            self._agent.system_prompt += memory_context
+        turn_context = self._compose_turn_context(memory_context)
 
-        if session_id:
-            if user_turn_index is not None:
-                self._prepare_session_turn_replace(session_id, user_turn_index)
-            else:
-                self.activate_session(session_id)
+        # 先绑定会话，再冻结 system（避免 fingerprint 与 session_id 脱节）
+        if not session_id:
+            import uuid
+            session_id = str(uuid.uuid4())[:8]
+
+        if user_turn_index is not None:
+            self._prepare_session_turn_replace(session_id, user_turn_index)
         else:
-            self._agent.clear_history()
-            self._current_session_id = None
+            self.activate_session(session_id)
+
+        self.ensure_session_system_prompt()
 
         # LLM 调用参数（防止重复循环）
         llm_kwargs = {
@@ -1271,15 +1376,20 @@ class MyClawAgent:
 
         # 构造（可能含多模态附件）输入并运行 Agent
         agent_input = self._prepare_message_with_attachments(message, attachments)
-        response = self._agent.run(agent_input, cancel_token=cancel_token, **llm_kwargs)
+        response = self._agent.run(
+            agent_input,
+            cancel_token=cancel_token,
+            turn_context=turn_context,
+            **llm_kwargs,
+        )
         self._finalize_turn_replace_if_needed()
 
-        # 保存会话
-        save_id = session_id or self.create_session()
+        # 保存会话（session_id 已在回合开始时分配）
         try:
-            self._agent.save_session(save_id)
-            self._current_session_id = save_id
-            self._index_session_safe(save_id)
+            self._agent.save_session(session_id)
+            self._current_session_id = session_id
+            self._rebind_system_prompt_fingerprint()
+            self._index_session_safe(session_id)
         except Exception as e:
             print(f"⚠️ 保存会话失败: {e}")
 
@@ -1317,11 +1427,15 @@ class MyClawAgent:
         t0 = time.time()
         print(f"[⏱️ {t0:.3f}] achat 开始 (mode={mode}, plan_confirmed={plan_confirmed})")
 
+        try:
+            from ..skills.curator import mark_chat_activity
+
+            mark_chat_activity()
+        except Exception:
+            pass
+
         # 热加载配置（检测 config.json 变化）
         self._reload_llm_if_changed()
-
-        # 动态更新系统提示词（检查 BOOTSTRAP 状态、读取最新配置）
-        self._agent.system_prompt = self._build_system_prompt()
 
         # 工具模式设置
         if mode == "ask":
@@ -1333,16 +1447,13 @@ class MyClawAgent:
             # Craft 模式 或 Plan 执行期：全部工具
             self._agent.set_tool_mode(ToolMode.FULL)
 
-        # 自动注入相关记忆（后台语义检索 top-K）
+        # 自动注入相关记忆 → ephemeral turn_context
         memory_context = self._inject_relevant_memories(message)
-        if memory_context:
-            self._agent.system_prompt += memory_context
-
-        print(f"[⏱️ {time.time():.3f}] 系统提示词构建完成 (+{time.time()-t0:.3f}s)")
 
         if not session_id:
             session_id = str(uuid.uuid4())[:8]
 
+        # 先绑定会话，再冻结 system
         if user_turn_index is not None:
             try:
                 self._prepare_session_turn_replace(session_id, user_turn_index)
@@ -1356,7 +1467,9 @@ class MyClawAgent:
                 return
         else:
             self.activate_session(session_id)
-        print(f"[⏱️ {time.time():.3f}] 会话加载完成 (+{time.time()-t0:.3f}s)")
+
+        self.ensure_session_system_prompt()
+        print(f"[⏱️ {time.time():.3f}] 系统提示词/会话就绪 (+{time.time()-t0:.3f}s)")
 
         # LLM 调用参数（防止重复循环）
         llm_kwargs = {
@@ -1376,36 +1489,18 @@ class MyClawAgent:
         # ════════════════════════════════════════════════════════════
         if mode == "plan" and not plan_confirmed:
             # ── Planning Phase ──
-            # 注入规划指令到系统提示词，要求 LLM 分析任务并输出结构化 TODO
-            planning_instruction = (
-                "\n\n## 规划模式指令\n"
-                "你正处于规划模式。请使用只读工具（read/search_content/search_file/"
-                "web_search/web_fetch 等）分析任务，然后输出一个结构化的执行计划。\n\n"
-                "**输出格式要求：**\n"
-                "在分析完成后，在你的最终回复中包含一个 JSON 代码块，格式如下：\n"
-                "```json\n"
-                '[\n'
-                '  {\n'
-                '    "id": "todo_1",\n'
-                '    "description": "任务描述（自然语言）",\n'
-                '    "dependencies": [],\n'
-                '    "tools_required": ["read", "edit"]\n'
-                '  }\n'
-                "]\n"
-                "```\n"
-                "规则：\n"
-                "- id 使用 todo_1, todo_2, ... 格式\n"
-                "- dependencies 是前置任务的 id 列表（可为空）\n"
-                "- tools_required 是完成任务需要的工具名列表\n"
-                "- 计划应包含 3-10 个可执行的步骤\n"
-                "- 在 JSON 之前先用自然语言解释你的分析\n"
+            turn_context = self._compose_turn_context(
+                memory_context,
+                self._plan_planning_instruction(),
             )
-            self._agent.system_prompt += planning_instruction
 
             # 运行 ReAct 循环（READ_ONLY 模式已设置）
             final_response = ""
             async for event in self._agent.arun_stream_with_tools(
-                agent_input, cancel_token=cancel_token, **llm_kwargs
+                agent_input,
+                cancel_token=cancel_token,
+                turn_context=turn_context,
+                **llm_kwargs,
             ):
                 if first_chunk and event.type.value == "llm_chunk":
                     print(f"[⏱️ {time.time():.3f}] 首个 token 到达 (LLM 延迟: {time.time()-t_llm:.3f}s)")
@@ -1459,16 +1554,21 @@ class MyClawAgent:
                 )
                 return
 
-            # 注入计划进度到系统提示词
-            plan_summary = self._todo_scheduler.get_progress_summary()
-            if plan_summary:
-                self._agent.system_prompt += f"\n\n{plan_summary}"
+            plan_summary = self._todo_scheduler.get_progress_summary() or ""
+            turn_context = self._compose_turn_context(memory_context, plan_summary)
+        else:
+            turn_context = self._compose_turn_context(memory_context)
 
         # ════════════════════════════════════════════════════════════
         # 正常 ReAct 循环（Craft / Ask / Plan 执行期）
         # ════════════════════════════════════════════════════════════
 
-        async for event in self._agent.arun_stream_with_tools(agent_input, cancel_token=cancel_token, **llm_kwargs):
+        async for event in self._agent.arun_stream_with_tools(
+            agent_input,
+            cancel_token=cancel_token,
+            turn_context=turn_context,
+            **llm_kwargs,
+        ):
             if first_chunk and event.type.value == "llm_chunk":
                 print(f"[⏱️ {time.time():.3f}] 首个 token 到达 (LLM 延迟: {time.time()-t_llm:.3f}s)")
                 first_chunk = False

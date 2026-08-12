@@ -7,6 +7,7 @@ from .web_fetch import WebFetchTool
 from .rag_tool import RAGTool
 from .mcp_tool import MCPTool
 from .skill_tool import SkillTool
+from .skill_manage_tool import SkillManageTool
 from .subagent_tool import SubAgentTool
 from .task_tool import TaskTool
 
@@ -18,6 +19,7 @@ __all__ = [
     "RAGTool",
     "MCPTool",
     "SkillTool",
+    "SkillManageTool",
     "SubAgentTool",
     "TaskTool",
 ]

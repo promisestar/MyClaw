@@ -81,7 +81,35 @@ async def lifespan(app: FastAPI):
     # 将 skill_loader 传递给 skills API 模块
     if hasattr(_agent, "skill_loader") and _agent.skill_loader:
         skills.set_skill_loader(_agent.skill_loader)
+        if getattr(_agent, "_skill_curator", None):
+            skills.set_skill_curator(_agent._skill_curator)
         print(f"🔧 Skill 系统已初始化：{_agent.skill_loader.total_count} 个技能，{_agent.skill_loader.enabled_count} 个已启用")
+
+    # Curator 后台 tick（空闲时维护 agent-created 技能）
+    curator_task: asyncio.Task | None = None
+
+    async def _curator_loop():
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 每小时检查一次门控
+                cur = getattr(_agent, "_skill_curator", None) if _agent else None
+                if cur is None:
+                    continue
+                # 在线程中跑同步 curator，避免阻塞事件循环
+                result = await asyncio.to_thread(cur.maybe_run)
+                if result:
+                    print(f"🧹 Curator 已运行：{result.get('summary')}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"⚠️ Curator tick 失败: {e}")
+
+    try:
+        curator_task = asyncio.create_task(_curator_loop())
+        print("SkillCurator tick started (hourly gate check)")
+    except Exception as e:
+        print(f"⚠️ 启动 SkillCurator 失败: {e}")
+        curator_task = None
 
     # Tokenizer 状态日志
     from .context.tokenizer import get_initialization_info, is_precise
@@ -155,6 +183,12 @@ async def lifespan(app: FastAPI):
                 await automation_scheduler.stop()
             except Exception as e:
                 print(f"⚠️ 停止 AutomationScheduler 失败: {e}")
+        if curator_task is not None:
+            curator_task.cancel()
+            try:
+                await curator_task
+            except asyncio.CancelledError:
+                pass
         # 持久化任务追踪器
         if _agent and hasattr(_agent, '_task_tracker'):
             try:

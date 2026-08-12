@@ -14,7 +14,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 from dataclasses import dataclass, field
@@ -26,10 +26,134 @@ from .exceptions import (
     SkillLoadError,
     SkillConflictError,
     SkillNotFoundError,
+    SkillError,
 )
 from .validators import ensure_valid_skill_name, validate_skill_name
+from .usage import SkillUsageStore, ARCHIVE_DIRNAME
 
 logger = logging.getLogger(__name__)
+
+# skill_manage 允许写入的配套子目录
+_ALLOWED_SUPPORT_DIRS = frozenset(
+    {"scripts", "references", "examples", "assets", "templates"}
+)
+
+_DESC_LINT_LIMIT = 60
+
+
+def _normalize_ws(text: str) -> str:
+    """折叠空白，用于模糊 patch 匹配。"""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _fuzzy_replace(
+    content: str,
+    old_string: str,
+    new_string: str,
+    *,
+    replace_all: bool = False,
+) -> Tuple[str, int]:
+    """精确匹配优先；失败则尝试空白归一化匹配。返回 (新内容, 替换次数)。"""
+    if not old_string:
+        raise SkillLoadError("old_string 不能为空", code="EMPTY_OLD_STRING")
+
+    if old_string in content:
+        occurrences = content.count(old_string)
+        if not replace_all and occurrences > 1:
+            raise SkillLoadError(
+                f"old_string 在文件中出现 {occurrences} 次；请提供更唯一的片段，或设置 replace_all=true",
+                code="AMBIGUOUS_MATCH",
+            )
+        if replace_all:
+            return content.replace(old_string, new_string), occurrences
+        return content.replace(old_string, new_string, 1), 1
+
+    norm_old = _normalize_ws(old_string)
+    if not norm_old:
+        raise SkillLoadError("未找到匹配的 old_string", code="NOT_FOUND")
+
+    lines = content.splitlines(keepends=True)
+    old_line_count = max(1, len(old_string.splitlines()))
+    matches: List[Tuple[int, int]] = []  # [start, end) line indices
+
+    for window in range(max(1, old_line_count - 2), old_line_count + 3):
+        for i in range(0, len(lines) - window + 1):
+            chunk = "".join(lines[i : i + window])
+            candidates = (_normalize_ws(chunk), _normalize_ws(chunk.rstrip("\r\n")))
+            if norm_old in candidates:
+                matches.append((i, i + window))
+                if not replace_all and len(matches) > 1:
+                    break
+        if matches:
+            break
+
+    if not matches:
+        raise SkillLoadError("未找到匹配的 old_string（含模糊空白匹配）", code="NOT_FOUND")
+    if not replace_all and len(matches) > 1:
+        raise SkillLoadError(
+            f"old_string 模糊匹配到 {len(matches)} 处；请提供更唯一的片段，或设置 replace_all=true",
+            code="AMBIGUOUS_MATCH",
+        )
+
+    # 从后往前替换，避免行号偏移
+    new_lines = list(lines)
+    for start, end in reversed(matches if replace_all else matches[:1]):
+        # 保留原块末尾换行习惯
+        replacement = new_string
+        original = "".join(new_lines[start:end])
+        if original.endswith("\n") and not replacement.endswith("\n"):
+            replacement = replacement + "\n"
+        new_lines[start:end] = [replacement]
+
+    return "".join(new_lines), len(matches if replace_all else matches[:1])
+
+
+def _lint_skill_content(content: str) -> List[str]:
+    warnings: List[str] = []
+    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", content, re.DOTALL)
+    if not fm_match:
+        warnings.append("缺少 YAML frontmatter（--- ... ---）")
+        return warnings
+    try:
+        meta = yaml.safe_load(fm_match.group(1)) or {}
+    except yaml.YAMLError as e:
+        warnings.append(f"frontmatter YAML 无法解析：{e}")
+        return warnings
+    if not isinstance(meta, dict):
+        warnings.append("frontmatter 应为 mapping")
+        return warnings
+    if "name" not in meta:
+        warnings.append("frontmatter 缺少 name")
+    if "description" not in meta:
+        warnings.append("frontmatter 缺少 description")
+    else:
+        desc = str(meta.get("description") or "")
+        if len(desc) > _DESC_LINT_LIMIT:
+            warnings.append(
+                f"description 建议 ≤{_DESC_LINT_LIMIT} 字符（当前 {len(desc)}）"
+            )
+    return warnings
+
+
+def _validate_support_relpath(rel_path: str) -> Path:
+    """校验配套文件相对路径，返回规范化相对 Path。"""
+    if not rel_path or not str(rel_path).strip():
+        raise SkillLoadError("file_path 不能为空", code="EMPTY_PATH")
+    raw = str(rel_path).replace("\\", "/").strip().lstrip("/")
+    if raw in ("", ".", "SKILL.md"):
+        raise SkillLoadError(
+            "配套文件路径不能为空或指向 SKILL.md；请改用 edit/patch",
+            code="INVALID_PATH",
+        )
+    parts = Path(raw).parts
+    if ".." in parts or parts[0].startswith(".."):
+        raise SkillLoadError("路径不得包含 '..'", code="PATH_TRAVERSAL")
+    if parts[0] not in _ALLOWED_SUPPORT_DIRS:
+        raise SkillLoadError(
+            f"配套文件必须位于 {sorted(_ALLOWED_SUPPORT_DIRS)} 之下，收到：{parts[0]}",
+            code="INVALID_SUPPORT_DIR",
+        )
+    return Path(*parts)
 
 
 @dataclass
@@ -112,6 +236,12 @@ class SkillLoader:
         self._global_state_manager = (
             SkillStateManager(self.global_dir / "skill_states.json")
             if self.global_dir else None
+        )
+
+        # usage sidecar：工作区与全局各一份
+        self._usage_store = SkillUsageStore(self.skills_dir)
+        self._global_usage_store = (
+            SkillUsageStore(self.global_dir) if self.global_dir else None
         )
 
         # 启动时扫描并加载元数据
@@ -255,6 +385,7 @@ class SkillLoader:
         self._state_manager = SkillStateManager(
             self.skills_dir / "skill_states.json"
         )
+        self._usage_store = SkillUsageStore(self.skills_dir)
         self.reload()
 
     def _parse_frontmatter_only(self, path: Path) -> Optional[Dict]:
@@ -560,6 +691,9 @@ class SkillLoader:
             old_enabled = old_sm.is_enabled(name)
             old_sm.set_enabled(new_name, old_enabled)
             old_sm.remove_state(name)
+
+            # 迁移 usage（pin / created_by / 计数）
+            self.usage_store_for(name).rename_record(name, new_name)
 
             # 迁移 metadata
             self.metadata_cache.pop(name, None)
@@ -983,6 +1117,344 @@ class SkillLoader:
                 code="LOAD_AFTER_IMPORT",
             )
         return skill
+
+    # ------------------------------------------------------------------
+    # Usage / mutation helpers (skill_manage + Curator)
+    # ------------------------------------------------------------------
+
+    def usage_store_for(self, name: Optional[str] = None, *, scope: str = "workspace") -> SkillUsageStore:
+        """按技能名或 scope 返回对应 usage store。"""
+        if name and name in self.metadata_cache:
+            if self.metadata_cache[name].get("source") == "global" and self._global_usage_store:
+                return self._global_usage_store
+            return self._usage_store
+        if scope == "global" and self._global_usage_store:
+            return self._global_usage_store
+        return self._usage_store
+
+    def _require_skill_meta(self, name: str) -> Dict:
+        if name not in self.metadata_cache:
+            raise SkillNotFoundError(f"技能 '{name}' 不存在")
+        return self.metadata_cache[name]
+
+    def create_skill(
+        self,
+        name: str,
+        content: str,
+        *,
+        scope: str = "workspace",
+    ) -> Tuple[str, List[str]]:
+        """新建技能目录 + SKILL.md。返回 (name, lint_warnings)。"""
+        name = ensure_valid_skill_name(name)
+        if scope == "global" and self.global_dir is None:
+            raise SkillImportError(
+                "全局技能目录未配置",
+                code="GLOBAL_DIR_NOT_CONFIGURED",
+            )
+        if name in self.metadata_cache:
+            raise SkillConflictError(f"已存在同名技能 '{name}'")
+
+        # frontmatter 校验
+        lint = _lint_skill_content(content)
+        fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+        if not fm_match:
+            raise SkillLoadError(
+                "SKILL.md 必须包含 YAML frontmatter（name / description）",
+                code="MISSING_FRONTMATTER",
+            )
+        try:
+            meta = yaml.safe_load(fm_match.group(1)) or {}
+        except yaml.YAMLError as e:
+            raise SkillLoadError(f"frontmatter YAML 错误：{e}", code="YAML_ERROR")
+        if not isinstance(meta, dict) or "name" not in meta or "description" not in meta:
+            raise SkillLoadError(
+                "frontmatter 必须包含 name 与 description",
+                code="MISSING_FIELDS",
+            )
+        fm_name = ensure_valid_skill_name(str(meta["name"]))
+        if fm_name != name:
+            raise SkillNameError(
+                f"参数 name='{name}' 与 frontmatter.name='{fm_name}' 不一致",
+                code="NAME_MISMATCH",
+            )
+
+        dest_root = self._get_dir_for_source(scope)
+        skill_dir = dest_root / name
+        if skill_dir.exists():
+            raise SkillConflictError(f"目录已存在：{skill_dir}")
+
+        try:
+            skill_dir.mkdir(parents=True, exist_ok=False)
+            (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+            for sub in ("scripts", "references", "examples", "assets", "templates"):
+                (skill_dir / sub).mkdir(exist_ok=True)
+        except OSError as e:
+            shutil.rmtree(skill_dir, ignore_errors=True)
+            raise SkillLoadError(f"创建技能失败：{e}", code="CREATE_FAILED")
+
+        sm = (
+            self._global_state_manager
+            if scope == "global" and self._global_state_manager
+            else self._state_manager
+        )
+        sm.set_enabled(name, True)
+        self.reload()
+        return name, lint
+
+    def patch_skill_file(
+        self,
+        name: str,
+        old_string: str,
+        new_string: str,
+        *,
+        file_path: str = "SKILL.md",
+        replace_all: bool = False,
+    ) -> Tuple[str, int, List[str]]:
+        """对 SKILL.md 或配套文件做 find-replace。返回 (相对路径, 替换次数, lint)。"""
+        meta = self._require_skill_meta(name)
+        skill_dir = Path(meta["dir"])
+
+        if not file_path or file_path in ("SKILL.md", ".", ""):
+            rel = "SKILL.md"
+            target = skill_dir / "SKILL.md"
+        else:
+            rel_path = _validate_support_relpath(file_path)
+            target = skill_dir / rel_path
+            rel = str(rel_path).replace("\\", "/")
+            try:
+                target.resolve().relative_to(skill_dir.resolve())
+            except ValueError as e:
+                raise SkillLoadError("路径穿越被拒绝", code="PATH_TRAVERSAL", detail=str(e))
+
+        if not target.exists():
+            raise SkillNotFoundError(f"文件不存在：{rel}", detail=str(target))
+
+        try:
+            content = target.read_text(encoding="utf-8")
+        except OSError as e:
+            raise SkillLoadError(f"读取失败：{e}", code="READ_FAILED")
+
+        new_content, count = _fuzzy_replace(
+            content,
+            old_string,
+            new_string if new_string is not None else "",
+            replace_all=replace_all,
+        )
+
+        if rel == "SKILL.md":
+            lint = _lint_skill_content(new_content)
+            self.set_skill_content(name, new_content)
+            return rel, count, lint
+
+        try:
+            target.write_text(new_content, encoding="utf-8")
+        except OSError as e:
+            raise SkillLoadError(f"写入失败：{e}", code="WRITE_FAILED")
+        return rel, count, []
+
+    def write_skill_file(self, name: str, file_path: str, content: str) -> str:
+        """写入配套文件，返回相对路径。"""
+        meta = self._require_skill_meta(name)
+        skill_dir = Path(meta["dir"])
+        rel_path = _validate_support_relpath(file_path)
+        target = skill_dir / rel_path
+        try:
+            target.resolve().relative_to(skill_dir.resolve())
+        except ValueError as e:
+            raise SkillLoadError("路径穿越被拒绝", code="PATH_TRAVERSAL", detail=str(e))
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content if content is not None else "", encoding="utf-8")
+        except OSError as e:
+            raise SkillLoadError(f"写入失败：{e}", code="WRITE_FAILED")
+        return str(rel_path).replace("\\", "/")
+
+    def remove_skill_file(self, name: str, file_path: str) -> str:
+        """删除配套文件，返回相对路径。"""
+        meta = self._require_skill_meta(name)
+        skill_dir = Path(meta["dir"])
+        rel_path = _validate_support_relpath(file_path)
+        target = skill_dir / rel_path
+        try:
+            target.resolve().relative_to(skill_dir.resolve())
+        except ValueError as e:
+            raise SkillLoadError("路径穿越被拒绝", code="PATH_TRAVERSAL", detail=str(e))
+        if not target.exists():
+            raise SkillNotFoundError(f"文件不存在：{rel_path}")
+        if target.is_dir():
+            raise SkillLoadError("拒绝删除目录；请指定文件", code="IS_DIRECTORY")
+        try:
+            target.unlink()
+        except OSError as e:
+            raise SkillLoadError(f"删除失败：{e}", code="REMOVE_FAILED")
+        return str(rel_path).replace("\\", "/")
+
+    def archive_skill(self, name: str, *, scope: Optional[str] = None) -> str:
+        """将技能目录移到同根 .archive/<name>/。返回归档路径。
+
+        Args:
+            name: 技能名
+            scope: 若指定，只归档该层级目录，并校验不跨 scope 误伤
+                   （Curator 必须传入当前遍历的 scope）。
+        """
+        if scope is not None:
+            return self._archive_skill_in_scope(name, scope=scope)
+
+        meta = self._require_skill_meta(name)
+        store = self.usage_store_for(name)
+        if store.is_pinned(name):
+            raise SkillError(
+                f"技能 '{name}' 已 pin，禁止归档/删除",
+                code="PINNED",
+            )
+
+        skill_dir = Path(meta["dir"])
+        source = meta.get("source", "workspace")
+        return self._move_to_archive(name, skill_dir, source=source, store=store)
+
+    def _archive_skill_in_scope(self, name: str, *, scope: str) -> str:
+        """按指定 scope 的磁盘路径归档，避免双目录同名时误归档覆盖方。"""
+        root = self._get_dir_for_source(scope)
+        skill_dir = root / name
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_dir.is_dir() or not skill_md.exists():
+            raise SkillNotFoundError(
+                f"scope={scope} 下不存在技能 '{name}'",
+                detail=str(skill_dir),
+            )
+
+        store = self.usage_store_for(scope=scope)
+        if store.is_pinned(name):
+            raise SkillError(
+                f"技能 '{name}' 已 pin，禁止归档/删除",
+                code="PINNED",
+            )
+
+        meta = self.metadata_cache.get(name)
+        if meta is not None and meta.get("source") != scope:
+            # cache 指向另一 scope（常见：workspace 覆盖 global）——仍只动本 scope 目录
+            logger.warning(
+                "archive scope=%s name=%s：metadata_cache.source=%s，按磁盘路径归档本 scope",
+                scope,
+                name,
+                meta.get("source"),
+            )
+
+        return self._move_to_archive(name, skill_dir, source=scope, store=store)
+
+    def _move_to_archive(
+        self,
+        name: str,
+        skill_dir: Path,
+        *,
+        source: str,
+        store: SkillUsageStore,
+    ) -> str:
+        root = self._get_dir_for_source(source)
+        archive_root = root / ARCHIVE_DIRNAME
+        archive_root.mkdir(parents=True, exist_ok=True)
+
+        dest = archive_root / name
+        if dest.exists():
+            from datetime import datetime, timezone
+
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            dest = archive_root / f"{name}-{stamp}"
+
+        try:
+            skill_dir.rename(dest)
+        except OSError as e:
+            raise SkillLoadError(f"归档失败：{e}", code="ARCHIVE_FAILED")
+
+        # 仅当 cache 指向本 scope 时清理启用状态与 cache
+        meta = self.metadata_cache.get(name)
+        if meta is not None and meta.get("source") == source:
+            self._get_state_manager(name).remove_state(name)
+            self.metadata_cache.pop(name, None)
+            self.skills_cache.pop(name, None)
+        elif source == "workspace":
+            self._state_manager.remove_state(name)
+        elif source == "global" and self._global_state_manager:
+            self._global_state_manager.remove_state(name)
+
+        store.set_state(name, "archived")
+        self.reload()
+        return str(dest)
+
+    def restore_skill(self, name: str, *, scope: str = "workspace") -> str:
+        """从 .archive 恢复技能。返回恢复后的目录路径。
+
+        ``name`` 可为逻辑名，或带时间戳后缀的归档目录名 ``foo-YYYYMMDDHHMMSS``。
+        恢复目标目录始终使用逻辑名（去掉 14 位时间戳后缀）。
+        """
+        raw_name = name.strip()
+        # 先不强制 ensure：时间戳后缀名仍合法；逻辑名再校验
+        root = self._get_dir_for_source(scope)
+        archive_root = root / ARCHIVE_DIRNAME
+        if not archive_root.exists():
+            raise SkillNotFoundError(f"归档目录不存在：{archive_root}")
+
+        ts_suffix = re.compile(r"^(?P<base>.+)-(?P<ts>\d{14})$")
+
+        def logical_name(dirname: str) -> str:
+            m = ts_suffix.match(dirname)
+            return m.group("base") if m else dirname
+
+        dest_name = logical_name(raw_name)
+        dest_name = ensure_valid_skill_name(dest_name)
+
+        if dest_name in self.metadata_cache:
+            raise SkillConflictError(f"已存在同名技能 '{dest_name}'，无法 restore")
+
+        candidates: List[Path] = []
+        for p in archive_root.iterdir():
+            if not p.is_dir():
+                continue
+            if p.name == raw_name or logical_name(p.name) == dest_name:
+                candidates.append(p)
+        if not candidates:
+            raise SkillNotFoundError(f"归档中未找到技能 '{raw_name}'")
+
+        # 精确目录名优先，否则取最近修改
+        exact = [p for p in candidates if p.name == raw_name]
+        pool = exact or candidates
+        pool.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        src = pool[0]
+        dest_name = logical_name(src.name)
+        dest_name = ensure_valid_skill_name(dest_name)
+
+        if dest_name in self.metadata_cache:
+            raise SkillConflictError(f"已存在同名技能 '{dest_name}'，无法 restore")
+
+        dest = root / dest_name
+        if dest.exists():
+            raise SkillConflictError(f"目标目录已存在：{dest}")
+
+        try:
+            src.rename(dest)
+        except OSError as e:
+            raise SkillLoadError(f"恢复失败：{e}", code="RESTORE_FAILED")
+
+        store = self.usage_store_for(scope=scope)
+        # 若归档时 usage key 仍是逻辑名，直接激活；若曾用时间戳当 key则一并照顾不到——保持逻辑名
+        if raw_name != dest_name and isinstance(store.load().get(raw_name), dict):
+            store.rename_record(raw_name, dest_name)
+        store.set_state(dest_name, "active")
+        sm = (
+            self._global_state_manager
+            if scope == "global" and self._global_state_manager
+            else self._state_manager
+        )
+        sm.set_enabled(dest_name, True)
+        self.reload()
+        return str(dest)
+
+    def list_archived(self, *, scope: str = "workspace") -> List[str]:
+        root = self._get_dir_for_source(scope)
+        archive_root = root / ARCHIVE_DIRNAME
+        if not archive_root.exists():
+            return []
+        return sorted(p.name for p in archive_root.iterdir() if p.is_dir())
 
     def reload(self):
         """重新扫描技能目录（热重载）"""

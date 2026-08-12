@@ -18,6 +18,9 @@ import { skillsApi, type SkillInfo } from '@/api/skills'
 const router = useRouter()
 const skills = ref<SkillInfo[]>([])
 const loading = ref(false)
+const curatorStatus = ref<Record<string, unknown> | null>(null)
+const archivedNames = ref<string[]>([])
+const curatorBusy = ref(false)
 
 // Import modal state
 const importModalOpen = ref(false)
@@ -37,6 +40,21 @@ const loadSkills = async () => {
     loading.value = false
   }
 }
+
+const loadCuratorMeta = async () => {
+  try {
+    curatorStatus.value = await skillsApi.curatorStatus()
+    const arch = await skillsApi.archived('workspace')
+    archivedNames.value = arch.archived || []
+  } catch {
+    // Curator 未就绪时静默
+  }
+}
+
+onMounted(async () => {
+  await loadSkills()
+  await loadCuratorMeta()
+})
 
 const toggleLoading = ref<string | null>(null)
 
@@ -146,9 +164,84 @@ const openImportModal = () => {
   importModalOpen.value = true
 }
 
-onMounted(() => {
-  loadSkills()
-})
+const handlePinToggle = async (skill: SkillInfo) => {
+  try {
+    if (skill.pinned) {
+      await skillsApi.unpin(skill.name)
+      skill.pinned = false
+      message.success(`已取消 pin：${skill.name}`)
+    } else {
+      await skillsApi.pin(skill.name)
+      skill.pinned = true
+      message.success(`已 pin：${skill.name}`)
+    }
+  } catch (error) {
+    message.error(extractErrorMessage(error, 'pin 操作失败'))
+  }
+}
+
+const handleAdopt = async (skill: SkillInfo) => {
+  try {
+    await skillsApi.adopt(skill.name)
+    skill.curator_managed = true
+    message.success(`已 adopt：${skill.name}`)
+  } catch (error) {
+    message.error(extractErrorMessage(error, 'adopt 失败'))
+  }
+}
+
+const handleArchive = async (skill: SkillInfo) => {
+  try {
+    await skillsApi.archive(skill.name)
+    message.success(`已归档：${skill.name}`)
+    await loadSkills()
+    await loadCuratorMeta()
+  } catch (error) {
+    message.error(extractErrorMessage(error, '归档失败'))
+  }
+}
+
+const handleRestore = async (name: string) => {
+  try {
+    await skillsApi.restore(name, 'workspace')
+    message.success(`已恢复：${name}`)
+    await loadSkills()
+    await loadCuratorMeta()
+  } catch (error) {
+    message.error(extractErrorMessage(error, '恢复失败'))
+  }
+}
+
+const handleCuratorRun = async () => {
+  curatorBusy.value = true
+  try {
+    const res = await skillsApi.curatorRun(true, false)
+    message.success(`Curator 已运行：${(res as { summary?: string }).summary || 'ok'}`)
+    await loadSkills()
+    await loadCuratorMeta()
+  } catch (error) {
+    message.error(extractErrorMessage(error, 'Curator 运行失败'))
+  } finally {
+    curatorBusy.value = false
+  }
+}
+
+const handleCuratorPauseToggle = async () => {
+  try {
+    const scopes = (curatorStatus.value?.scopes || {}) as Record<string, { state?: { paused?: boolean } }>
+    const paused = Object.values(scopes).some((s) => s?.state?.paused)
+    if (paused) {
+      await skillsApi.curatorResume()
+      message.success('Curator 已恢复')
+    } else {
+      await skillsApi.curatorPause()
+      message.success('Curator 已暂停')
+    }
+    await loadCuratorMeta()
+  } catch (error) {
+    message.error(extractErrorMessage(error, 'Curator 暂停/恢复失败'))
+  }
+}
 </script>
 
 <template>
@@ -163,6 +256,28 @@ onMounted(() => {
         <template #icon><PlusOutlined /></template>
         导入
       </Button>
+    </div>
+
+    <!-- Curator 状态条 -->
+    <div class="curator-bar">
+      <div class="curator-bar-text">
+        <span>Curator</span>
+        <Tag v-if="curatorStatus" color="blue">已接入</Tag>
+        <Tag v-else color="default">未就绪</Tag>
+        <span v-if="archivedNames.length" class="curator-archived">
+          归档 {{ archivedNames.length }}：
+          <a
+            v-for="n in archivedNames.slice(0, 5)"
+            :key="n"
+            class="restore-link"
+            @click="handleRestore(n)"
+          >{{ n }}</a>
+        </span>
+      </div>
+      <div class="curator-bar-actions">
+        <Button size="small" :loading="curatorBusy" @click="handleCuratorRun">立即运行</Button>
+        <Button size="small" @click="handleCuratorPauseToggle">暂停/恢复</Button>
+      </div>
     </div>
 
     <!-- 技能卡片区域 -->
@@ -188,6 +303,15 @@ onMounted(() => {
               />
             </div>
             <p class="skill-desc">{{ skill.description }}</p>
+            <div class="skill-meta-tags">
+              <Tag v-if="skill.pinned" color="purple">pin</Tag>
+              <Tag v-if="skill.curator_managed" color="cyan">curator</Tag>
+              <Tag v-if="skill.lifecycle_state && skill.lifecycle_state !== 'active'" color="orange">
+                {{ skill.lifecycle_state }}
+              </Tag>
+              <Tag>use {{ skill.use_count ?? 0 }}</Tag>
+              <Tag>patch {{ skill.patch_count ?? 0 }}</Tag>
+            </div>
             <!-- 环境状态徽标 -->
             <div class="skill-env-status">
               <Tooltip v-if="skill.has_venv" :title="skill.python_path || ''">
@@ -226,6 +350,25 @@ onMounted(() => {
               <template #icon><EditOutlined /></template>
               编辑
             </Button>
+            <Button size="small" type="text" @click.stop="handlePinToggle(skill)">
+              {{ skill.pinned ? '取消 pin' : 'pin' }}
+            </Button>
+            <Button
+              v-if="!skill.curator_managed"
+              size="small"
+              type="text"
+              @click.stop="handleAdopt(skill)"
+            >
+              adopt
+            </Button>
+            <Popconfirm
+              title="归档此技能？（可恢复，非硬删）"
+              ok-text="归档"
+              cancel-text="取消"
+              @confirm="handleArchive(skill)"
+            >
+              <Button size="small" type="text" @click.stop>归档</Button>
+            </Popconfirm>
             <Popconfirm
               title="确定要删除此技能吗？"
               :description="`将删除「${skill.name}」对应的整个目录（含专属环境）`"
@@ -319,7 +462,47 @@ onMounted(() => {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  margin-bottom: 24px;
+  margin-bottom: 16px;
+}
+
+.curator-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  border: 1px solid #eee;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.curator-bar-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #666;
+}
+
+.curator-bar-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.curator-archived .restore-link {
+  margin-right: 8px;
+  color: #1677ff;
+  cursor: pointer;
+}
+
+.skill-meta-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
 }
 
 .skills-header h1 {

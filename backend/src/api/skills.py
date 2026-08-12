@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/skills", tags=["skills"])
 
 
-# ── 全局 skill_loader 引用 ──
+# ── 全局 skill_loader / curator 引用 ──
 _skill_loader = None
+_skill_curator = None
 
 
 def set_skill_loader(loader):
@@ -41,11 +42,22 @@ def set_skill_loader(loader):
     _skill_loader = loader
 
 
+def set_skill_curator(curator):
+    global _skill_curator
+    _skill_curator = curator
+
+
 def get_skill_loader():
     """获取全局 SkillLoader 实例"""
     if _skill_loader is None:
         raise HTTPException(status_code=500, detail="Skill 系统未初始化")
     return _skill_loader
+
+
+def get_skill_curator():
+    if _skill_curator is None:
+        raise HTTPException(status_code=500, detail="Curator 未初始化")
+    return _skill_curator
 
 
 def _refresh_skill_tool():
@@ -75,6 +87,8 @@ def _raise_http_from_skill_error(exc: SkillError):
     detail 字段使用 dict，保留结构化的 code / message / detail，前端可解析。
     """
     status = _EXC_STATUS_MAP.get(type(exc), 500)
+    if exc.code in ("PINNED", "INVALID_PATH", "PATH_TRAVERSAL", "EMPTY_OLD_STRING", "AMBIGUOUS_MATCH"):
+        status = 400
     logger.warning(
         "Skill API 业务异常 status=%s code=%s message=%s detail=%s",
         status, exc.code, exc.message, exc.detail,
@@ -94,6 +108,11 @@ class SkillInfo(BaseModel):
     has_venv: bool = False
     has_dependencies: bool = False
     python_path: Optional[str] = None
+    use_count: int = 0
+    patch_count: int = 0
+    pinned: bool = False
+    curator_managed: bool = False
+    lifecycle_state: str = "active"
 
 
 class InstallEnvResponse(BaseModel):
@@ -151,6 +170,15 @@ class SkillDetailResponse(BaseModel):
     dir: str
 
 
+class CuratorRunRequest(BaseModel):
+    force: bool = False
+    dry_run: bool = False
+
+
+class ScopeRequest(BaseModel):
+    scope: Literal["global", "workspace"] = "workspace"
+
+
 # ── API 端点 ──
 
 @router.get("", response_model=SkillListResponse)
@@ -158,11 +186,121 @@ async def list_skills():
     """列出所有技能"""
     loader = get_skill_loader()
     infos = loader.list_skill_infos()
+    skills_out: List[SkillInfo] = []
+    for info in infos:
+        name = info["name"]
+        store = loader.usage_store_for(name)
+        rec = store.get_record(name)
+        skills_out.append(
+            SkillInfo(
+                **info,
+                use_count=int(rec.get("use_count") or 0),
+                patch_count=int(rec.get("patch_count") or 0),
+                pinned=bool(rec.get("pinned")),
+                curator_managed=store.is_curator_managed(name),
+                lifecycle_state=str(rec.get("state") or "active"),
+            )
+        )
     return SkillListResponse(
-        skills=[SkillInfo(**info) for info in infos],
+        skills=skills_out,
         total=loader.total_count,
         enabled_count=loader.enabled_count,
     )
+
+
+@router.get("/usage")
+async def get_usage():
+    """返回工作区 + 全局 usage 报告。"""
+    loader = get_skill_loader()
+    workspace = loader._usage_store.usage_report()
+    for row in workspace:
+        row["scope"] = "workspace"
+    global_rows = []
+    if loader._global_usage_store:
+        global_rows = loader._global_usage_store.usage_report()
+        for row in global_rows:
+            row["scope"] = "global"
+    return {"usage": workspace + global_rows}
+
+
+@router.get("/archived")
+async def list_archived(scope: Literal["global", "workspace"] = "workspace"):
+    loader = get_skill_loader()
+    return {"archived": loader.list_archived(scope=scope), "scope": scope}
+
+
+@router.get("/curator/status")
+async def curator_status():
+    return get_skill_curator().status()
+
+
+@router.post("/curator/run")
+async def curator_run(request: CuratorRunRequest):
+    result = get_skill_curator().run(force=request.force, dry_run=request.dry_run)
+    _refresh_skill_tool()
+    return result
+
+
+@router.post("/curator/pause")
+async def curator_pause():
+    get_skill_curator().set_paused(True)
+    return {"paused": True}
+
+
+@router.post("/curator/resume")
+async def curator_resume():
+    get_skill_curator().set_paused(False)
+    return {"paused": False}
+
+
+@router.post("/{name}/pin")
+async def pin_skill(name: str):
+    loader = get_skill_loader()
+    if name not in loader.metadata_cache:
+        _raise_http_from_skill_error(SkillNotFoundError(f"技能 '{name}' 不存在"))
+    loader.usage_store_for(name).set_pinned(name, True)
+    return {"message": f"技能 '{name}' 已 pin", "pinned": True}
+
+
+@router.post("/{name}/unpin")
+async def unpin_skill(name: str):
+    loader = get_skill_loader()
+    if name not in loader.metadata_cache:
+        _raise_http_from_skill_error(SkillNotFoundError(f"技能 '{name}' 不存在"))
+    loader.usage_store_for(name).set_pinned(name, False)
+    return {"message": f"技能 '{name}' 已 unpin", "pinned": False}
+
+
+@router.post("/{name}/adopt")
+async def adopt_skill(name: str):
+    """将用户技能纳入 Curator 自主维护（created_by=agent）。"""
+    loader = get_skill_loader()
+    if name not in loader.metadata_cache:
+        _raise_http_from_skill_error(SkillNotFoundError(f"技能 '{name}' 不存在"))
+    loader.usage_store_for(name).mark_agent_created(name)
+    return {"message": f"技能 '{name}' 已 adopt 为 curator-managed", "curator_managed": True}
+
+
+@router.post("/{name}/archive")
+async def archive_skill_api(name: str):
+    loader = get_skill_loader()
+    try:
+        path = loader.archive_skill(name)
+    except SkillError as e:
+        _raise_http_from_skill_error(e)
+    _refresh_skill_tool()
+    return {"message": f"技能 '{name}' 已归档", "archived_to": path}
+
+
+@router.post("/{name}/restore")
+async def restore_skill_api(name: str, request: ScopeRequest = ScopeRequest()):
+    loader = get_skill_loader()
+    try:
+        path = loader.restore_skill(name, scope=request.scope)
+    except SkillError as e:
+        _raise_http_from_skill_error(e)
+    _refresh_skill_tool()
+    return {"message": f"技能 '{name}' 已恢复", "restored_to": path, "scope": request.scope}
 
 
 @router.get("/{name}", response_model=SkillDetailResponse)
@@ -216,14 +354,19 @@ async def update_skill_content(name: str, request: SkillContentUpdateRequest):
 
 @router.delete("/{name}")
 async def delete_skill(name: str):
-    """删除技能"""
+    """硬删除技能（人类 UI）。pin 技能拒绝；全局技能仍由 loader 拒绝。"""
     loader = get_skill_loader()
     if name not in loader.list_skills():
         _raise_http_from_skill_error(SkillNotFoundError(f"技能 '{name}' 不存在"))
 
+    store = loader.usage_store_for(name)
+    if store.is_pinned(name):
+        _raise_http_from_skill_error(
+            SkillError(f"技能 '{name}' 已 pin，禁止删除", code="PINNED")
+        )
+
     success = loader.delete_skill(name)
     if not success:
-        # 已确认存在但删除失败：归类为 LOAD/IO 错误（详情在日志里）
         raise HTTPException(
             status_code=500,
             detail={
@@ -233,6 +376,7 @@ async def delete_skill(name: str):
             },
         )
 
+    store.forget(name)
     _refresh_skill_tool()
     return {"message": f"技能 '{name}' 已删除"}
 

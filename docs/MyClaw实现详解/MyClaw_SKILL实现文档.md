@@ -1,6 +1,6 @@
 # Skill 系统实现与升级说明
 
-本文档基于当前代码，说明 MyClaw 中 **Skill（技能）** 系统的全新自实现架构，涵盖后端加载与管理模块、前端管理界面、聊天框 `/` 触发机制，以及与 `hello_agents` 旧依赖的对比。文中的 Mermaid 图可在 Obsidian 中渲染。
+本文档基于当前代码，说明 MyClaw 中 **Skill（技能）** 系统的自实现架构，涵盖后端加载与管理、代理只读加载与自进化写入、技能生命周期维护、前端管理界面、聊天框斜杠触发机制，以及与 `hello_agents` 旧依赖的对比。文中的流程图可在 Obsidian 中渲染。
 
 ---
 
@@ -10,17 +10,20 @@ Skill 系统已从依赖外部库 `hello_agents` 完全替换为**项目自实�
 
 | 特性 | 说明 |
 |------|------|
-| **存储** | 工作空间 `skills/` 目录，每个技能一个子目录，核心文件为 `SKILL.md` |
+| **存储** | 全局 `~/.helloclaw/skills/` + 工作区 `.myclaw/skills/`，每个技能一个子目录，核心文件为 `SKILL.md` |
 | **加载机制** | 渐进式披露（三层）：启动时仅加载元数据，运行时按需加载完整正文，资源文件仅在工具响应中列出 |
 | **状态管理** | 独立 JSON 文件 `skill_states.json`，不修改原始 `SKILL.md`；默认启用，不在文件中视为启用 |
+| **自进化写入** | 技能管理工具：新建、局部修订、全文改写、配套文件写入与删除、查看、删除（默认归档） |
+| **使用量遥测** | 各技能根目录下的 `.usage.json`：加载/查看/修订次数、创建归属、固定保护、生命周期状态 |
+| **生命周期维护** | 空闲时定时巡检；仅维护已纳入自主维护的技能；活跃→闲置→已归档；可选归并审查审计报告 |
 | **导入方式** | 本地目录复制（`shutil.copytree`）和 Git 仓库克隆（`git clone`）两种方式 |
 | **依赖管理** | 每个技能拥有独立 venv（`skills/<name>/.venv`），导入时自动安装 `requirements.txt`，优先使用 `uv` 加速 |
 | **名称校验** | 严格拒绝非法字符（路径分隔符、Windows 保留名、`.`/`_` 开头等），中文/字母/数字/`- _ .` 合法 |
 | **错误处理** | 6 个结构化异常类（`SkillError` 体系），所有失败原因可定位；前端展示带 `code` 的可读错误消息 |
 | **目录名规则** | 强制 `dir.name == frontmatter.name`，编辑改 name 时自动重命名目录并迁移状态 |
-| **管理界面** | 前端卡片列表（开关、编辑、删除、依赖状态徽标、安装/重装按钮）+ 导入弹窗（Tab 切换本地/Git） |
-| **编辑器** | 独立页面编辑 `SKILL.md` 全文，支持改 name 自动重命名，保存后刷新 Agent 工具描述 |
-| **Agent 调用** | SkillTool 工具（Agent 主动调用）+ 聊天框 `/技能名` 前缀触发（用户主动选择） |
+| **管理界面** | 前端卡片列表（开关、编辑、删除、固定保护、纳入自主维护、归档、依赖状态标记）+ 维护器状态条 + 导入弹窗 |
+| **编辑器** | 独立页面编辑 `SKILL.md` 全文，支持改 name 自动重命名，保存后刷新代理工具描述 |
+| **代理调用** | 只读加载工具 + 技能管理写入工具 + 聊天框「/技能名」前缀触发 |
 
 ### 与旧架构的区别
 
@@ -37,7 +40,9 @@ Skill 系统已从依赖外部库 `hello_agents` 完全替换为**项目自实�
 | 名称合法性 | 无校验（异常被静默吞掉） | `validators.py` 严格校验，非法立即拒绝 |
 | 错误反馈 | 静默 `return None` | 结构化异常 + 日志堆栈，前端展示 `code` |
 | 目录-名一致 | 不保证 | 强制 `dir.name == name`，改名自动重命名 |
-| 描述刷新 | 启动时固定 | 导入/删除/切换/编辑后动态刷新工具描述 |
+| 描述刷新 | 启动时固定 | 导入/删除/切换/编辑/技能管理写入后动态刷新工具描述 |
+| 代理写入 | 无专用工具 | 技能管理工具 + 使用量遥测 + 删除默认归档 |
+| 生命周期 | 无 | 闲置/归档、固定保护、纳入自主维护 + 可选归并审查报告 |
 
 ---
 
@@ -740,13 +745,18 @@ sequenceDiagram
 | 位置 | 作用 |
 |------|------|
 | `backend/src/skills/__init__.py` | Skill 数据类、异常类、校验函数包导出 |
-| `backend/src/skills/loader.py` | SkillLoader：扫描、加载、导入、编辑、删除、改名、热重载 |
+| `backend/src/skills/loader.py` | SkillLoader：扫描、加载、导入、编辑、删除、改名、热重载，以及新建、局部修订、归档、恢复 |
+| `backend/src/skills/usage.py` | SkillUsageStore：使用量与归属附属文件 |
+| `backend/src/skills/curator.py` | 技能生命周期维护器：调度与状态机 |
+| `backend/src/skills/curator_backup.py` | 变更前备份与回滚 |
+| `backend/src/skills/provenance.py` | 前台/后台写来源标记 |
 | `backend/src/skills/state_manager.py` | SkillStateManager：启用/禁用状态持久化 |
 | `backend/src/skills/env_manager.py` | 独立 venv 创建（uv/pip）+ 依赖安装 + 解释器探测 |
 | `backend/src/skills/exceptions.py` | 6 个结构化异常类（含 `code`/`message`/`detail`） |
 | `backend/src/skills/validators.py` | `validate_skill_name` / `ensure_valid_skill_name` |
-| `backend/src/tools/builtin/skill_tool.py` | SkillTool：Agent 按需调用工具，响应注入 python_path |
-| `backend/src/api/skills.py` | 技能 CRUD API（9 个端点）+ `SkillError → HTTPException` 转换 |
+| `backend/src/tools/builtin/skill_tool.py` | SkillTool：代理按需加载，响应注入解释器路径，累计使用次数 |
+| `backend/src/tools/builtin/skill_manage_tool.py` | 技能管理工具：自进化写入 |
+| `backend/src/api/skills.py` | 技能增删改查，以及固定保护、纳入自主维护、归档、维护器接口 |
 | `backend/src/agent/myclaw_agent.py` | 注册 SkillTool、暴露 refresh_skill_tool() |
 | `backend/src/agent/enhanced_simple_agent.py` | `max_tools_per_round` + 同参数去重保护 |
 | `backend/src/api/chat.py` | ChatRequest.skill 字段、_inject_skill_context() |
@@ -793,3 +803,140 @@ sequenceDiagram
 ---
 
 以上为 Skill 系统的当前实现与功能说明；若后续调整架构或接口，请以对应源码为准。
+
+---
+
+## 10. Skill 自进化（落地说明）
+
+设计蓝本见仓库文档 `docs/Hermes-Agent_SKILL自进化说明文档.md`。本节描述 **MyClaw 已落地** 的模块、数据流与运维接口。文中保留必要的模块名与接口路径，便于对照源码；概念说明优先使用中文全称。
+
+### 10.1 模块关系
+
+```mermaid
+flowchart TB
+  subgraph Tools
+    ST[只读技能工具]
+    SM[技能管理工具]
+  end
+  subgraph SkillsPkg["skills/"]
+    LDR[SkillLoader 写入原语]
+    USG[使用量存储]
+    CUR[生命周期维护器]
+    BAK[变更前备份]
+    PROV[写来源上下文]
+  end
+  subgraph Persist
+    DISK["skills/*/SKILL.md"]
+    USAGE[".usage.json"]
+    ARCH[".archive/"]
+    CSTATE[".curator_state"]
+  end
+  ST -->|累计使用次数| USG
+  SM --> LDR
+  SM --> USG
+  SM --> PROV
+  LDR --> DISK
+  LDR --> ARCH
+  USG --> USAGE
+  CUR --> USG
+  CUR --> LDR
+  CUR --> BAK
+  CUR --> CSTATE
+```
+
+### 10.2 写入流水线
+
+```mermaid
+sequenceDiagram
+  participant Agent as 代理
+  participant SM as 技能管理工具
+  participant LDR as SkillLoader
+  participant USG as 使用量存储
+  participant Cache as 只读工具描述
+  Agent->>SM: 动作 + 名称 + 参数
+  SM->>LDR: 新建 / 局部修订 / 改写 / …
+  LDR->>LDR: 名称、文首元数据、路径校验
+  LDR-->>SM: 成功或结构化错误
+  SM->>USG: 记录创建 / 累计修订 / …
+  SM->>Cache: 变更回调 → 刷新工具描述
+  SM-->>Agent: JSON（可含校验警告）
+```
+
+要点：
+
+- **局部修订**：先精确匹配，再按空白归一化做模糊匹配；多处命中时需指定全部替换，或换用更唯一的片段。  
+- **配套文件路径**：必须落在 `scripts`、`references`、`examples`、`assets`、`templates` 之下，拒绝上级目录穿越。  
+- **工具侧删除**：等价于归档到 `.archive/`；人工接口仍可永久删除，但**已固定保护则拒绝**。  
+- **归属**：对话前台新建默认不纳入自主维护；后台写来源，或显式标记为自主创建时，才记入自主维护范围。
+
+### 10.3 遥测字段（`.usage.json`）
+
+| 字段 | 含义 |
+|------|------|
+| created_by | 空值表示用户资产；取值为 `agent` 表示已纳入自主维护 |
+| use_count / view_count / patch_count | 加载次数 / 查看次数 / 修订次数 |
+| last_*_at | 对应活动时间（协调世界时，ISO 格式） |
+| state | 活跃 / 闲置 / 已归档 |
+| pinned | 固定保护：阻止自动状态迁移与自主删除；前台仍可修订正文 |
+| created_at / archived_at | 创建与归档时间锚点 |
+
+最近活动时间取「最近加载、最近查看、最近修订」三者的最大值，**不包含**创建时间。
+
+### 10.4 维护器门控与状态机
+
+1. 已启用且未暂停  
+2. 空闲时长达到配置的最短空闲时间（无聊天记录时视为已充分空闲）  
+3. 距上次运行已满巡检间隔；**首次**只写入基准时间并推迟本轮清理  
+4. 应用自动迁移：已固定保护则跳过；从未使用的技能在闲置窗口内保持活跃；超时则归档  
+
+配置默认（`templates/config.json`）：
+
+```json
+"curator": {
+  "enabled": true,
+  "interval_hours": 168,
+  "min_idle_hours": 2,
+  "stale_after_days": 30,
+  "archive_after_days": 90,
+  "consolidate": false,
+  "backup": { "enabled": true, "keep": 5 }
+}
+```
+
+字段含义：`enabled` 是否启用；`interval_hours` 巡检间隔（小时）；`min_idle_hours` 最短空闲时间；`stale_after_days` / `archive_after_days` 进入闲置与归档的天数阈值；`consolidate` 是否开启归并审查；`backup` 变更前备份开关与保留份数。
+
+`consolidate: true` 时写入 `~/.helloclaw/logs/curator/<范围>-<时间戳>/REPORT.md` 与 `run.json`（候选列表审计；完整的大语言模型归并可在此报告基础上扩展）。
+
+### 10.5 新增运维接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/skills/usage` | 工作区与全局双目录使用量报告 |
+| GET | `/api/skills/archived` | 已归档技能名称列表 |
+| POST | `/api/skills/{name}/pin` 与 `unpin` | 固定保护开关 |
+| POST | `/api/skills/{name}/adopt` | 纳入自主维护 |
+| POST | `/api/skills/{name}/archive` 与 `restore` | 归档 / 恢复 |
+| GET/POST | `/api/skills/curator/status`、`run`、`pause`、`resume` | 维护器状态查询、立即运行、暂停、恢复 |
+
+列表接口额外返回：使用次数、修订次数、是否固定保护、是否自主维护、生命周期状态。
+
+### 10.6 代码索引补充
+
+| 位置 | 作用 |
+|------|------|
+| `backend/src/skills/usage.py` | 使用量与归属附属文件存储 |
+| `backend/src/skills/curator.py` | 门控、状态机、归并审查报告 |
+| `backend/src/skills/curator_backup.py` | 压缩快照与回滚 |
+| `backend/src/skills/provenance.py` | 写来源上下文变量 |
+| `backend/src/tools/builtin/skill_manage_tool.py` | 代理写入工具与后台写守卫 |
+| `backend/src/main.py` | 维护器按小时尝试调度 |
+| `frontend/src/views/SkillsView.vue` | 固定保护、纳入自主维护、归档、维护器状态条 |
+| `tests/skills/test_*.py`、`tests/tools/test_skill_manage_tool.py` | 行为契约测试 |
+
+### 10.7 运维提示补充
+
+- 用户技能不会被维护器自动归档，除非先**纳入自主维护**。  
+- 关键流程请先**固定保护**，再交由代理继续修订正文。  
+- 误归档：可在技能页通过归档入口恢复，或调用恢复接口。  
+- 备份目录：`skills/.curator_backups/`；归并审查报告：`~/.helloclaw/logs/curator/`。  
+- 代理应优先使用技能管理工具写入，避免通用文件写入工具直接改 skills 目录（否则无使用量记录、也不会刷新工具列表）。

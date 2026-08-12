@@ -90,6 +90,7 @@ class ContextGuard:
         "task",
         "subagent",
         "Skill",
+        "skill_manage",
         "calculator",
         "browser",      # 有状态（page 持久化），不可委托
         "automation",    # 副作用（创建/删除定时任务），不可委托

@@ -354,7 +354,7 @@ class TodoItem:
 - `mark_completed(todo_id)` — 标记完成，自动触发下游 `_update_ready_status()`
 - `mark_failed(todo_id, reason)` — 标记失败，自动 `fail_downstream()`
 - `fail_downstream(todo_id)` — 迭代式 BFS 阻塞下游（避免递归栈溢出）
-- `get_progress_summary()` — 生成可注入系统提示词的进度 Markdown
+- `get_progress_summary()` — 生成进度 Markdown（Plan 执行期由 TodoScheduler 经 turn_context 注入；TaskTracker 版本供工具/API）
 - `check_plan_divergence(current_action)` — **[实验性]** 偏离检测（当前为简单关键词匹配，后续将升级为语义匹配）
 - `is_all_completed()` / `has_failed()` — 完成度检查
 - `to_plan_json()` — 序列化为前端可消费格式

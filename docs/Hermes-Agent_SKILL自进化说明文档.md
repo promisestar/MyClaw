@@ -2,8 +2,8 @@
 
 本文档说明 **Skill（技能）自进化** 的设计动机、实现方法与价值。实现参考来自 Hermes Agent 的 `skill_manage` 工具链路（`tools/skill_manager_tool.py`）及其配套的遥测与 Curator 维护体系。文中 Mermaid 图可在 Obsidian 中渲染。
 
-> **与 MyClaw 现有 Skill 系统的关系**  
-> MyClaw 当前已具备 Skill 的加载、启用/禁用、导入、编辑与 Agent 调用（见 `MyClaw_SKILL实现文档.md`）。本文描述的是其上的一层能力：**让 Agent 把成功经验沉淀为可复用 Skill，并在使用中持续改写与维护**。可作为后续在 MyClaw 落地「Skill 自进化」的设计蓝本。
+> **与 MyClaw Skill 系统的关系**  
+> MyClaw 已具备 Skill 的加载、启用/禁用、导入、编辑与 Agent 调用（见 `MyClaw实现详解/MyClaw_SKILL实现文档.md`）。本文是自进化能力的**设计蓝本与动机说明**；落地后的模块、API、配置与数据流以该实现文档（尤其 §10）为准。二者分工：本文讲「为什么 / 对齐 Hermes 的什么」；实现文档讲「MyClaw 代码里怎么做的」。
 
 ---
 

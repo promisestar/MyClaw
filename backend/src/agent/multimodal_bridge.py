@@ -200,10 +200,10 @@ def install_simple_agent_multimodal_patch() -> None:
 
     original_build_messages = cls._build_messages
 
-    def patched_build_messages(self, input_text):  # type: ignore[no-untyped-def]
+    def patched_build_messages(self, input_text, *, turn_context=None):  # type: ignore[no-untyped-def]
         # 在调用原方法前不能改 input_text（要保持 add_message 仍写入编码字符串），
         # 但原方法返回的 messages 列表中可能包含编码后的 content，统一在这里解码并即时加载图片。
-        messages = original_build_messages(self, input_text)
+        messages = original_build_messages(self, input_text, turn_context=turn_context)
         for item in messages:
             content = item.get("content")
             if is_encoded_multimodal(content):

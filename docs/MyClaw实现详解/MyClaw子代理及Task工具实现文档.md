@@ -571,7 +571,7 @@ sequenceDiagram
 | **P2** | Context Guard 自动路由 | 在 `_try_execute_ready_tool` 中根据 `should_delegate_to_subagent()` 自动拦截重型工具调用并路由到子代理，不再依赖 LLM 判断 |
 | **P3** | 任务模板 | 为常见任务类型（代码重构、项目初始化、文档生成）预定义任务模板 |
 | **P4** | 子代理超时策略 | 基于任务复杂度（历史工具调用数、预估 token 量）动态调整 `timeout_seconds` |
-| **P5** | 任务进度自动注入 | 将 `get_progress_summary()` 在每轮 LLM 调用前注入系统提示词，让 Agent 始终感知任务进度（类似 Memory Flush 的自动注入） |
+| **P5** | 任务进度自动注入 | 将 `TodoScheduler.get_progress_summary()`（Plan 执行期）经 `turn_context` 注入本轮 user 前缀；`TaskTracker` 进度仍以工具返回为主 |
 
 ---
 
@@ -595,7 +595,7 @@ sequenceDiagram
 | `backend/src/tools/builtin/task_tool.py` | `TaskTool`：将追踪器包装为 `task` 工具（7 个动作） |
 | `backend/src/tools/__init__.py` | 导出 `SubAgentTool` + `TaskTool` |
 | `backend/src/tools/builtin/__init__.py` | 导出 `SubAgentTool` + `TaskTool` |
-| `backend/src/agent/myclaw_agent.py` | 初始化编排器/追踪器、注册工具、注入系统提示词、生命周期钩子 |
+| `backend/src/agent/myclaw_agent.py` | 初始化编排器/追踪器、注册工具、冻结 system / turn_context、生命周期钩子 |
 | `backend/src/agent/enhanced_simple_agent.py` | 新增 `subagent_orchestrator` 可选参数（预留扩展） |
 | `backend/src/main.py` | `lifespan` shutdown 阶段持久化任务列表 |
 | `docs/IMPLEMENTATION_GUIDE.md` | 实施指南：安装步骤 + 测试清单 + 回滚方案 |

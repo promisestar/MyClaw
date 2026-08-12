@@ -33,7 +33,7 @@ flowchart TB
 
 记忆系统为 **统一的长期记忆**：基于 **Qdrant 向量数据库** 存储，使用与 RAGTool 相同的 embedding 基础设施做语义检索。进入模型的路径是 **双通道**：
 
-1. **每轮自动注入（默认开启）**：用户消息到达时，按语义检索 top-K（默认 **3**）条相关记忆，追加到本轮 `system_prompt`。
+1. **每轮自动注入（默认开启）**：用户消息到达时，按语义检索 top-K（默认 **3**）条相关记忆，经 `turn_context` 合并进本轮发给模型的 **user 前缀**（不写入 `system_prompt`、不入会话历史），以利于 prompt cache。
 2. **工具按需深挖**：Agent 可再调 `memory_search` 等子动作获取更多或按分类过滤的结果。
 
 | 特性 | 说明 |
@@ -41,7 +41,7 @@ flowchart TB
 | **存储** | Qdrant 向量数据库（collection: `helloclaw_memory`，可由 `QDRANT_COLLECTION` 覆盖） |
 | **写入方式** | 自动捕获（`MemoryCaptureManager`，正则匹配）、Agent 工具 `memory_add`、Memory Flush 静默回合、HTTP `/api/memory/capture` |
 | **写入去重** | **L1 字面去重（默认启用）**：`content_hash + category`；**L2 语义去重（默认关闭）**：embedding top-1 + 阈值。命中均不新建，复用旧 `memory_id` 并强化 |
-| **检索 / 进入模型** | ① 每轮 `auto_inject` 语义检索并注入 system prompt；② Agent 工具 `memory_search` 按需深挖；③ `USER.md` 画像区域由聚合器从记忆沉淀后，经 `_build_system_prompt` 常驻注入 |
+| **检索 / 进入模型** | ① 每轮 `auto_inject` 语义检索并写入 ephemeral `turn_context`；② Agent 工具 `memory_search` 按需深挖；③ `USER.md` 画像区域由聚合器从记忆沉淀后，经 `_build_system_prompt` 常驻于**冻结** system |
 | **遗忘机制** | 衰减式遗忘：`decay_score` 初始 1.0，每 7 天按分类速率衰减，归零则删除；检索命中重置计时器（用进废退）；懒处理（启动时 / `memory_cleanup`） |
 | **分类体系** | preference / decision / entity / fact / plan / relationship / reference / rule（8 种） |
 | **用户画像联动** | `ProfileAggregator` 从记忆聚合写入 `~/.helloclaw/identity/USER.md` 自动区域（每 10 轮或 preference 过多时触发） |
@@ -97,13 +97,13 @@ sequenceDiagram
 
 ### 2.1 自动注入（`_inject_relevant_memories`）
 
-实现位置：`backend/src/agent/myclaw_agent.py`。在 `chat()` / `achat()` 中，于 `_build_system_prompt()` **之后**、Agent 运行 **之前** 调用。
+实现位置：`backend/src/agent/myclaw_agent.py`。在 `chat()` / `achat()` 中，于会话绑定与 `ensure_session_system_prompt()` **之后**、Agent 运行 **之前** 组装进 `turn_context`。
 
 行为要点：
 
 - 用当前用户消息（多模态时先拍平为纯文本）做 query，调用 `MemoryVectorStore.search_memories`。
-- 命中则追加到本轮 `system_prompt`，标题为 `## 相关记忆（自动注入）`，并提示不足时可再调 `memory_search`。
-- **每轮先重建 base system prompt，再追加本轮检索结果**，不会跨轮累加旧注入块。
+- 命中则写入本轮 `turn_context`，标题为 `## 相关记忆（自动注入）`，并提示不足时可再调 `memory_search`。
+- **基座 system 在会话内冻结**；记忆块每轮可变，但只出现在发给模型的 user 前缀，**不会**追加进 `system_prompt`，也**不会**写入会话历史。
 - 记忆不可用、配置关闭、query 为空或无命中时返回空串，不影响对话。
 
 配置（工作区 / 全局 `config.json` 的 `memory` 段，模板见 `workspace/templates/config.json`）：

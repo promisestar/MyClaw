@@ -142,6 +142,12 @@ class SkillTool(Tool):
 2. 执行 Python 脚本时，**必须使用上方指定的 Python 解释器**，不要用 `python` 或 `python3` 这种依赖 PATH 的写法。
 3. 如果脚本报 ModuleNotFoundError，说明依赖未安装到本技能的专属环境，请告知用户而不是自行 pip install。"""
 
+            # 遥测：加载即 use（best-effort）
+            try:
+                self.skill_loader.usage_store_for(skill_name).bump_use(skill_name)
+            except Exception:
+                pass
+
             return ToolResponse.success(
                 text=full_content,
                 data={

@@ -24,7 +24,8 @@
 16. [用户画像：对话驱动的自动聚合系统](#16-用户画像对话驱动的自动聚合系统)
 17. [最难的部分：三道硬关与攻克方案](#17-最难的部分三道硬关与攻克方案)
 18. [前端 SSE 流式增量渲染与无损编辑](#18-前端-sse-流式增量渲染与无损编辑)
-19. [面试展示策略](#19-面试展示策略)
+19. [Skill 自进化：流程型知识与生命周期维护](#19-skill-自进化流程型知识与生命周期维护)
+20. [面试展示策略](#20-面试展示策略)
 
 ---
 
@@ -363,7 +364,7 @@ def _compute_retry_delay(attempt, base_delay, max_delay, backoff, jitter):
 
 ### 实现方案
 
-`MyClawAgent._build_system_prompt` 从多个配置文件组合系统提示词（**身份从基座 IdentityManager 读，AGENTS 从当前工作区读、基座 fallback**）：
+`MyClawAgent._build_system_prompt` 从多个配置文件组合**基座**系统提示词（**身份从基座 IdentityManager 读，AGENTS 从当前工作区读、基座 fallback**）。该结果经 `ensure_session_system_prompt` 在会话内冻结；每轮变化的记忆与 Plan 段走 `turn_context`（本轮 user 前缀，不入历史）。
 
 ```
 AGENTS.md      → 主体行为规范（工作区 .myclaw/ 优先，否则 ~/.helloclaw/AGENTS.md）
@@ -371,11 +372,7 @@ BOOTSTRAP.md   → 启动引导（入职未完成时从 identity/ 注入）
 IDENTITY.md    → 身份认知（~/.helloclaw/identity/）
 USER.md        → 用户画像（~/.helloclaw/identity/）
 SOUL.md        → 性格特征（~/.helloclaw/identity/）
-+ 子代理使用指引（自动注入）
-+ 任务管理指引（自动注入）
-+ 长期记忆使用指引（自动注入）
 + 回忆通道指引（session_search 启用时）
-+ 当前时间（每次构建时动态注入）
 ```
 
 **关键代码**（`myclaw_agent.py`）：
@@ -407,12 +404,15 @@ def _build_system_prompt(self) -> str:
     return base_prompt + "\n" + "\n".join(context_parts)
 ```
 
-**热加载机制**：每次 `chat()` / `achat()` 调用前都重新构建系统提示词：
+**会话内冻结与边界重建**：同会话连续对话不重写基座 system；在切换会话、切换工作区或入职完成时 `ensure_session_system_prompt(force=True)` 重建。LLM 配置仍每轮检测热加载。
 
 ```python
 def chat(self, message, session_id=None, ...):
     self._reload_llm_if_changed()  # 检测 config.json 变化
-    self._agent.system_prompt = self._build_system_prompt()  # 重建提示词
+    self.ensure_session_system_prompt()  # 会话内冻结；边界才重建
+    turn_context = self._compose_turn_context(
+        self._inject_relevant_memories(message),
+    )
     ...
 ```
 
@@ -422,13 +422,13 @@ def chat(self, message, session_id=None, ...):
 
 **2. 条件注入**：`BOOTSTRAP.md` 只在入职未完成时注入，完成后自动消失，不浪费上下文空间。
 
-**3. 动态时间感知**：每次构建时注入当前时间，让 Agent 能回答"今天几号"类问题。
+**3. Prompt cache 友好**：基座 system 会话内稳定；相关记忆与 Plan 附加段挂在本轮 user 前缀（`turn_context`），不写入会话历史。
 
-**4. 热加载**：修改任何配置文件后，下一次对话立即生效，无需重启服务。
+**4. 边界热加载**：修改身份/AGENTS 后，切换会话或工作区即可带上新内容，无需重启服务。
 
 ### 面试展示要点
 
-> "Agent 的人格不是写死在代码里的，而是由多个配置文件组合而成：基础规范、身份认知、用户画像、性格特征各自独立。每次对话前重新构建系统提示词，支持热加载。入职引导在完成后自动消失，不浪费上下文。"
+> "Agent 的人格不是写死在代码里的，而是由多个配置文件组合而成：基础规范、身份认知、用户画像、性格特征各自独立。基座系统提示在会话内冻结以利于前缀缓存；每轮相关记忆走 user 侧临时上下文。入职引导在完成后从下一边界重建中消失，不浪费上下文。"
 
 ---
 
@@ -540,7 +540,7 @@ def start(self, task_id):
 
 **3. 持久化**：任务列表可保存到 `workspace/tasks/{session_id}.json`，会话切换时自动加载。
 
-**4. 进度摘要**：`get_progress_summary()` 生成 Markdown 格式的进度报告，可注入系统提示词让 Agent 始终感知当前进度。
+**4. 进度摘要**：`TaskTracker.get_progress_summary()` 生成 Markdown 进度报告，经任务工具返回值与相关 API 暴露给 Agent/前端；**不**自动写入 system 或 `turn_context`。Plan 执行期注入的是 `TodoScheduler.get_progress_summary()`（与 TaskTracker 不同模块）。
 
 ### 面试展示要点
 
@@ -574,7 +574,8 @@ Agent 需要跨会话记住两类截然不同的东西：
   自动注入（被动）：
     每轮用户消息 → _inject_relevant_memories
                  → 语义检索 top-3（score_threshold=0.3）
-                 → 格式化为「相关记忆（自动注入）」追加到系统提示词
+                 → 格式化为「相关记忆（自动注入）」写入 turn_context
+                 → 仅合并进本轮发给模型的 user 前缀（不入 system、不入会话历史）
                  → Qdrant 不可用时静默降级（跳过注入）
 
   主动检索（Agent 按需）：
@@ -630,7 +631,7 @@ Agent 需要跨会话记住两类截然不同的东西：
 
 **4. 懒处理策略**：衰减计算和删除只在程序启动时或手动调用时执行，不随每轮对话触发，零运行时开销。
 
-**5. 自动注入（被动检索）**：每轮用户消息到达时，后台语义检索 top-3 相关记忆注入系统提示词。配置项支持开关、top_k 和相似度阈值。Qdrant 不可用时静默降级。
+**5. 自动注入（被动检索）**：每轮用户消息到达时，后台语义检索 top-3 相关记忆，经 `turn_context` 挂到本轮 user 前缀（不改 system、不写历史）。配置项支持开关、top_k 和相似度阈值。Qdrant 不可用时静默降级。
 
 **6. 事实 / 原文硬边界（Session Recall）**：
 - JSON 为 source of truth，`index.db` 可丢可重建——与 Hermes「写入即索引」同构，但 MyClaw 不改 hello-agents 内核，用 save/delete 挂钩增量维护。  
@@ -643,7 +644,7 @@ Agent 需要跨会话记住两类截然不同的东西：
 
 ### 面试展示要点
 
-> "回忆不是一个桶。我们拆成三通道：Memory 用 Qdrant 存短事实，每轮自动注入 top-3，再加衰减和用进废退；Profile 把偏好沉淀进 USER.md 常驻；Session Recall 用全局会话 JSON + SQLite FTS，Agent 用 session_search 按需钻原文——锚定窗口加 bookend，不把旧对话每轮灌进 prompt。事实和原文分开，是为了既省 token，又答得出『上次我们具体怎么说的』。"
+> "回忆不是一个桶。我们拆成三通道：Memory 用 Qdrant 存短事实，每轮 top-3 挂到 user 侧临时上下文（不打断 system 前缀缓存），再加衰减和用进废退；Profile 把偏好沉淀进 USER.md 常驻于冻结 system；Session Recall 用全局会话 JSON + SQLite FTS，Agent 用 session_search 按需钻原文——锚定窗口加 bookend，不把旧对话每轮灌进 prompt。事实和原文分开，是为了既省 token，又答得出『上次我们具体怎么说的』。"
 
 ---
 
@@ -966,7 +967,7 @@ def bind_workspace(self, workspace_path: str):
     self._subagent_orchestrator.workspace_path = abs_path
     self._agent.workspace_root = Path(abs_path).resolve()
     self._memory_capture_manager.workspace_manager = self.workspace
-    self._agent.system_prompt = self._build_system_prompt()  # 重建（identity 不变）
+    self.ensure_session_system_prompt(force=True)  # 会话边界重建（identity 不变）
     # sessions/tasks 已全局化（~/.helloclaw/），无需重绑
 ```
 
@@ -1048,7 +1049,7 @@ Plan 模式是整个系统中交互最复杂的模式，需要在无状态的 HT
   └── 用户点击「取消」→ 清理状态，对话结束
   ↓
 [后端] _load_pending_plan(session_id) 恢复计划
-  ├── 注入进度摘要到系统提示词
+  ├── 进度摘要写入 turn_context（本轮 user 前缀）
   ├── 设置 FULL 模式 → ReAct 循环执行
   └── 完成后 _cleanup_plan_file(session_id)
 ```
@@ -1400,7 +1401,7 @@ def bind_workspace(self, workspace_path: str):
     self._browser_session._uploads_dir = Path(...)    # ⑥ 浏览器上传
     self._automation_store = AutomationStore(...)     # ⑦ 定时任务
     self._memory_capture_manager.workspace_manager = ...  # ⑧ 记忆捕获
-    self._agent.system_prompt = self._build_system_prompt()  # ⑨ 系统提示词（identity 不变）
+    self.ensure_session_system_prompt(force=True)  # ⑨ 系统提示词（会话边界重建，identity 不变）
     # ⑩⑪⑫ ... 更多引用点
 
     print(f"🔄 已切换工作区: {abs_path}")
@@ -1680,7 +1681,102 @@ splitMessagesAtUserTurn(1) 输出:
 
 ---
 
-## 19. 面试展示策略
+## 19. Skill 自进化：流程型知识与生命周期维护
+
+### 设计动机
+
+长期记忆回答「用户是谁、偏好与事实是什么」；知识库检索回答「资料里写了什么」；二者都不擅长「这类任务应按什么步骤完成」。Skill（技能）承担**流程型知识**：触发条件、执行步骤、常见陷阱与验收方式。
+
+若技能只能由人工导入或整文件编辑，会出现三类问题：
+
+1. **经验难以回流**：复杂排障成功后，流程只留在单次对话记录中，下次同类任务仍从零探索。  
+2. **文档与环境脱节**：接口、操作系统或路径变更后文档未同步，代理仍按过时步骤执行并产生错误结果。  
+3. **技能库无序膨胀**：只增不改、不归档，检索噪声增大、触发条件相互冲突。
+
+自进化的目标不是微调模型权重，而是形成闭环：**一次成功经验 → 可版本管理的技能资产 → 再次执行 → 再修订**；同时用归属边界与生命周期策略，避免「自主维护」误伤用户自有技能。
+
+### 实现方案
+
+整体分三层（设计思路对齐 Hermes 的技能生命周期维护器，落地在 MyClaw 的工作区/全局双目录技能底座上）：
+
+```
+对话代理
+  ├─ 只读工具 Skill（加载全文）── 累计使用次数 ──► .usage.json
+  └─ 技能管理工具 skill_manage（新建 / 局部修订 / 改写 / …）
+         │ 名称与文首元数据校验、模糊局部匹配、路径护栏
+         ▼
+   skills/ 磁盘目录（工作区或全局）
+         │
+         ├─ 记录创建归属 / 累计修订次数
+         ├─ 重新扫描目录 + 刷新只读工具描述（写入后必须执行）
+         └─ 生命周期维护器（系统空闲且到达巡检间隔时运行）
+                ├─ 活跃 → 闲置 → 已归档（仅「已纳入自主维护」的技能）
+                ├─ 固定保护：跳过自动迁移；首次巡检只写入基准时间、不立即清理
+                └─ 开启归并审查时：写出 ~/.helloclaw/logs/curator/ 下的审计报告
+```
+
+**1. 写入工具层：技能管理工具（`tools/builtin/skill_manage_tool.py`）**
+
+| 动作 | 语义 |
+|------|------|
+| 新建（create） | 创建技能目录与 `SKILL.md`；对话前台默认**不**标记为自主维护资产（视为用户资产） |
+| 局部修订（patch） | 查找替换；先精确匹配，再按空白归一化做模糊匹配；优先用于局部纠错 |
+| 改写 / 写配套文件 / 删配套文件 | 整篇重写，或仅允许在 scripts、references、examples、assets、templates 下操作 |
+| 查看（view） | 先读后写的证据链；累计查看次数 |
+| 删除（delete） | **归档**到 `.archive/`，而非直接删除目录；已固定保护则拒绝 |
+
+写入成功后回调 `MyClawAgent.refresh_skill_tool()`，避免「磁盘已更新，但工具列表描述仍停留在旧版本」。
+
+**2. 使用量与归属遥测（`skills/usage.py`）**
+
+- 路径：`.myclaw/skills/.usage.json` 与 `~/.helloclaw/skills/.usage.json` 分别管理对应目录  
+- 字段：加载次数、查看次数、修订次数、创建归属、是否固定保护、生命周期状态、时间戳  
+- 文件锁与原子写入；计数失败不中断主工具执行路径  
+- 归属字段取值为 `agent` 时，表示**用户已将该技能纳入自主维护范围**（显式加入），并非严格意义上的「作者证明」；用户可通过接口「纳入自主维护」完成移交
+
+**3. 生命周期维护器（`skills/curator.py`、`curator_backup.py`）**
+
+- 配置：`config.json` 的 `curator` 段（默认约 7 天巡检一次、闲置/归档阈值约 30/90 天、归并审查默认关闭）  
+- 调度：`main.py` 每小时尝试一次；真正执行还需满足：已启用、未暂停、系统空闲、达到巡检间隔；聊天活动会刷新「最近活跃」时间  
+- 确定性状态迁移：仅处理报告中的自主维护技能；从未使用的技能有宽限下限；重新活动可将闲置状态拉回活跃  
+- 备份：状态变更前生成压缩快照，保留最近若干份  
+- 归并审查：开启时写出候选清单审计报告（完整的大语言模型归并可在此基础上扩展）；后台写入路径通过写来源标记与「吸收目标」参数做缺省拒绝（参数不全则拒绝执行）
+
+**4. 运维面**
+
+提供使用量查询、固定保护开关、纳入自主维护、归档与恢复、维护器状态/立即运行/暂停/恢复等 HTTP 接口；前端技能页展示使用量、固定保护与自主维护标记、归档恢复入口及维护器状态条。
+
+### 代码引用
+
+| 模块 | 路径 |
+|------|------|
+| 遥测 | `backend/src/skills/usage.py` |
+| 写入原语 | `backend/src/skills/loader.py`（新建、局部修订、归档、恢复） |
+| 生命周期维护器 | `backend/src/skills/curator.py`、`curator_backup.py` |
+| 写来源 | `backend/src/skills/provenance.py` |
+| 代理工具 | `backend/src/tools/builtin/skill_manage_tool.py`、`skill_tool.py` |
+| 接口 | `backend/src/api/skills.py` |
+| 调度 | `backend/src/main.py`（维护器循环） |
+| 引导文案 | `workspace/templates/workspace/AGENTS.md` 第 7.4 节 |
+
+### 对比分析
+
+| 方案 | 优点 | 问题 |
+|------|------|------|
+| 仅人工导入与编辑技能 | 可控性强 | 成功经验无法回流；代理直接写磁盘缺少校验与工具描述刷新 |
+| 用通用文件写入工具改 skills 目录 | 无需新工具 | 缺少文首元数据校验、无使用量与归属记录、易发生路径穿越 |
+| 直接永久删除过期技能 | 实现简单 | 不可恢复；易误删关键流程 |
+| **自进化三层结构** | 可沉淀、可局部修订、可归档恢复，用户资产与自主维护资产分离 | 需维护附属遥测文件与后台调度；归并审查须谨慎开启 |
+
+相对 Hermes：MyClaw 采用工作区与全局各一份附属遥测文件；对话中新建技能默认归用户资产；本期不移植「每轮对话结束后的后台审查」子流程；纳入自主维护主要依赖用户主动移交，再交由生命周期维护器处理。
+
+### 面试展示要点
+
+> 「Skill 是流程型知识，与长期记忆、知识库检索的分工不同。我们让代理用技能管理工具把一次做对的过程写成 `SKILL.md`，发现偏差再做局部修订；附属遥测文件记录使用量与归属；生命周期维护器只处理已纳入自主维护的技能，过期归档且可恢复，固定保护用于关键流程。这样能力可复现、可运维，又避免自主维护误伤用户自有技能。」
+
+---
+
+## 20. 面试展示策略
 
 ### 推荐展示顺序（15 分钟 talk）
 
@@ -1688,7 +1784,7 @@ splitMessagesAtUserTurn(1) 输出:
 |------|------|------|
 | 0-2 min | 项目定位 + 架构全景图（三组目录解耦 + 画一张中文示意图） | 建立整体印象 |
 | 2-8 min | **三道硬关**（详见[第 17 章](#17-最难的部分三道硬关与攻克方案)）：<br/>① 流式工具并发安全 — 状态机 + 三层保障<br/>② 14 点运行时重绑 — setattr 全量切换<br/>③ 上下文窗口经济学 — 三道防线 + 条件注入 | 展示"解决真正难的问题"的能力 |
-| 8-10 min | **三通道回忆**：Memory 四层 + Session Recall（`session_search`） | 展示产品思维与事实/原文分工 |
+| 8-10 min | **三通道回忆** + 可选一句 **Skill 自进化**（流程型知识 vs 长期记忆） | 展示产品思维与事实/流程分工 |
 | 10-12 min | **Agent 循环可中断 + 双向协同取消** | 展示对可靠性边界的理解 |
 | 12-13 min | **意图识别 + 用户画像**（三模式路由、Plan 两阶段、对话驱动画像） | 展示产品设计 + 多系统联动 |
 | 13-14 min | 踩过的坑 + 如果重新来过会怎么做不同 | 展示反思能力 |
@@ -1713,7 +1809,7 @@ splitMessagesAtUserTurn(1) 输出:
 
 ### 一句话总结
 
-> 这个项目最大的亮点不是"做了什么功能"，而是"**在功能背后的工程决策**"——流式提前执行、只读工具并行、三级路由、错误分类重试、记忆自动注入与跨会话原文按需召回、双向协同取消、破坏性截断的取舍，每一个都体现了对"Agent 如何在生产环境可靠运行"的深度思考。
+> 这个项目最大的亮点不是"做了什么功能"，而是"**在功能背后的工程决策**"——流式提前执行、只读工具并行、三级路由、错误分类重试、记忆自动注入与跨会话原文按需召回、Skill 流程型知识自进化与生命周期维护、双向协同取消、破坏性截断的取舍，每一个都体现了对"Agent 如何在生产环境可靠运行"的深度思考。
 
 ---
 

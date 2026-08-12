@@ -2,6 +2,7 @@
 
 import json
 import asyncio
+import logging
 import time
 import os
 import re
@@ -31,6 +32,48 @@ if TYPE_CHECKING:
     from hello_agents.tools.registry import ToolRegistry
 
 # 错误分类和重试逻辑已抽取到 retry_executor.py，此处不再保留重复的正则模式
+
+
+def compose_turn_user_content(
+    input_text: str,
+    turn_context: Optional[str] = None,
+) -> str:
+    """将本轮 ephemeral 上下文与用户原文合并为发给模型的 user content。
+
+    历史记录应仍使用干净的 ``input_text``，不得把 ``turn_context`` 写入会话。
+    若 ``input_text`` 为多模态编码串，把上下文作为前置 text part 再编码，
+    以便 ``multimodal_bridge`` 补丁仍能整段解码。
+
+    多模态路径失败时**丢弃上下文、保留原编码串**，避免破坏 ``__MM_V1__`` 前缀。
+    """
+    ctx = (turn_context or "").strip()
+    if not ctx:
+        return input_text
+
+    prefix = f"## 本轮上下文\n{ctx}\n\n---\n\n"
+    try:
+        from .multimodal_bridge import (
+            decode_multimodal_content,
+            encode_multimodal_content,
+            is_encoded_multimodal,
+        )
+
+        if is_encoded_multimodal(input_text):
+            decoded = decode_multimodal_content(input_text)
+            if isinstance(decoded, list):
+                return encode_multimodal_content(
+                    [{"type": "text", "text": prefix}] + decoded
+                )
+            # 非预期结构：宁可丢掉上下文，也不破坏编码串
+            return input_text
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "compose_turn_user_content: multimodal merge failed, keeping original encoding: %s",
+            e,
+        )
+        return input_text
+    return f"{prefix}{input_text}"
 
 
 class EnhancedSimpleAgent(SimpleAgent):
@@ -316,8 +359,16 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         return result.result
 
-    def _build_messages(self, input_text: str) -> List[Dict[str, Any]]:
-        """构建消息列表，并在对话开始前执行上下文管理。"""
+    def _build_messages(
+        self,
+        input_text: str,
+        *,
+        turn_context: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """构建消息列表，并在对话开始前执行上下文管理。
+
+        ``turn_context`` 仅合并进本轮发给模型的末条 user，不写入历史。
+        """
         if self.context_manager.maybe_compress_history():
             print("📦 对话开始前已压缩历史上下文")
 
@@ -345,7 +396,7 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         messages.append({
             "role": "user",
-            "content": input_text
+            "content": compose_turn_user_content(input_text, turn_context),
         })
 
         if self.context_manager.maybe_compress_messages(messages, self.system_prompt):
@@ -757,12 +808,20 @@ class EnhancedSimpleAgent(SimpleAgent):
             ):
                 yield event
 
-    def run(self, input_text: str, *, cancel_token: Optional[CancellationToken] = None, **kwargs) -> str:
+    def run(
+        self,
+        input_text: str,
+        *,
+        cancel_token: Optional[CancellationToken] = None,
+        turn_context: Optional[str] = None,
+        **kwargs,
+    ) -> str:
         """同步运行；每轮工具迭代重建 tool_schemas（支持 MCP 渐进披露）。
 
         Args:
-            input_text: 用户输入
+            input_text: 用户输入（写入历史的干净原文）
             cancel_token: 取消令牌，用于中断 Agent 循环
+            turn_context: 仅本轮发给模型的 ephemeral 上下文（不入历史）
         """
         from datetime import datetime as dt
         from hello_agents.observability import TraceLogger
@@ -780,7 +839,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                 {"agent_name": self.name, "agent_type": self.__class__.__name__},
             )
 
-        messages = self._build_messages(input_text)
+        messages = self._build_messages(input_text, turn_context=turn_context)
 
         if trace_logger:
             trace_logger.log_event("message_written", {"role": "user", "content": input_text})
@@ -980,6 +1039,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         input_text: str,
         *,
         cancel_token: Optional[CancellationToken] = None,
+        turn_context: Optional[str] = None,
         **kwargs
     ) -> AsyncGenerator[StreamEvent, None]:
         """异步流式运行（支持工具调用）
@@ -988,8 +1048,9 @@ class EnhancedSimpleAgent(SimpleAgent):
         每个工具调用的参数 JSON 解析完成后会立即执行，无需等待整轮流结束。
 
         Args:
-            input_text: 用户输入
+            input_text: 用户输入（写入历史的干净原文）
             cancel_token: 取消令牌，用于中断 Agent 循环
+            turn_context: 仅本轮发给模型的 ephemeral 上下文（不入历史）
             **kwargs: 其他参数
 
         Yields:
@@ -1031,7 +1092,7 @@ class EnhancedSimpleAgent(SimpleAgent):
 
         try:
             # 构建消息列表，并在对话开始前检查/执行上下文压缩
-            messages = self._build_messages(input_text)
+            messages = self._build_messages(input_text, turn_context=turn_context)
 
             # 检查是否有工具
             if not self.enable_tool_calling or not self.tool_registry:
@@ -1049,7 +1110,12 @@ class EnhancedSimpleAgent(SimpleAgent):
                     UserWarning
                 )
                 # 回退到基类的非流式模式
-                response = self.run(input_text, **kwargs)
+                response = self.run(
+                    input_text,
+                    cancel_token=cancel_token,
+                    turn_context=turn_context,
+                    **kwargs,
+                )
                 yield StreamEvent.create(
                     StreamEventType.AGENT_FINISH,
                     self.name,
