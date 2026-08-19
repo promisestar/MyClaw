@@ -74,11 +74,16 @@ class ContextManager:
         self._snip_ratio = snip_ratio
         self._summarize_ratio = summarize_ratio
         self._collapse_ratio = collapse_ratio
+        # tool 结果字符裁剪：相对 128K → 1500 字符的基准，随窗口放大
+        self._tool_snip_base_chars = 1500
+        self._tool_snip_ref_window = 128_000
+        self._tool_snip_max_chars = 100_000
 
         self.max_tokens = config.context_window
         self._snip_at = int(self.max_tokens * snip_ratio)
         self._summarize_at = int(self.max_tokens * summarize_ratio)
         self._collapse_at = int(self.max_tokens * collapse_ratio)
+        self._recompute_tool_snip_chars(self.max_tokens)
 
         self._history_token_count = 0
         self._summary_llm: Optional["HelloAgentsLLM"] = None
@@ -99,6 +104,22 @@ class ContextManager:
         self._token_model = model
         self._token_base_url = base_url
 
+    def _recompute_tool_snip_chars(self, window: int) -> None:
+        """按上下文窗口缩放单条 tool 消息的字符裁剪上限。
+
+        128K → 1500 字符（历史默认）；更大窗口允许更长 tool 结果留在上下文中，
+        避免修好 Read 正文回传后又被硬裁剪吞掉。上限 100_000。
+        """
+        if window <= 0:
+            window = self._tool_snip_ref_window
+        scaled = int(
+            self._tool_snip_base_chars * window / self._tool_snip_ref_window
+        )
+        self.tool_snip_chars = max(
+            self._tool_snip_base_chars,
+            min(scaled, self._tool_snip_max_chars),
+        )
+
     def update_context_window(self, new_max_tokens: int):
         """动态更新上下文窗口大小及所有压缩阈值。
 
@@ -115,12 +136,14 @@ class ContextManager:
         self._snip_at = int(self.max_tokens * self._snip_ratio)
         self._summarize_at = int(self.max_tokens * self._summarize_ratio)
         self._collapse_at = int(self.max_tokens * self._collapse_ratio)
+        self._recompute_tool_snip_chars(new_max_tokens)
 
         if old != new_max_tokens:
             print(
                 f"📐 上下文窗口已更新: {old:,} → {new_max_tokens:,} tokens "
                 f"(snip={self._snip_at:,}, summarize={self._summarize_at:,}, "
-                f"collapse={self._collapse_at:,})"
+                f"collapse={self._collapse_at:,}, "
+                f"tool_snip_chars={self.tool_snip_chars:,})"
             )
 
     def count_tokens(self, text: str) -> int:

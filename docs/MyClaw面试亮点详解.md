@@ -207,26 +207,30 @@ async for tool_event in self._try_execute_ready_tool(...):
 
 ### 设计动机
 
-Agent 工具调用的输出大小差异巨大：`calculator` 返回 100 tokens，`read_file` 可能返回 5000+ tokens，`web_fetch` 可能返回 8000+ tokens。如果所有输出都直接灌入主上下文，几次大输出后上下文就被占满，导致频繁压缩、丢失历史信息。
+Agent 工具调用的输出大小差异巨大：`calculator` 返回约 100 tokens，`Read` 可能返回数千 tokens，`web_fetch` 可能返回近万 tokens。如果所有输出都直接灌入主上下文，几次大输出后上下文就被占满，导致频繁压缩、丢失历史信息。
 
-传统方案是"事后截断"——等上下文超阈值后再裁剪。但裁剪是破坏性操作，截断后无法恢复。更好的思路是"事前预判"——在工具执行前就决定结果如何进入上下文。
+传统方案是「事后截断」——等上下文超阈值后再裁剪。但裁剪是破坏性操作，截断后难以恢复。更好的思路是「事前预判」——在工具执行前就决定结果如何进入上下文。
+
+同时，不同模型的上下文窗口从 32K 到 1M 不等：若把 inline/snip/delegate 的分界写死为 2000/8000，在大窗口上会把本可内联的结果错误委派给子代理。MyClaw 因此把**额度阈值**做成窗口比例，而把工具 `output_size_hint` 保留为输出规模的绝对值。
 
 ### 实现方案
 
-`ContextGuard`（`context/context_guard.py`）在工具执行前拦截，基于工具输出预估表做三级路由：
+`ContextGuard`（`context/context_guard.py`）在工具执行前拦截，基于工具输出预估值与**随窗口动态的阈值**做三级路由：
 
 ```
 工具调用
   ├── 副作用工具黑名单 → inline/snip（无论如何不委托）
-  │     write_file, edit_file, memory_add, memory_delete,
-  │     calculator, task, subagent, Skill
+  │     Write, Edit, memory_add, memory_delete,
+  │     calculator, task, subagent, Skill, browser, automation
   │
-  ├── 预估 < 2000 tokens → inline（直接执行，结果放入主上下文）
+  ├── 预估 < small_threshold → inline（直接执行，结果放入主上下文）
   │
-  ├── 预估 2000~8000 tokens → snip（正常执行，输出由 ContextManager 截断）
+  ├── 预估 < large_threshold → snip（正常执行；压缩层按 tool_snip_chars 截断）
   │
-  └── 预估 > 8000 tokens → delegate（委托子代理，主上下文只收到摘要）
+  └── 预估 >= large_threshold → delegate（委托子代理，主上下文只收到摘要）
 ```
+
+128K 基准下 `small_threshold=2000`、`large_threshold=8000`（与历史行为对齐）；窗口变大时阈值按比例升高。`MyClawAgent._sync_context_window` 同步更新 Guard 与 `ContextManager.tool_snip_chars`。
 
 **关键代码**（`enhanced_simple_agent.py` `_try_execute_ready_tool`）：
 
@@ -254,17 +258,19 @@ if self._context_guard is not None and self._context_guard.should_delegate(tool_
 
 ### 设计亮点
 
-**1. 副作用工具黑名单**：`write_file`、`memory_add` 等有副作用的工具即使预估输出大也不会被委托——因为委托意味着在子代理的隔离上下文中执行，主 Agent 无法直接感知副作用结果。
+**1. 副作用工具黑名单**：`Write`、`memory_add` 等有副作用的工具即使预估输出大也不会被委托——因为委托意味着在子代理的隔离上下文中执行，主 Agent 无法直接感知副作用结果。
 
-**2. 优雅降级**：委托失败时自动降级为 `snip`（直接执行 + 截断），保证功能不中断。
+**2. 优雅降级**：委托失败时自动降级为本地直接执行，保证功能不中断。
 
-**3. 语义化任务描述**：`delegate_tool` 内部有 `_format_task_description`，针对不同工具生成子代理可理解的自然语言任务：
+**3. 语义化任务描述**：`delegate_tool` 内部有 `_format_task_description`，针对不同工具生成子代理可理解的自然语言任务（工具名与注册名一致，如 `Read`）：
 
 ```python
-# read_file 的任务描述
-"使用 read_file 工具读取文件 'src/main.py'（限制 100 行）。
+# Read 的任务描述
+"使用 Read 工具读取文件 'src/main.py'（限制 100 行）。
  只输出文件的完整内容，不要做任何解释或总结。"
 ```
+
+**4. 阈值与 hint 解耦**：hint 描述「工具大概吐多少」；阈值描述「当前窗口愿意花多少」。只缩放后者，大窗口才真正少委派、少误裁。
 
 ### 对比分析
 
@@ -272,11 +278,11 @@ if self._context_guard is not None and self._context_guard.should_delegate(tool_
 |------|---------|---------|-----------|
 | 事后截断（传统） | 上下文超阈值后 | 低（已污染上下文） | 不涉及 |
 | 二元委托 | LLM 自主判断 | 中（依赖 LLM 配合） | 无保护 |
-| **三级路由（MyClaw）** | **工具执行前** | **高（事前拦截）** | **黑名单保护** |
+| **三级路由（MyClaw）** | **工具执行前** | **高（事前拦截 + 窗口自适应）** | **黑名单保护** |
 
 ### 面试展示要点
 
-> "子代理委托不是简单的开关，我设计了一个三级路由：小输出直接执行、中输出执行后截断、大输出委托子代理。还有一个副作用工具黑名单防止 write_file 这类工具被误委托。委托失败时自动降级为截断执行，保证不中断。"
+> "子代理委托不是简单的开关，我设计了三级路由：小输出直接执行、中输出执行后由压缩层截断、大输出委托子代理。额度阈值按模型上下文窗口比例动态计算，工具 hint 保持绝对值，避免大窗口下误委派。还有副作用工具黑名单防止 Write 这类工具被误委托。委托失败时自动降级为直接执行，保证不中断。"
 
 ---
 

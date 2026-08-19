@@ -294,11 +294,13 @@ CREATE INDEX idx_sessions_updated ON sessions(updated_at DESC);
 
 | 属性 | 建议值 |
 |------|--------|
-| `output_size_hint` | 3000～5000（discover 多命中时偏大） |
+| `output_size_hint` | 3000～5000（discover 多命中时偏大；此为**预估输出 token 绝对值**，不随模型窗口缩放） |
 | `has_side_effects` | `false`（只读） |
 | Ask 模式 | **允许**（只读回忆） |
 | Plan 规划期 | **允许** |
-| 委托 | 可委托（无副作用） |
+| 委托 | 可委托（无副作用）；是否真正 `delegate` 取决于当前窗口下的 `large_threshold`（`ContextGuard.update_context_window`，128K 基准下约为 8000） |
+
+说明：`output_size_hint` 描述工具「大概吐多少」；`small_threshold` / `large_threshold` 描述「当前上下文窗口愿意为单次工具结果花多少」。二者解耦后，大窗口下不会因固定 8000 门槛把本可内联的 `session_search` / `web_fetch` 结果误委派。压缩层的 `tool_snip_chars` 也会随窗口放大，避免召回原文刚进上下文就被裁成短摘要。
 
 ---
 
@@ -567,7 +569,7 @@ def probe_sqlite_fts_capabilities() -> dict:
 |------|------|
 | 目标环境 SQLite 无 FTS5 | **§13.1 探测 + LIKE 降级**；CI/启动记录能力位；不引入新依赖硬顶 |
 | 索引与 JSON 不一致 | JSON 为权威；工具可 fallback 读 JSON；定期/启动校验 |
-| 工具返回过大撑爆上下文 | 截断、limit、bookend 限制；ContextGuard hint |
+| 工具返回过大撑爆上下文 | 工具侧 limit/bookend 截断；`output_size_hint` 绝对值 + ContextGuard 动态 large 阈值；`ContextManager.tool_snip_chars` 随窗口放大 |
 | 模型滥用 session_search | AGENTS 指引；trivial 问候可不鼓励调用 |
 | 中文召回差 | LIKE fallback；二期 trigram（需探测通过） |
 | 隐私 | 索引与 sessions 同目录权限；不上传云端；工具只读 |

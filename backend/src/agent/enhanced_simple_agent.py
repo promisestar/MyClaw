@@ -329,6 +329,70 @@ class EnhancedSimpleAgent(SimpleAgent):
         """计算重试延迟（委托给 retry_executor.compute_retry_delay）。"""
         return compute_retry_delay(attempt, base_delay, max_delay, backoff, jitter)
 
+    def _execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """执行工具并返回写入 LLM 上下文的字符串。
+
+        相对基类：成功时若 ``data.content`` 未出现在 ``text`` 中则合并进去，
+        避免 Read 等工具把正文只放在 data 导致模型看不到文件内容。
+        """
+        if not self.tool_registry:
+            return "❌ 错误：未配置工具注册表"
+
+        tool = self.tool_registry.get_tool(tool_name)
+        if tool:
+            try:
+                typed_arguments = self._convert_parameter_types(tool_name, arguments)
+                response = tool.run_with_timing(typed_arguments)
+
+                from hello_agents.tools.response import ToolStatus
+
+                text = self._tool_response_to_llm_text(response)
+                if response.status == ToolStatus.ERROR:
+                    error_code = (
+                        response.error_info.get("code", "UNKNOWN")
+                        if response.error_info
+                        else "UNKNOWN"
+                    )
+                    return f"❌ 错误 [{error_code}]: {text}"
+                if response.status == ToolStatus.PARTIAL:
+                    return f"⚠️ 部分成功: {text}"
+                return text
+            except Exception as exc:
+                return f"❌ 工具调用失败：{exc}"
+
+        func = self.tool_registry.get_function(tool_name)
+        if func:
+            try:
+                input_text = arguments.get("input", "")
+                response = self.tool_registry.execute_tool(tool_name, input_text)
+                from hello_agents.tools.response import ToolStatus
+
+                text = self._tool_response_to_llm_text(response)
+                if response.status == ToolStatus.ERROR:
+                    error_code = (
+                        response.error_info.get("code", "UNKNOWN")
+                        if response.error_info
+                        else "UNKNOWN"
+                    )
+                    return f"❌ 错误 [{error_code}]: {text}"
+                if response.status == ToolStatus.PARTIAL:
+                    return f"⚠️ 部分成功: {text}"
+                return text
+            except Exception as exc:
+                return f"❌ 工具调用失败：{exc}"
+
+        return f"❌ 错误：未找到工具 '{tool_name}'"
+
+    @staticmethod
+    def _tool_response_to_llm_text(response: Any) -> str:
+        """从 ToolResponse 提取给 LLM 的文本，必要时合并 data.content。"""
+        text = getattr(response, "text", None) or ""
+        data = getattr(response, "data", None) or {}
+        content = data.get("content") if isinstance(data, dict) else None
+        if isinstance(content, str) and content and content not in text:
+            return f"{text}\n\n{content}" if text else content
+        return text
+
     def _execute_tool_call_with_retry_sync(
         self,
         tool_name: str,

@@ -2,17 +2,22 @@
 
 在工具实际执行之前，根据预估值表判断输出规模，决定执行策略：
 - inline  → 直接执行，结果放入主上下文（小工具：calculator、memory_add）
-- snip    → 正常执行，但输出自动截断后放入上下文（中等：execute_command、web_search）
-- delegate → 委托给子代理，主上下文只收到摘要（大工具：read_file、web_fetch、rag_ask）
+- snip    → 正常执行，但输出由 ContextManager 在压缩层按 tool_snip_chars 截断（中等）
+- delegate → 委托给子代理，主上下文只收到摘要（大工具：web_fetch 等）
 
 核心理念：
     不让臃肿的工具输出进入主 Agent 的上下文。在数据进入之前就拦截它。
 
+阈值（small/large）按当前 LLM 上下文窗口比例动态计算；
+工具 output_size_hint / TOOL_ESTIMATES 仍是「预估输出 token 绝对值」，不随窗口缩放
+（否则阈值与预估同比例放大会导致路由结果不变）。
+
 使用方式：
     guard = ContextGuard(orchestrator=subagent_orchestrator)
-    strategy = guard.decide("read_file")
+    guard.update_context_window(128_000)
+    strategy = guard.decide("Read")
     if strategy == "delegate":
-        result = await guard.delegate_tool("read_file", {"path": "src/main.py"})
+        result = await guard.delegate_tool("Read", {"path": "src/main.py"})
 """
 
 from __future__ import annotations
@@ -34,24 +39,26 @@ class ContextGuard:
     决定每个工具调用是直接执行还是委托给子代理。
     """
 
-    # ── 阈值配置 ──
-    SMALL_THRESHOLD = 2000    # tokens：低于此值直接执行
-    LARGE_THRESHOLD = 8000    # tokens：高于此值委托子代理
+    # ── 相对 128K 基准窗口的额度比例 ──
+    REFERENCE_WINDOW = 128_000
+    SMALL_RATIO = 2000 / 128_000   # ≈ 1.56%
+    LARGE_RATIO = 8000 / 128_000   # ≈ 6.25%
+    MIN_SMALL = 500
 
-    # ── 工具 → 预估输出大小(tokens) ──
-    # 预估值来源于工具语义分析（不是实时计算）：
-    # - read_file 天然产出大量文本 → 5000
-    # - web_fetch 抓取网页 → 8000
-    # - calculator 几乎永远短输出 → 100
+    # 兼容旧代码/文档引用的类常量（128K 基准下的绝对值）
+    SMALL_THRESHOLD = 2000
+    LARGE_THRESHOLD = 8000
+
+    # ── 工具 → 预估输出大小(tokens，绝对值，不随窗口缩放) ──
+    # 键名与实际注册的工具 name 对齐；registry 的 output_size_hint 优先。
     TOOL_ESTIMATES: Dict[str, int] = {
-        # 入口在 subagent_orchestrator.py，此处为副本（解耦）
-        # 如果你改了 orchestrator 中的值，记得同步这里
-        "read_file": 5000,
-        "write_file": 500,
-        "edit_file": 800,
+        "Read": 5000,
+        "Write": 500,
+        "Edit": 800,
         "execute_command": 3000,
         "web_search": 4000,
         "web_fetch": 8000,
+        "memory": 1000,
         "memory_search": 1000,
         "memory_add": 200,
         "memory_list": 1500,
@@ -60,29 +67,26 @@ class ContextGuard:
         "memory_cleanup": 500,
         "calculator": 100,
         "Skill": 2000,
+        "skill_manage": 800,
         "mcp": 5000,
+        "rag": 5000,
         "rag_ask": 5000,
-        # subagent 工具本身输出是摘要，很小
         "subagent": 500,
         "task": 300,
-        # ── P0 补全工具 ──
-        "search_content": 3000,   # 搜索结果可能较长
-        "search_file": 1000,      # 文件名列表
-        "list_dir": 1500,         # 目录列表
-        "http_request": 4000,     # API 响应
-        "browser": 4000,          # 浏览器操作结果/截图
-        "automation": 500,        # 定时任务 CRUD 结果
-        "session_search": 4000,   # 跨会话原文窗口
+        "search_content": 3000,
+        "search_file": 1000,
+        "list_dir": 1500,
+        "http_request": 4000,
+        "browser": 4000,
+        "automation": 500,
+        "session_search": 4000,
     }
 
     # ── 不适合委托的工具 ──
-    # 这些工具即使预估输出大，也不能委托给子代理，因为：
-    # - write_file / edit_file：有副作用，必须在主上下文中执行
-    # - memory_add / memory_delete：副作用操作
-    # - task / subagent：元工具，委托会导致无限递归
-    # - Skill：需要加载到主 Agent 的上下文中才有意义
     NO_DELEGATE_TOOLS = {
-        "write_file",
+        "Write",
+        "Edit",
+        "write_file",  # 旧名兼容
         "edit_file",
         "memory_add",
         "memory_delete",
@@ -92,14 +96,15 @@ class ContextGuard:
         "Skill",
         "skill_manage",
         "calculator",
-        "browser",      # 有状态（page 持久化），不可委托
-        "automation",    # 副作用（创建/删除定时任务），不可委托
+        "browser",
+        "automation",
     }
 
     def __init__(
         self,
         orchestrator: Optional["SubAgentOrchestrator"] = None,
         tool_registry: Optional[Any] = None,
+        context_window: int = REFERENCE_WINDOW,
     ):
         """初始化上下文守卫。
 
@@ -108,14 +113,32 @@ class ContextGuard:
                           会降级为 snip。
             tool_registry: ToolRegistry 实例。如果提供，decide() 会优先从工具元数据
                           (output_size_hint, has_side_effects) 读取，而非硬编码字典。
+            context_window: 当前模型上下文窗口（token），用于重算 small/large 阈值。
         """
         self._orchestrator = orchestrator
         self._tool_registry = tool_registry
-        # 动态元数据映射（从工具实例的 output_size_hint / has_side_effects 构建）
         self._dynamic_estimates: Dict[str, int] = {}
         self._dynamic_no_delegate: set = set()
+        self.context_window = context_window
+        self.small_threshold = self.SMALL_THRESHOLD
+        self.large_threshold = self.LARGE_THRESHOLD
+        self.update_context_window(context_window)
         if tool_registry is not None:
             self._build_metadata_from_registry()
+
+    def update_context_window(self, window: int) -> None:
+        """按上下文窗口比例重算 inline/snip/delegate 阈值。
+
+        在 128K 基准下与历史常量一致（2000 / 8000）。
+        更大窗口提高 large 阈值，避免 web_fetch 等被不必要地委派。
+        """
+        if window <= 0:
+            window = self.REFERENCE_WINDOW
+        self.context_window = window
+        small = max(self.MIN_SMALL, int(window * self.SMALL_RATIO))
+        large = max(small + 1, int(window * self.LARGE_RATIO))
+        self.small_threshold = small
+        self.large_threshold = large
 
     def set_tool_registry(self, tool_registry: Any) -> None:
         """设置或更新工具注册表（工具注册后调用）。"""
@@ -148,27 +171,25 @@ class ContextGuard:
 
         优先从工具元数据 (output_size_hint, has_side_effects) 读取，
         回退到硬编码 TOOL_ESTIMATES / NO_DELEGATE_TOOLS。
+        与 small_threshold / large_threshold（随窗口动态）比较。
 
         Returns:
             "inline" | "snip" | "delegate"
         """
-        # 合并动态元数据和硬编码（动态优先）
         no_delegate = self._dynamic_no_delegate | self.NO_DELEGATE_TOOLS
         estimates = {**self.TOOL_ESTIMATES, **self._dynamic_estimates}
 
-        # 副作用工具不能委托
         if tool_name in no_delegate:
             estimate = estimates.get(tool_name, 2000)
-            return "snip" if estimate > self.SMALL_THRESHOLD else "inline"
+            return "snip" if estimate > self.small_threshold else "inline"
 
         estimate = estimates.get(tool_name, 2000)
 
-        if estimate < self.SMALL_THRESHOLD:
+        if estimate < self.small_threshold:
             return "inline"
-        elif estimate < self.LARGE_THRESHOLD:
+        elif estimate < self.large_threshold:
             return "snip"
         else:
-            # 如果 orchestrator 不可用，降级为 snip
             if self._orchestrator is None:
                 return "snip"
             return "delegate"
@@ -205,16 +226,13 @@ class ContextGuard:
 
         from ..agent.subagent_orchestrator import SubAgentTask, SubAgentResultMode
 
-        # 构造子代理的自然语言任务描述
         task_desc = self._format_task_description(tool_name, arguments)
 
         task = SubAgentTask(
             description=task_desc,
-            tools=[tool_name],              # 子代理只能用这一个工具
+            tools=[tool_name],
             result_mode=SubAgentResultMode.SUMMARY,
-            max_iterations=3,               # 子代理少迭代（通常 1 次工具调用就够）
-            # timeout_seconds 不设置：SubAgentTask.__post_init__ 自动计算
-            # 1 个工具 + 3 轮迭代 → 30 + 15 + 30 = 75s
+            max_iterations=3,
         )
 
         result = await self._orchestrator.run_task(task)
@@ -241,22 +259,21 @@ class ContextGuard:
 
     @staticmethod
     def _format_task_description(tool_name: str, arguments: Dict[str, Any]) -> str:
-        """将 LLM 工具调用转为子代理可理解的自然语言任务描述。
-
-        例如：read_file(path="src/main.py", limit=100)
-        → "使用 read_file 工具读取文件 'src/main.py'（限制 100 行），"
-          "只输出文件内容，不要解释。"
-        """
-        # 针对常见工具做语义化描述
+        """将 LLM 工具调用转为子代理可理解的自然语言任务描述。"""
         formatters = {
+            "Read": lambda args: (
+                f"使用 Read 工具读取文件 '{args.get('path', 'unknown')}'"
+                + (f"（限制 {args.get('limit', 'all')} 行）" if args.get("limit") else "")
+                + "。只输出文件的完整内容，不要做任何解释或总结。"
+            ),
             "read_file": lambda args: (
-                f"使用 read_file 工具读取文件 '{args.get('path', 'unknown')}'"
-                + (f"（限制 {args.get('limit', 'all')} 行）" if args.get('limit') else "")
+                f"使用 Read 工具读取文件 '{args.get('path', 'unknown')}'"
+                + (f"（限制 {args.get('limit', 'all')} 行）" if args.get("limit") else "")
                 + "。只输出文件的完整内容，不要做任何解释或总结。"
             ),
             "web_search": lambda args: (
                 f"使用 web_search 工具搜索关键词 '{args.get('query', 'unknown')}'"
-                + (f"（返回 {args.get('count', 5)} 条结果）" if args.get('count') else "")
+                + (f"（返回 {args.get('count', 5)} 条结果）" if args.get("count") else "")
                 + "。只输出搜索结果，不要做任何解释或总结。"
             ),
             "web_fetch": lambda args: (
@@ -267,21 +284,17 @@ class ContextGuard:
                 f"使用 execute_command 工具执行命令 '{args.get('command', 'unknown')}'"
                 + "。只输出命令执行结果，不要做任何解释或总结。"
             ),
-            "rag_ask": lambda args: (
-                f"使用 rag_ask 工具查询知识库 '{args.get('query', 'unknown')}'"
+            "rag": lambda args: (
+                f"使用 rag 工具查询知识库 '{args.get('question') or args.get('query', 'unknown')}'"
                 + "。只输出检索结果，不要做任何解释或总结。"
             ),
-        }
-
-        formatter = formatters.get(tool_name)
-        if formatter:
-            return formatter(arguments)
-
-        # ── P0 补全工具的委托描述 ──
-        p0_formatters = {
+            "rag_ask": lambda args: (
+                f"使用 rag 工具查询知识库 '{args.get('query', 'unknown')}'"
+                + "。只输出检索结果，不要做任何解释或总结。"
+            ),
             "search_content": lambda args: (
                 f"使用 search_content 工具搜索内容，正则 '{args.get('pattern', 'unknown')}'"
-                + (f"，目录 {args.get('path', '工作空间根')}" if args.get('path') else "")
+                + (f"，目录 {args.get('path', '工作空间根')}" if args.get("path") else "")
                 + "。只输出搜索结果，不要做任何解释或总结。"
             ),
             "search_file": lambda args: (
@@ -290,20 +303,24 @@ class ContextGuard:
             ),
             "list_dir": lambda args: (
                 f"使用 list_dir 工具列出目录"
-                + (f" {args.get('target_directory', '')}" if args.get('target_directory') else "")
+                + (f" {args.get('target_directory', '')}" if args.get("target_directory") else "")
                 + "。只输出目录内容，不要做任何解释或总结。"
             ),
             "http_request": lambda args: (
                 f"使用 http_request 工具请求 {args.get('method', 'GET')} {args.get('url', 'unknown')}"
                 + "。只输出响应内容，不要做任何解释或总结。"
             ),
+            "session_search": lambda args: (
+                f"使用 session_search 工具检索历史会话，参数为："
+                f"{json.dumps(arguments, ensure_ascii=False)}。"
+                "只输出检索结果，不要做任何解释或总结。"
+            ),
         }
 
-        formatter = p0_formatters.get(tool_name)
+        formatter = formatters.get(tool_name)
         if formatter:
             return formatter(arguments)
 
-        # 通用兜底：JSON 化参数
         return (
             f"使用 {tool_name} 工具，参数为：{json.dumps(arguments, ensure_ascii=False)}。"
             f"只输出工具返回的结果，不要做任何解释或总结。"

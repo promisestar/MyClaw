@@ -646,27 +646,36 @@ sequenceDiagram
 | `agent/myclaw_agent.py` | **修改**（+1 行） | 将 `self._subagent_orchestrator` 传递给 `EnhancedSimpleAgent` 构造函数，使 Context Guard 可用 |
 | `agent/subagent_orchestrator.py` | **修改**（-60 行） | 移除冗余的 `TOOL_OUTPUT_ESTIMATES`、`estimate_tool_output_tokens()`、`should_delegate_to_subagent()`；修复 `parallel_run` 的 `asyncio.gather(return_exceptions=True)` 类型注解 |
 
-**Context Guard 三级路由规则**：
+**Context Guard 三级路由规则**（阈值随模型上下文窗口动态计算）：
 
 ```
 工具调用
   ├── NO_DELEGATE_TOOLS 中的工具 → inline/snip（无论如何不委托）
-  │     write_file, edit_file, memory_add, memory_delete, calculator, task, subagent, Skill
+  │     Write, Edit, memory_add, memory_delete, calculator, task, subagent, Skill, browser, automation
   │
-  ├── 预估输出 < 2000 tokens → inline（直接执行，结果放入主上下文）
-  │     calculator(100), memory_add(200), write_file(500), memory_delete(200)
+  ├── 预估输出 < small_threshold → inline（直接执行，结果放入主上下文）
   │
-  ├── 预估输出 2000~8000 tokens → snip（正常执行，输出由 ContextManager 截断）
-  │     execute_command(3000), Skill(2000), memory_list(1500), memory_search(1000)
+  ├── 预估输出 small_threshold ~ large_threshold → snip
+  │     （正常执行；超长 tool 输出由 ContextManager.tool_snip_chars 在压缩层截断）
   │
-  └── 预估输出 > 8000 tokens → delegate（委托子代理，主上下文只收到摘要）
-        web_fetch(8000), read_file(5000), web_search(4000), mcp(5000), rag_ask(5000)
+  └── 预估输出 >= large_threshold → delegate（委托子代理，主上下文只收到摘要）
 ```
 
-**降级策略**：当 `orchestrator` 不可用或委托执行失败时，`delegate` 自动降级为 `snip`（直接执行但输出截断），保证功能不中断。
+**动态额度（相对 128K 基准）**：
+
+| 量 | 含义 | 128K 时 | 缩放方式 |
+|----|------|---------|----------|
+| `output_size_hint` / `TOOL_ESTIMATES` | 工具预估输出 token **绝对值** | 如 `web_fetch=8000` | **不随窗口缩放** |
+| `small_threshold` | inline / snip 分界 | 2000 | `max(500, window × 2000/128000)` |
+| `large_threshold` | snip / delegate 分界 | 8000 | `max(small+1, window × 8000/128000)` |
+| `tool_snip_chars` | 单条 tool 消息字符裁剪上限 | 1500 | `max(1500, min(100000, 1500 × window/128000))` |
+
+只缩放阈值、不缩放 hint：若两者同比例放大，路由结果对窗口不变，大窗口下仍会把 `web_fetch` 等误委派。`MyClawAgent._sync_context_window` 在感知模型窗口后同步调用 `ContextGuard.update_context_window` 与 `ContextManager.update_context_window`。
+
+**降级策略**：当 `orchestrator` 不可用或委托执行失败时，`delegate` 自动降级为直接执行（Agent 侧捕获异常后走本地 `_execute_tool_call`），保证功能不中断。
 
 **设计要点**：
 - 拦截插入点在 `_try_execute_ready_tool` 中的去重检查之后、限量检查之前，确保委托行为也受去重和限量约束
-- 委托执行通过 `SubAgentOrchestrator.run_task()` 创建隔离子代理，`max_iterations=3`（子代理只需 1 次工具调用），`timeout=30s`
+- 委托执行通过 `SubAgentOrchestrator.run_task()` 创建隔离子代理，`max_iterations=3`（子代理通常只需 1 次工具调用）
 - 委托结果以 `[自动委托...]` 前缀的格式化文本注入主上下文，含子代理 ID、工具名、调用次数、耗时和结果摘要
-- 工具描述格式化器（`_format_task_description`）针对 5 种高频工具生成语义化子代理任务描述，使其按统一格式使用工具
+- 工具描述格式化器（`_format_task_description`）针对 `Read`、`web_fetch`、`execute_command` 等高频真实工具名生成语义化子代理任务描述

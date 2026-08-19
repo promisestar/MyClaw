@@ -390,6 +390,7 @@ _MODEL_CONTEXT_WINDOW: Dict[str, int] = {
     "doubao-pro":           128_000,
     "doubao-lite":          128_000,
     "deepseek-v4-pro":      1_000_000,
+    "MiniMax-M3":           1_000_000,
 }
 
 

@@ -10,11 +10,30 @@
 
 | 属性 | 值 |
 |------|-----|
-| 工具名 | `read` |
+| 工具名 | `Read` |
 | 实现 | `DocAwareReadTool`（继承 `hello_agents.ReadTool`） |
-| 元数据 | `output_size_hint=5000`，`has_side_effects=False` |
+| 元数据 | `output_size_hint=5000`（预估输出 token **绝对值**，不随窗口缩放），`has_side_effects=False` |
 
 **与标准 ReadTool 的差异**：继承自 hello_agents 的 `ReadTool`，但针对二进制文档格式（PDF/DOCX/XLSX/PPTX 等）做了增强——当 Agent 尝试读取这类文件时，自动委托 `DocumentExtractor`（底层调用 `markitdown`）提取纯文本，而非像原版那样 `open(encoding='utf-8')` 导致 `UnicodeDecodeError`。纯文本文件和目录列表行为与原版完全一致。
+
+**返回值与 LLM 上下文（重要）**：
+
+Agent 循环把工具结果写入 `messages` 时，只会使用 `ToolResponse.text`（见 `EnhancedSimpleAgent._execute_tool_call`），**不会**自动序列化整个 `data`。上游 `ReadTool` 曾把文件正文放在 `data.content`、`text` 仅有「读取 N 行…」摘要，导致模型看不到文件内容。
+
+MyClaw 的修复：
+
+1. **`DocAwareReadTool`**：纯文本路径在 `super().run()` 后把 `data.content` 合并进 `text`；文档提取路径直接以「摘要头 + 正文」作为 `text`（`data.content` 仍保留兼容）。
+2. **执行层兜底**：`EnhancedSimpleAgent._execute_tool_call` 若发现成功响应的 `data.content` 未出现在 `text` 中，会再次合并后再返回给 LLM。
+
+因此对 LLM 可见的典型形态为：
+
+```text
+读取 50 行（共 120 行，3456 字节）
+
+<文件正文...>
+```
+
+目录列表本身已在父类 `text` 中，无需合并。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -481,29 +500,32 @@
 
 ## 总结速查表
 
-| 工具 | 名称 | 副作用 | output_hint | 可委托 |
-|------|------|--------|-------------|--------|
-| Read | `read` | 否 | 5000 | ✅ |
-| Write | `write` | 是 | 500 | ❌ |
-| Edit | `edit` | 是 | 800 | ❌ |
+| 工具 | 名称 | 副作用 | output_hint（绝对值 tokens） | 可委托 |
+|------|------|--------|------------------------------|--------|
+| Read | `Read` | 否 | 5000 | 视窗口动态阈值而定 |
+| Write | `Write` | 是 | 500 | ❌ |
+| Edit | `Edit` | 是 | 800 | ❌ |
 | Calculator | `calculator` | 是 | 100 | ❌ |
-| Bash | `execute_command` | 否¹ | — | ✅ |
-| Memory | `memory` | 是 | — | ❌ |
-| WebSearch | `web_search` | 否 | 3000 | ✅ |
-| WebFetch | `web_fetch` | 否 | 8000 | ✅ |
-| RAG | `rag` | 是 | 3000 | ❌ |
-| SearchContent | `search_content` | 否 | 2000 | ✅ |
-| SearchFile | `search_file` | 否 | 1000 | ✅ |
-| ListDir | `list_dir` | 否 | 1500 | ✅ |
-| HttpRequest | `http_request` | 否 | 4000 | ✅ |
-| Browser | `browser` | 否 | 5000 | ✅ |
-| Automation | `automation` | 是 | — | ❌ |
-| Skill | `skill` | 否 | — | ❌ |
-| MCP | 动态 | 取决于外部服务 | — | — |
-| SubAgent | `subagent` | 否 | 2000 | ✅ |
+| Bash | `execute_command` | 否¹ | 3000 | 视窗口动态阈值而定 |
+| Memory | `memory` | 分动作 | 1000 | 写类动作 ❌ |
+| WebSearch | `web_search` | 否 | 4000 | 视窗口动态阈值而定 |
+| WebFetch | `web_fetch` | 否 | 8000 | 视窗口动态阈值而定 |
+| RAG | `rag` | 分动作 | 5000 | 视窗口动态阈值而定 |
+| SearchContent | `search_content` | 否 | 3000 | 视窗口动态阈值而定 |
+| SearchFile | `search_file` | 否 | 1000 | 视窗口动态阈值而定 |
+| ListDir | `list_dir` | 否 | 1500 | 视窗口动态阈值而定 |
+| HttpRequest | `http_request` | 否 | 4000 | 视窗口动态阈值而定 |
+| Browser | `browser` | 是（有状态） | 4000 | ❌ |
+| Automation | `automation` | 是 | 500 | ❌ |
+| Skill | `Skill` | 否 | 2000 | ❌ |
+| MCP | 动态 | 取决于外部服务 | 5000 | — |
+| SubAgent | `subagent` | 是（元工具） | 500 | ❌ |
 | Task | `task` | 是 | 300 | ❌ |
+| SessionSearch | `session_search` | 否 | 4000 | 视窗口动态阈值而定 |
 
-> ¹ BashTool 的 `has_side_effects=False` 是因为它在**子代理隔离环境**中执行——每个子代理有独立的 Shell 进程，不会影响主 Agent 的工作目录状态。
+> ¹ BashTool 的 `has_side_effects` 以注册时元数据为准；是否委托还取决于 `ContextGuard` 当前 `large_threshold`（随模型上下文窗口缩放）。
+>
+> **`output_size_hint` 与动态阈值**：hint 表示工具「大概会吐出多少 token」的绝对值，不随窗口放大。`ContextGuard` 的 `small_threshold` / `large_threshold` 按窗口比例重算（128K 基准下为 2000 / 8000）。大窗口提高委派门槛，避免不必要的子代理委派；`ContextManager.tool_snip_chars` 同步按窗口放大，避免 tool 正文刚进上下文就被硬裁剪。
 
 ---
 

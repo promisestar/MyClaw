@@ -429,6 +429,13 @@ class MyClawAgent:
         if hasattr(self, "_agent") and hasattr(self._agent, "context_manager") and self._agent.context_manager:
             self._agent.context_manager.update_context_window(new_window)
 
+        # 同步到 ContextGuard（动态 inline/snip/delegate 额度）
+        if (
+            hasattr(self, "_agent")
+            and getattr(self._agent, "_context_guard", None) is not None
+        ):
+            self._agent._context_guard.update_context_window(new_window)
+
         # 同步到 MemoryFlushManager（更新 flush 触发点）— 仅在已创建时
         if hasattr(self, "_memory_flush_manager") and self._memory_flush_manager:
             self._memory_flush_manager.context_window = new_window

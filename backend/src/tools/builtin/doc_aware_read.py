@@ -7,6 +7,9 @@
 
 解决场景：Agent 对二进制文档调用 Read 时不再 UnicodeDecodeError，
 也不会因为读不了就转去 RAG 入库——直接返回提取后的文本。
+
+重要：Agent 执行层只把 ToolResponse.text 写入 LLM 上下文。
+因此成功读取文件时，正文必须出现在 text 中（不能只放在 data.content）。
 """
 
 from __future__ import annotations
@@ -22,6 +25,19 @@ from hello_agents.tools.errors import ToolErrorCode
 from ...multimodal.extractor import DocumentExtractor, _DOC_EXTENSIONS, _is_plain_text_safe
 
 
+def _merge_content_into_text(response: ToolResponse) -> ToolResponse:
+    """若 data.content 未出现在 text 中，则合并进 text（供 LLM 上下文使用）。"""
+    data = getattr(response, "data", None) or {}
+    content = data.get("content")
+    if not isinstance(content, str) or not content:
+        return response
+    text = response.text or ""
+    if content in text:
+        return response
+    response.text = f"{text}\n\n{content}" if text else content
+    return response
+
+
 class DocAwareReadTool(ReadTool):
     """支持文档格式的 ReadTool。
 
@@ -30,6 +46,7 @@ class DocAwareReadTool(ReadTool):
     UnicodeDecodeError。
 
     纯文本格式和目录列表行为与原版完全一致，不影响 offset/limit/元数据缓存。
+    读文件成功时 text 含正文，确保进入 LLM 的 tool 消息可用。
     """
 
     # 覆盖父类描述，明确声明支持的文档格式，避免 LLM 误选 rag 入库
@@ -57,13 +74,13 @@ class DocAwareReadTool(ReadTool):
         # 解析路径（复用父类逻辑）
         full_path = self._resolve_path(path)
 
-        # 目录 → 原版逻辑
+        # 目录 → 原版逻辑（列表已在 text 中）
         if full_path.is_dir():
             return super().run(parameters)
 
-        # 纯文本格式 → 原版逻辑（保留 offset/limit/行号/元数据缓存）
+        # 纯文本格式 → 原版逻辑（保留 offset/limit/行号/元数据缓存），再合并正文到 text
         if _is_plain_text_safe(str(full_path)):
-            return super().run(parameters)
+            return _merge_content_into_text(super().run(parameters))
 
         # 二进制文档格式 → 委托 DocumentExtractor
         ext = (os.path.splitext(str(full_path))[1] or "").lower()
@@ -117,13 +134,16 @@ class DocAwareReadTool(ReadTool):
         if result.error:
             warning += f"\n[提取提示: {result.error}]"
 
+        body = content + warning
+        summary = (
+            f"读取文档 {full_path.name}（{result.kind} 格式，"
+            f"已提取为纯文本，当前显示 {len(lines)}/{total_lines} 行）"
+        )
+
         return ToolResponse.success(
-            text=(
-                f"读取文档 {full_path.name}（{result.kind} 格式，"
-                f"已提取为纯文本，当前显示 {len(lines)}/{total_lines} 行）"
-            ),
+            text=f"{summary}\n\n{body}",
             data={
-                "content": content + warning,
+                "content": body,
                 "lines": len(lines),
                 "total_lines": total_lines,
                 "file_mtime_ms": int(os.path.getmtime(full_path) * 1000),
