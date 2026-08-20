@@ -651,7 +651,7 @@ sequenceDiagram
 ```
 工具调用
   ├── NO_DELEGATE_TOOLS 中的工具 → inline/snip（无论如何不委托）
-  │     Write, Edit, memory_add, memory_delete, calculator, task, subagent, Skill, browser, automation
+  │     Write, Edit, memory_add, calculator, task, subagent, Skill, browser, automation
   │
   ├── 预估输出 < small_threshold → inline（直接执行，结果放入主上下文）
   │

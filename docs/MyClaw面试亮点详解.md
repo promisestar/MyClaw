@@ -220,7 +220,7 @@ Agent 工具调用的输出大小差异巨大：`calculator` 返回约 100 token
 ```
 工具调用
   ├── 副作用工具黑名单 → inline/snip（无论如何不委托）
-  │     Write, Edit, memory_add, memory_delete,
+  │     Write, Edit, memory_add,
   │     calculator, task, subagent, Skill, browser, automation
   │
   ├── 预估 < small_threshold → inline（直接执行，结果放入主上下文）
@@ -1229,7 +1229,7 @@ ProfileAggregator._update_user_md() — 原子写入 USER.md
 
 **① 同步和异步两种调用场景如何统一？**
 
-画像聚合有两个调用入口：`achat()` 末尾（异步）和 `memory_aggregate_profile` 工具（同步 `MemoryTool.run()`）。如果在同步上下文中创建新事件循环调用 `async aggregate()`，会触发 `RuntimeError`。
+画像聚合入口为 `achat()` 末尾的异步 `ProfileAggregator.aggregate()`（另有 `aggregate_sync()` 供同步上下文复用）。若在已有事件循环的同步路径里再用 `asyncio.run` 包一层异步聚合，会触发 `RuntimeError`——因此工具面曾提供的同步入口已撤回，统一走自动聚合。
 
 MyClaw 提供双接口：
 
@@ -1272,7 +1272,7 @@ domain_items = [e for e in entities if e not in tech_items]
 
 ### 面试展示要点
 
-> "用户画像不是让用户填表，而是在对话中自动发现的。每次对话结束检查是否需要聚合——每 10 轮或偏好记忆超过 20 条就触发一次，用轻量 LLM 把 preference/entity/decision 记忆提炼成结构化文本，写入 USER.md 的 AUTO 区域。有同步和异步两个调用入口——achat 末尾和 memory_aggregate_profile 工具，共享同一个聚合核心。LLM 不可用时降兜到纯关键词分类。写入用 os.replace 原子替换防并发冲突，同时清理 LLM 输出中的区域标记防注入。"
+> "用户画像不是让用户填表，而是在对话中自动发现的。每次对话结束检查是否需要聚合——每 10 轮或偏好记忆超过 20 条就触发一次，用轻量 LLM 把 preference/entity/decision 记忆提炼成结构化文本，写入 USER.md 的 AUTO 区域。聚合在 achat 末尾异步触发，与 Agent 工具面解耦（Memory 工具只保留 search/add）。LLM 不可用时降兜到纯关键词分类。写入用 os.replace 原子替换防并发冲突，同时清理 LLM 输出中的区域标记防注入。"
 
 ### 为什么不是"最难部分"
 
@@ -1520,7 +1520,7 @@ if self._context_guard.should_delegate(tool_name):
 # 即使预估输出大也不委托——委托意味着在子代理隔离上下文中执行
 # 主 Agent 如果不知道文件已写入，后续逻辑会出错
 SIDE_EFFECT_BLACKLIST = {
-    "write_file", "multi_edit", "memory_add", "memory_delete",
+    "write_file", "multi_edit", "memory_add",
     "calculator", "task", "Skill",
 }
 ```

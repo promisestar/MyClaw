@@ -42,7 +42,7 @@ flowchart TB
 | **写入方式** | 自动捕获（`MemoryCaptureManager`，正则匹配）、Agent 工具 `memory_add`、Memory Flush 静默回合、HTTP `/api/memory/capture` |
 | **写入去重** | **L1 字面去重（默认启用）**：`content_hash + category`；**L2 语义去重（默认关闭）**：embedding top-1 + 阈值。命中均不新建，复用旧 `memory_id` 并强化 |
 | **检索 / 进入模型** | ① 每轮 `auto_inject` 语义检索并写入 ephemeral `turn_context`；② Agent 工具 `memory_search` 按需深挖；③ `USER.md` 画像区域由聚合器从记忆沉淀后，经 `_build_system_prompt` 常驻于**冻结** system |
-| **遗忘机制** | 衰减式遗忘：`decay_score` 初始 1.0，每 7 天按分类速率衰减，归零则删除；检索命中重置计时器（用进废退）；懒处理（启动时 / `memory_cleanup`） |
+| **遗忘机制** | 衰减式遗忘：`decay_score` 初始 1.0，每 7 天按分类速率衰减，归零则删除；检索命中重置计时器（用进废退）；懒处理（启动时 / `/api/memory/cleanup`） |
 | **分类体系** | preference / decision / entity / fact / plan / relationship / reference / rule（8 种） |
 | **用户画像联动** | `ProfileAggregator` 从记忆聚合写入 `~/.helloclaw/identity/USER.md` 自动区域（每 10 轮或 preference 过多时触发） |
 
@@ -178,7 +178,7 @@ MemoryVectorStore
 
 - 写入时 `decay_score = 1.0`，`last_decay_ts = now`
 - 每 **7 天**（`DECAY_INTERVAL_DAYS`）按分类速率扣减；`≤ 0` 则删除
-- **懒处理**：启动时（`main.py` lifespan）或 `memory_cleanup` / `/api/memory/cleanup` 时批量执行
+- **懒处理**：启动时（`main.py` lifespan）或 HTTP `/api/memory/cleanup` 时批量执行
 - **访问强化**：`search_memories` 命中（含自动注入检索）会重置 `last_decay_ts`
 
 | 分类 | 每 7 天衰减量 | 理论寿命 | 设计理由 |
@@ -191,7 +191,7 @@ MemoryVectorStore
 
 ```mermaid
 flowchart TD
-    A["启动 / memory_cleanup"] --> B["scroll 全部记忆"]
+    A["启动 / API cleanup"] --> B["scroll 全部记忆"]
     B --> C{"elapsed ≥ 7天?"}
     C -->|否| D["跳过"]
     C -->|是| E["new_score = max(0, score - rate × periods)"]
@@ -263,26 +263,22 @@ flowchart TB
 
 ## 4. 内置工具：`MemoryTool`
 
-实现：`backend/src/tools/builtin/memory.py`。
+实现：`backend/src/tools/builtin/memory.py`（`expandable=True`，注册时展开为独立工具）。
 
-| 子动作 | 说明 |
-|--------|------|
-| `memory_search` | 语义检索（默认 top_k=5，可按 category 过滤） |
-| `memory_get` | 按 memory_id 查询 |
-| `memory_add` | 写入长期记忆（`source=agent`） |
-| `memory_list` | 按时间列出最近记忆 |
-| `memory_cleanup` | 触发 `process_decay` |
-| `memory_delete` | 按 ID 删除 |
-| `memory_aggregate_profile` | 手动触发画像聚合 → 更新 `USER.md` 自动区域 |
-| `memory_update_longterm` | **已弃用**，转发到 `memory_add` |
+为降低 LLM 工具选型噪声，**Agent 仅可见两个子工具**；列表/按 ID 查询/衰减/删除/手动画像聚合仍由系统 lifespan、HTTP API、`ProfileAggregator` 自动路径提供。
+
+| 子工具 | 说明 | 元数据 |
+|--------|------|--------|
+| `memory_search` | 语义检索（默认 top_k=5，可按 category 过滤）；结果含全文与 ID | `has_side_effects=False`，`output_size_hint=1000` |
+| `memory_add` | 写入长期记忆（`source=agent`） | `has_side_effects=True`，`output_size_hint=200`（Ask / Plan 规划期屏蔽） |
 
 与自动注入的关系：
 
 - 自动注入覆盖「本轮最相关的几条」，降低漏调工具的概率。  
-- 需要更多结果、按分类过滤、或核对具体 ID 时，仍应使用工具。  
+- 需要更多结果或按分类过滤时，使用 `memory_search`。  
 - 工具检索命中同样触发访问强化。
 
-`memory_store` 不可用时，部分动作可回退到旧的 `workspace_manager` 文件 API（过渡兼容）。
+`memory_store` 不可用时，search/add 可回退到旧的 `workspace_manager` 文件 API（过渡兼容）。
 
 ---
 
@@ -310,7 +306,7 @@ flowchart TB
 
 - 从 preference / entity 等记忆聚合到 `USER.md` 的自动区域（`tech_stack` / `work_domain` / `communication` / `code_style`）  
 - 保留手动区域（HTML 注释边界）  
-- 触发：对话每 10 轮，或 preference 条数超过阈值；也可 `memory_aggregate_profile`  
+- 触发：对话每 10 轮，或 preference 条数超过阈值（`achat` 末尾自动）；**不再**向 Agent 暴露 `memory_aggregate_profile` 工具 
 - 聚合结果经 `_build_system_prompt` 的「用户信息」块**常驻**进 system prompt（与每轮 top-K 自动注入互补：画像偏稳定偏好，自动注入偏本轮相关事实）
 
 ### 5.4 包导出

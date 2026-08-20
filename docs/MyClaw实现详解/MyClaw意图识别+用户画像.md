@@ -467,7 +467,7 @@ _其他手动维护的信息_
 | 触发条件 | 实现 |
 |---------|------|
 | 每 10 轮对话后 | `should_trigger()` 检查 `turn_count - _last_aggregated_turn >= 10` |
-| 手动触发 | `memory_aggregate_profile` 工具 action（调用 `aggregate_sync()`） |
+| 手动触发 | 已移除 Agent 工具面；仅保留 `achat()` 末尾 `ProfileAggregator.aggregate()` 自动路径 |
 | preference 记忆超过 20 条 | `should_trigger()` 检查 `preference_count >= 20`（通过 `_list_recent(top_k=200)` 精确统计） |
 
 ### 2.5 画像如何驱动行为
@@ -488,7 +488,7 @@ USER.md 已由 `_build_system_prompt()` 自动注入系统提示词（`myclaw_ag
 | 新增文件 | 修改文件 | 实际行数 |
 |---------|---------|---------|
 | `agent/profile_aggregator.py` | `agent/myclaw_agent.py`（画像聚合触发 + `profile_aggregator` 注入） | ~260 行 |
-| | `tools/builtin/memory.py`（新增 `memory_aggregate_profile` action） | ~40 行 |
+| | `tools/builtin/memory.py`（曾新增手动画像 action，现已精简为仅 search/add） | ~40 行 |
 | | `workspace/templates/identity/USER.md`（模板重设计） | ~50 行 |
 | **合计** | | **~350 行** |
 
@@ -568,5 +568,5 @@ USER.md 已由 `_build_system_prompt()` 自动注入系统提示词（`myclaw_ag
 | `backend/src/agent/myclaw_agent.py` | `achat()` mode 分流 + Plan 两阶段 + 暂存/恢复/清理 + 画像聚合触发 | +160 行 |
 | `backend/src/agent/enhanced_simple_agent.py` | `set_tool_mode()` + `_execute_tools_batch` 工具门控 + `executed_ids` 参数 | +60 行 |
 | `backend/src/agent/task_tracker.py` | `Task` 新增 `tools_required` 字段 | +20 行 |
-| `backend/src/tools/builtin/memory.py` | 新增 `memory_aggregate_profile` 工具 action + `profile_aggregator` 注入 | +40 行 |
+| `backend/src/tools/builtin/memory.py` | 曾注入 `profile_aggregator` 与手动聚合 action；现 Agent 面仅保留 `memory_search` / `memory_add` | 精简 |
 | `backend/src/workspace/templates/identity/USER.md` | 模板重设计，4 个 AUTO 自动区域 | 重写 |

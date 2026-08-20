@@ -39,10 +39,13 @@ class ToolMode(Enum):
 # 注意：bash 工具的注册名为 "bash"（见 myclaw_agent.py:670）
 SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "write",
+    "Write",
     "edit",
+    "Edit",
     "bash",
     "execute_command",
     "automation",
+    "memory_add",
 })
 
 

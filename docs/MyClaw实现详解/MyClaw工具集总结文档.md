@@ -316,26 +316,22 @@ MyClaw 的修复：
 
 | 属性 | 值 |
 |------|-----|
-| 工具名 | `memory` |
-| 实现 | `MemoryTool` |
-| 元数据 | `has_side_effects=True` |
+| 工具名 | 展开为 `memory_search` / `memory_add` |
+| 实现 | `MemoryTool`（`expandable=True`） |
+| 元数据 | `memory_search`：`output_size_hint=1000`，`has_side_effects=False`；`memory_add`：`output_size_hint=200`，`has_side_effects=True` |
 
-管理 Agent 长期记忆，底层 `MemoryVectorStore`（Qdrant）+ 衰减机制。
+管理 Agent 长期记忆，底层 `MemoryVectorStore`（Qdrant）+ 衰减机制。为减少 LLM 工具选型噪声，**仅向 Agent 暴露检索与写入**；列表/删除/衰减/画像聚合由 lifespan、`/api/memory/*` 与 `ProfileAggregator` 自动路径承担。
 
 | 动作 | 关键参数 | 说明 |
 |------|---------|------|
-| `memory_add` | `title`, `knowledge`, `context` | 添加记忆条目 |
-| `memory_search` | `query`, `top_k` | 语义搜索最相关记忆 |
-| `memory_list` | — | 列出所有记忆 |
-| `memory_get` | `memory_id` | 获取单条记忆 |
-| `memory_update` | `memory_id`, `knowledge` | 更新记忆内容 |
-| `memory_delete` | `memory_id` | 删除记忆 |
+| `memory_search` | `keyword`, `top_k`, `category` | 语义搜索最相关记忆（结果含全文与 ID） |
+| `memory_add` | `content`, `category`, `session_id` | 添加记忆条目 |
 
 **实现要点**：
 - **自动捕获**：`MemoryCaptureManager` 在每轮对话结束后自动提取要点并存为记忆
-- **双路检索**：语义检索（Qdrant）+ 关键词过滤，定期自动注入相关记忆到系统提示词
-- **衰减机制**：长期未引用的记忆逐渐降低权重，模拟人类遗忘曲线
-- **去重**：文本hash + embedding 余弦相似度双重去重
+- **双路检索**：语义检索（Qdrant）+ 关键词过滤，相关记忆自动注入本轮用户消息前缀
+- **衰减机制**：长期未引用的记忆逐渐降低权重；启动时与 HTTP cleanup 触发 `process_decay`
+- **去重**：文本 hash + embedding 余弦相似度双重去重
 
 **适用场景**：记住用户偏好、保存项目背景、跨会话知识继承。
 
@@ -507,7 +503,7 @@ MyClaw 的修复：
 | Edit | `Edit` | 是 | 800 | ❌ |
 | Calculator | `calculator` | 是 | 100 | ❌ |
 | Bash | `execute_command` | 否¹ | 3000 | 视窗口动态阈值而定 |
-| Memory | `memory` | 分动作 | 1000 | 写类动作 ❌ |
+| Memory | `memory_search` / `memory_add` | add 是 | 1000 / 200 | search ✅ / add ❌ |
 | WebSearch | `web_search` | 否 | 4000 | 视窗口动态阈值而定 |
 | WebFetch | `web_fetch` | 否 | 8000 | 视窗口动态阈值而定 |
 | RAG | `rag` | 分动作 | 5000 | 视窗口动态阈值而定 |

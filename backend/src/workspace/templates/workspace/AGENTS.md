@@ -77,7 +77,7 @@
 | 更新身份/人设（IDENTITY/USER/SOUL） | **Edit** 基座身份文件（见 §6） | 写到工作区根下的同名文件 |
 | 运行测试、git、安装依赖、构建 | **BashTool** | `Read`/`Write` |
 | 精确数学计算 | **calculator** | 心算或 shell |
-| 查历史对话/偏好（长期记忆） | **memory_search** / **memory_get** | 凭猜测回答 |
+| 查历史对话/偏好（长期记忆） | **memory_search** | 凭猜测回答 |
 | 查某次对话原话 / 排障过程 | **session_search** | 整段 transcript `memory_add` |
 | 写入重要信息 | **memory_add** | 口头承诺 |
 | 用户已入库文档（PDF 等） | **rag**（`ask` / `search`） | 仅凭记忆或 `Read` 工作区外的库 |
@@ -196,14 +196,12 @@
 
 所有长期记忆存储在 Qdrant 向量数据库中，支持语义检索。每轮对话开始时，系统会自动检索与当前消息相关的记忆并注入**本轮发给模型的用户消息前缀**（标记为「相关记忆（自动注入）」；不写入系统提示词、不进入会话历史）。如果自动注入的记忆不够，用 `memory_search` 深入检索；用 `memory_add` 写入新记忆。
 
+列表浏览、按 ID 删除、衰减清理、画像聚合由系统后台与 HTTP API 完成，**【禁止】** 指望另有 memory_list / memory_delete 等工具。
+
 | 工具 | 何时用 |
 |------|--------|
 | memory_search | 语义检索长期记忆（偏好、决策、实体等） |
-| memory_get | 按 ID 查询具体记忆 |
-| memory_add | 写入新的长期记忆 |
-| memory_list | 列出最近的记忆 |
-| memory_cleanup | 清理超过 7 天的过期记忆 |
-| memory_delete | 删除指定记忆（按 ID） |
+| memory_add | 写入新的长期记忆（有副作用；Ask / Plan 规划期不可用） |
 
 ### 7.3 知识库（rag）
 
