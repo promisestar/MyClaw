@@ -1,6 +1,6 @@
 # MyClaw
 
-基于 [Hello-Agents](https://github.com/hello-agents/hello-agents) 的个性化 AI Agent 应用，在 [HelloClaw](https://github.com/tino-chen/helloclaw) 能力之上扩展了 **多工作区、意图识别（Ask/Plan/Craft）、DAG 计划执行、用户画像、三通道回忆（长期记忆 + 跨会话原文检索）、RAG、MCP、Skill 自进化、子代理（SubAgent）、定时任务、文件上传、WebSocket 外部接入、多模态输入** 等能力。
+个性化 AI Agent 应用，实现了 **多工作区、意图识别（Ask/Plan/Craft）、DAG 计划执行、用户画像、三通道回忆（长期记忆 + 跨会话原文检索）、RAG、MCP、Skill 自进化、子代理（SubAgent）、定时任务、文件上传、WebSocket 外部接入、多模态输入** 等能力。
 
 ![](MyClaw.png)
 
