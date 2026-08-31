@@ -202,8 +202,8 @@ class TestCancellationToken(unittest.TestCase):
 
 class TestEvalScorerReadonly(unittest.TestCase):
     def test_ask_gate_detects_write(self):
-        from eval.harness.scorers import score_scenario
-        from eval.harness.types import Expectation, Scenario, StreamTrace
+        from evals.agent.harness.scorers import score_scenario
+        from evals.agent.harness.types import Expectation, Scenario, StreamTrace
 
         sc = Scenario(
             id="t",

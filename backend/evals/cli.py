@@ -1,4 +1,4 @@
-"""离线评测 CLI。"""
+"""MyClaw 统一评测 CLI。"""
 
 from __future__ import annotations
 
@@ -29,70 +29,104 @@ def _parse_ks(raw: str) -> List[int]:
     return [int(p) for p in parts]
 
 
+def _parse_ids(raw: str) -> Optional[List[str]]:
+    ids = [x.strip() for x in raw.split(",") if x.strip()]
+    return ids or None
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m evals",
-        description="MyClaw Memory / RAG offline retrieval evaluation",
+        description=(
+            "MyClaw 统一评测：Agent L2 场景（--channel agent）或 "
+            "Memory/RAG 离线检索（--channel memory|rag|rag_expanded|retrieval）"
+        ),
     )
     p.add_argument(
         "--channel",
-        choices=("memory", "rag", "rag_expanded", "all"),
-        default="all",
-        help="Which channel to evaluate",
+        choices=("agent", "memory", "rag", "rag_expanded", "retrieval", "all"),
+        default="retrieval",
+        help=(
+            "评测通道：agent=Agent L2 场景；memory/rag/rag_expanded=单通道检索；"
+            "retrieval/all=全部检索通道（默认 retrieval）"
+        ),
     )
-    p.add_argument(
+
+    # --- Agent L2 ---
+    agent = p.add_argument_group("Agent L2（--channel agent）")
+    agent.add_argument(
+        "--base-url",
+        default=None,
+        help="后端地址（默认 MYCLAW_EVAL_BASE_URL 或 http://127.0.0.1:8000）",
+    )
+    agent.add_argument("--suite", default="core", help="场景标签过滤，默认 core")
+    agent.add_argument(
+        "--ids",
+        default="",
+        help="逗号分隔场景 id，如 ask_readonly_gate,plan_generate",
+    )
+    agent.add_argument(
+        "--workspace",
+        default=None,
+        help="已授权工作区路径（建议指向 evals/agent/fixtures/mini_repo 副本）",
+    )
+
+    # --- Memory / RAG 检索 ---
+    retrieval = p.add_argument_group("Memory / RAG 检索")
+    retrieval.add_argument(
         "--ks",
         type=_parse_ks,
         default=[1, 3, 5, 10],
         help="Comma-separated K values for Hit/Recall/Precision (default: 1,3,5,10)",
     )
-    p.add_argument(
+    retrieval.add_argument(
         "--top-k",
         type=int,
         default=None,
         help="Retrieval limit (default: max(ks))",
     )
-    p.add_argument(
+    retrieval.add_argument(
         "--score-threshold",
         type=float,
         default=None,
         help="Similarity threshold. Memory default 0.3; RAG default None",
     )
-    p.add_argument(
+    retrieval.add_argument(
         "--enable-mqe",
         action="store_true",
         default=True,
         help="RAG expanded: enable MQE (default on for rag_expanded)",
     )
-    p.add_argument(
+    retrieval.add_argument(
         "--disable-mqe",
         dest="enable_mqe",
         action="store_false",
         help="RAG expanded: disable MQE",
     )
-    p.add_argument(
+    retrieval.add_argument(
         "--enable-hyde",
         action="store_true",
         default=True,
         help="RAG expanded: enable HyDE (default on for rag_expanded)",
     )
-    p.add_argument(
+    retrieval.add_argument(
         "--disable-hyde",
         dest="enable_hyde",
         action="store_false",
         help="RAG expanded: disable HyDE",
     )
-    p.add_argument(
+    retrieval.add_argument(
         "--mqe-expansions",
         type=int,
         default=2,
         help="RAG expanded: number of MQE extra queries",
     )
-    p.add_argument(
+    retrieval.add_argument(
         "--reseed",
         action="store_true",
         help="Clear eval collection/namespace and re-index corpus",
     )
+
     p.add_argument(
         "-v",
         "--verbose",
@@ -102,6 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _resolve_retrieval_channels(channel: str) -> List[str]:
+    if channel in ("retrieval", "all"):
+        return ["memory", "rag", "rag_expanded"]
+    return [channel]
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -109,7 +149,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    channels = ["memory", "rag", "rag_expanded"] if args.channel == "all" else [args.channel]
+    if args.channel == "agent":
+        import os
+
+        from .run_agent import run_agent_eval
+
+        ws = args.workspace or os.getenv("MYCLAW_EVAL_WORKSPACE") or None
+        try:
+            results = run_agent_eval(
+                base_url=args.base_url,
+                suite=args.suite,
+                ids=_parse_ids(args.ids),
+                workspace_path=ws,
+            )
+        except Exception as e:
+            logging.exception("agent eval failed: %s", e)
+            return 1
+        passed = sum(1 for r in results if r.hard_pass)
+        return 0 if passed == len(results) else 1
+
+    channels = _resolve_retrieval_channels(args.channel)
     exit_code = 0
 
     for ch in channels:

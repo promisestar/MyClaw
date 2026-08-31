@@ -1,7 +1,7 @@
 # MyClaw Agent 能力评测框架
 
 > 本文档依据当前仓库实现（`MyClawAgent.achat`、`EnhancedSimpleAgent.arun_stream_with_tools`、`ToolModeFilter`、`TodoScheduler`、`ContextGuard`、SSE `/api/chat/send/stream` 等）设计一套可落地的分层评测体系。  
-> 代码入口位于 `backend/eval/`，确定性单测位于 `backend/tests/eval/`。
+> 代码入口位于 `backend/evals/`（`python -m evals --channel agent`），确定性单测位于 `backend/tests/eval/`。
 
 ---
 
@@ -139,7 +139,7 @@ L1 可用 `@pytest.mark.tool`；依赖外部服务的用例用 `@pytest.mark.req
 
 ### L2 — Agent 端到端场景（需 LLM）
 
-**必须走 stream API**。每个场景是一份 YAML/JSON（见 `backend/eval/suites/scenarios/`），包含：
+**必须走 stream API**。每个场景是一份 YAML/JSON（见 `backend/evals/agent/suites/scenarios/`），包含：
 
 - `id` / `title` / `mode` / `plan_confirmed` / `message`
 - `workspace` 夹具说明
@@ -214,9 +214,9 @@ L1 可用 `@pytest.mark.tool`；依赖外部服务的用例用 `@pytest.mark.req
 评测 **禁止** 默认写真实业务仓库。推荐：
 
 ```
-backend/eval/fixtures/
+backend/evals/agent/fixtures/
   mini_repo/          # 含几个 .py / README / 样本 PDF
-  docs_kb/            # RAG 用短文档
+  docs_kb/            # RAG 用短文档（可选，检索评测见 evals/datasets/rag/）
 ```
 
 每次 L2 运行：
@@ -240,18 +240,22 @@ backend/eval/fixtures/
 
 ```
 backend/
-├── eval/
-│   ├── __init__.py
-│   ├── runner.py              # CLI：跑场景、汇总报告
-│   ├── harness/
-│   │   ├── sse_client.py      # 消费 /send/stream
-│   │   ├── scorers.py         # 门控/计划/工具序列断言
-│   │   └── types.py           # Scenario / CaseResult
-│   ├── suites/
-│   │   └── scenarios/*.yaml   # L2 场景定义
-│   └── fixtures/mini_repo/    # 最小夹具
+├── evals/
+│   ├── cli.py / __main__.py   # 统一 CLI：python -m evals --channel ...
+│   ├── run_agent.py           # Agent L2 场景
+│   ├── run_memory.py / run_rag.py / ...
+│   ├── agent/
+│   │   ├── harness/
+│   │   │   ├── sse_client.py      # 消费 /send/stream
+│   │   │   ├── scorers.py         # 门控/计划/工具序列断言
+│   │   │   └── types.py           # Scenario / CaseResult
+│   │   ├── suites/
+│   │   │   └── scenarios/*.yaml   # L2 场景定义
+│   │   └── fixtures/mini_repo/    # 最小夹具
+│   └── datasets/                  # Memory/RAG 检索标注
 ├── tests/
-│   └── eval/                  # L0/L1 pytest（CI）
+│   ├── eval/                  # L0/L1 Agent pytest（CI）
+│   └── evals/                 # 检索指标单测
 └── pyproject.toml             # pytest markers
 ```
 
@@ -261,11 +265,14 @@ backend/
 # L0/L1（CI）
 cd backend && uv run pytest tests/eval -q
 
-# L2（需已启动后端 + LLM）
-cd backend && uv run python -m eval.runner --suite core --base-url http://127.0.0.1:8000
+# L2 Agent（需已启动后端 + LLM）
+cd backend && uv run python -m evals --channel agent --suite core --base-url http://127.0.0.1:8000
 
 # 只跑门控红线场景
-uv run python -m eval.runner --ids ask_readonly_gate,plan_generate,bash_sandbox
+uv run python -m evals --channel agent --ids ask_readonly_gate,plan_generate,bash_sandbox
+
+# Memory/RAG 检索（需 Qdrant）
+uv run python -m evals --channel retrieval --reseed
 ```
 
 ---
@@ -318,5 +325,5 @@ uv run python -m eval.runner --ids ask_readonly_gate,plan_generate,bash_sandbox
 | Bash 沙箱 | `backend/src/tools/builtin/bash.py` |
 | 工具日志 | `backend/src/logging/tool_logger.py` / `api/tool_logs.py` |
 | 任务进度 | `backend/src/api/agent.py` |
-| 本评测包 | `backend/eval/` |
+| 本评测包 | `backend/evals/` |
 | L0 测试 | `backend/tests/eval/` |

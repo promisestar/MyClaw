@@ -1,35 +1,27 @@
-"""L2 评测运行器。
-
-用法（在 backend 目录）：
-
-    uv run python -m eval.runner --suite core
-    uv run python -m eval.runner --ids ask_readonly_gate,plan_generate
-    uv run python -m eval.runner --base-url http://127.0.0.1:8000 --report-dir ./eval_reports
-"""
+"""Agent L2 场景评测 runner（SSE + 硬断言）。"""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
+import logging
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-# 允许 `python -m eval.runner` 从 backend 根运行
-_BACKEND_ROOT = Path(__file__).resolve().parents[1]
-if str(_BACKEND_ROOT) not in sys.path:
-    sys.path.insert(0, str(_BACKEND_ROOT))
+from .agent.harness.scorers import score_scenario
+from .agent.harness.sse_client import run_chat_stream
+from .agent.harness.types import CaseResult, Scenario
+from .agent.suites import load_scenarios
+from .paths import AGENT_REPORTS_DIR, EVALS_ROOT
 
-from eval.harness.scorers import score_scenario  # noqa: E402
-from eval.harness.sse_client import run_chat_stream  # noqa: E402
-from eval.harness.types import CaseResult, Scenario  # noqa: E402
-from eval.suites import load_scenarios  # noqa: E402
+logger = logging.getLogger(__name__)
+
+_BACKEND_ROOT = EVALS_ROOT.parent
 
 
-async def run_suite(
+async def run_agent_suite(
     scenarios: List[Scenario],
     *,
     base_url: str,
@@ -91,13 +83,14 @@ async def run_suite(
     return results
 
 
-def write_report(results: List[CaseResult], report_dir: Path) -> Path:
+def write_agent_report(results: List[CaseResult], report_dir: Path) -> Path:
     report_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = report_dir / f"eval_report_{ts}.json"
+    path = report_dir / f"agent_{ts}.json"
     passed = sum(1 for r in results if r.hard_pass)
     payload = {
         "generated_at": ts,
+        "channel": "agent",
         "summary": {
             "total": len(results),
             "hard_pass": passed,
@@ -113,42 +106,30 @@ def write_report(results: List[CaseResult], report_dir: Path) -> Path:
     return path
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="MyClaw Agent L2 评测运行器")
-    parser.add_argument(
-        "--base-url",
-        default=os.getenv("MYCLAW_EVAL_BASE_URL", "http://127.0.0.1:8000"),
-    )
-    parser.add_argument("--suite", default="core", help="场景标签过滤，默认 core")
-    parser.add_argument("--ids", default="", help="逗号分隔场景 id")
-    parser.add_argument(
-        "--workspace",
-        default=os.getenv("MYCLAW_EVAL_WORKSPACE", ""),
-        help="已授权工作区路径（建议指向 eval/fixtures/mini_repo 副本）",
-    )
-    parser.add_argument(
-        "--report-dir",
-        default=os.getenv("MYCLAW_EVAL_REPORT_DIR", str(_BACKEND_ROOT / "eval_reports")),
-    )
-    args = parser.parse_args(argv)
+def run_agent_eval(
+    *,
+    base_url: Optional[str] = None,
+    suite: str = "core",
+    ids: Optional[List[str]] = None,
+    workspace_path: Optional[str] = None,
+    report_dir: Optional[Path] = None,
+) -> List[CaseResult]:
+    """运行 Agent L2 场景评测并写报告。"""
+    url = base_url or os.getenv("MYCLAW_EVAL_BASE_URL", "http://127.0.0.1:8000")
+    out_dir = report_dir or AGENT_REPORTS_DIR
 
-    ids = [x.strip() for x in args.ids.split(",") if x.strip()] or None
-    scenarios = load_scenarios(suite=args.suite, ids=ids)
+    scenarios = load_scenarios(suite=suite, ids=ids)
     if not scenarios:
-        print("没有匹配的场景", file=sys.stderr)
-        return 2
+        raise RuntimeError("没有匹配的场景")
 
-    print(f"Base URL: {args.base_url}")
+    print(f"Base URL: {url}")
     print(f"Scenarios ({len(scenarios)}): " + ", ".join(s.id for s in scenarios))
-    ws = args.workspace or None
 
-    results = asyncio.run(run_suite(scenarios, base_url=args.base_url, workspace_path=ws))
-    report_path = write_report(results, Path(args.report_dir))
+    results = asyncio.run(
+        run_agent_suite(scenarios, base_url=url, workspace_path=workspace_path)
+    )
+    report_path = write_agent_report(results, out_dir)
     passed = sum(1 for r in results if r.hard_pass)
     print(f"\nHard pass: {passed}/{len(results)}")
     print(f"Report: {report_path}")
-    return 0 if passed == len(results) else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    return results

@@ -1,5 +1,5 @@
 # MyClaw Agent L2 核心场景（与 suites._builtin_scenarios 对齐，便于人工编辑）
-# 运行：python -m eval.runner --suite core
+# 运行：python -m evals --channel agent --suite core
 # 需要：PyYAML（可选）；无则自动回退内置场景
 
 scenarios:
