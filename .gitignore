@@ -50,3 +50,7 @@ htmlcov/
 backend/memory/
 backend/skills/
 backend/tool-output/
+
+# Offline retrieval eval reports (keep .gitkeep)
+backend/evals/reports/*.json
+backend/evals/reports/*.md

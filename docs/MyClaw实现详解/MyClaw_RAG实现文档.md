@@ -706,3 +706,13 @@ knowledgeBaseApi.delete(sourcePath, namespace?)  // DELETE /api/knowledge-base/d
 | `frontend/src/router/index.ts` | 修改 | 新增 `/knowledge-base` 路由 |
 | `frontend/src/views/ChatView.vue` | 修改 | 监听 `doc` query 参数写入输入框 |
 
+---
+
+## 12. 离线检索评测
+
+向量检索召回（文档级 Hit@K / Recall@K / MRR）离线评测脚手架见：
+
+- [`backend/evals/README.md`](../../backend/evals/README.md)
+
+使用隔离 collection `helloclaw_eval_rag` + `rag_namespace=eval`，基线调用 `search_vectors`（不含 MQE/HyDE）。命令示例：`cd backend && python -m evals --channel rag --reseed`。
+

@@ -1,0 +1,28 @@
+{"query_id": "m001", "query": "我喜欢怎样的回复风格？", "relevant_keys": ["pref_brief"]}
+{"query_id": "m002", "query": "请用什么语言跟我说话？", "relevant_keys": ["pref_zh"]}
+{"query_id": "m003", "query": "写代码注释有什么偏好？", "relevant_keys": ["pref_code_comments"]}
+{"query_id": "m004", "query": "UI 主题偏好是什么？", "relevant_keys": ["pref_dark_theme"]}
+{"query_id": "m005", "query": "正式文档能不能用表情符号？", "relevant_keys": ["pref_no_emoji"]}
+{"query_id": "m006", "query": "用户叫什么名字？", "relevant_keys": ["entity_name"]}
+{"query_id": "m007", "query": "他住在哪座城市？", "relevant_keys": ["entity_city"]}
+{"query_id": "m008", "query": "在哪家公司做什么岗位？", "relevant_keys": ["entity_company"]}
+{"query_id": "m009", "query": "工作邮箱是多少？", "relevant_keys": ["entity_email"]}
+{"query_id": "m010", "query": "开发用什么操作系统电脑？", "relevant_keys": ["entity_laptop"]}
+{"query_id": "m011", "query": "向量数据库选了哪个？", "relevant_keys": ["decision_qdrant"]}
+{"query_id": "m012", "query": "后端框架技术栈是什么？", "relevant_keys": ["decision_python"]}
+{"query_id": "m013", "query": "Python 包管理用什么工具？", "relevant_keys": ["decision_uv"]}
+{"query_id": "m014", "query": "会不会用 MongoDB？", "relevant_keys": ["decision_no_mongo"]}
+{"query_id": "m015", "query": "本地 API 端口是多少？", "relevant_keys": ["fact_port"]}
+{"query_id": "m016", "query": "项目工作区路径在哪里？", "relevant_keys": ["fact_workspace"]}
+{"query_id": "m017", "query": "默认的 embedding 模型叫什么？", "relevant_keys": ["fact_embed_model"]}
+{"query_id": "m018", "query": "记忆自动注入一次拿几条？", "relevant_keys": ["fact_memory_topk"]}
+{"query_id": "m019", "query": "本周关于评测脚手架的计划是什么？", "relevant_keys": ["plan_eval"]}
+{"query_id": "m020", "query": "删除用户数据前要做什么？", "relevant_keys": ["rule_confirm_delete"]}
+{"query_id": "m021", "query": "密钥能不能提交到 git？", "relevant_keys": ["rule_no_secrets"]}
+{"query_id": "m022", "query": "谁是技术导师？", "relevant_keys": ["rel_mentor"]}
+{"query_id": "m023", "query": "前端是谁负责的？", "relevant_keys": ["rel_teammate"]}
+{"query_id": "m024", "query": "本地 Qdrant 地址通常是什么？", "relevant_keys": ["ref_qdrant_url"]}
+{"query_id": "m025", "query": "跨会话原文检索用什么技术？", "relevant_keys": ["decision_sqlite_session"]}
+{"query_id": "m026", "query": "用户时区是什么？", "relevant_keys": ["entity_timezone"]}
+{"query_id": "m027", "query": "关于回复风格和中文语言的偏好有哪些？", "relevant_keys": ["pref_brief", "pref_zh"]}
+{"query_id": "m028", "query": "后端技术选型和依赖管理决策是什么？", "relevant_keys": ["decision_python", "decision_uv"]}

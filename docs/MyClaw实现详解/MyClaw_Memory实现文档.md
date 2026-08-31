@@ -543,4 +543,16 @@ cd backend && python -m unittest tests.session_store.test_session_store -v
 
 ---
 
+---
+
+## 11. 离线检索评测
+
+Memory / RAG 向量检索的 Hit@K、Recall@K、MRR 等离线评测脚手架见：
+
+- [`backend/evals/README.md`](../../backend/evals/README.md)
+
+使用隔离 collection `helloclaw_eval_memory`，命令示例：`cd backend && python -m evals --channel memory --reseed`。
+
+---
+
 以上为当前 **Memory + Session Recall** 说明。若调整 `auto_inject*`、`session_recall.*`、`MEMORY_TRIGGERS`、`CATEGORY_DECAY_RATES`、`MEMORY_DEDUPE_THRESHOLD` 或工具参数，以对应源码为准。

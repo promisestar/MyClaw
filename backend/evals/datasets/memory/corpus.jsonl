@@ -1,0 +1,30 @@
+{"stable_key": "pref_brief", "content": "用户偏好简洁回复，避免冗长铺垫。", "category": "preference"}
+{"stable_key": "pref_zh", "content": "用户希望默认使用简体中文交流。", "category": "preference"}
+{"stable_key": "pref_code_comments", "content": "写代码时用户希望保留必要注释，但不要过度注释。", "category": "preference"}
+{"stable_key": "pref_dark_theme", "content": "用户界面偏好深色主题。", "category": "preference"}
+{"stable_key": "pref_no_emoji", "content": "用户不喜欢在正式文档里使用 emoji。", "category": "preference"}
+{"stable_key": "entity_name", "content": "用户姓名是张伟。", "category": "entity"}
+{"stable_key": "entity_city", "content": "用户居住在上海。", "category": "entity"}
+{"stable_key": "entity_company", "content": "用户就职于星云科技，担任后端工程师。", "category": "entity"}
+{"stable_key": "entity_email", "content": "用户工作邮箱是 zhangwei@xingyun.example。", "category": "entity"}
+{"stable_key": "entity_laptop", "content": "用户主力开发机器是 Windows 笔记本。", "category": "entity"}
+{"stable_key": "decision_qdrant", "content": "项目决定使用 Qdrant 作为向量数据库。", "category": "decision"}
+{"stable_key": "decision_python", "content": "后端技术栈选定 Python + FastAPI。", "category": "decision"}
+{"stable_key": "decision_uv", "content": "Python 依赖管理工具选用 uv。", "category": "decision"}
+{"stable_key": "decision_no_mongo", "content": "团队明确不使用 MongoDB，优先关系型或向量库。", "category": "decision"}
+{"stable_key": "fact_port", "content": "本地 API 默认监听端口是 8000。", "category": "fact"}
+{"stable_key": "fact_workspace", "content": "工作区路径示例为 G:/Agent/MyClaw。", "category": "fact"}
+{"stable_key": "fact_embed_model", "content": "默认 embedding 模型是 all-MiniLM-L6-v2。", "category": "fact"}
+{"stable_key": "fact_memory_topk", "content": "记忆自动注入默认 top_k 为 3。", "category": "fact"}
+{"stable_key": "plan_eval", "content": "计划为本周完成 Memory 与 RAG 离线检索评测脚手架。", "category": "plan"}
+{"stable_key": "plan_zh_embed", "content": "计划后续评估切换到中文友好 embedding 模型。", "category": "plan"}
+{"stable_key": "rule_confirm_delete", "content": "删除用户数据前必须二次确认。", "category": "rule"}
+{"stable_key": "rule_no_secrets", "content": "禁止把 API Key 写入仓库或日志。", "category": "rule"}
+{"stable_key": "rel_mentor", "content": "用户的技术导师是李明。", "category": "relationship"}
+{"stable_key": "rel_teammate", "content": "同事王芳负责前端界面。", "category": "relationship"}
+{"stable_key": "ref_docs", "content": "项目文档入口是 docs/MyClaw项目说明文档.md。", "category": "reference"}
+{"stable_key": "ref_qdrant_url", "content": "本地 Qdrant 通常使用 http://localhost:6333。", "category": "reference"}
+{"stable_key": "pref_tests", "content": "用户希望改动附带必要的单元测试。", "category": "preference"}
+{"stable_key": "fact_rag_ns", "content": "RAG 使用 rag_namespace 隔离不同知识库。", "category": "fact"}
+{"stable_key": "decision_sqlite_session", "content": "跨会话原文检索采用 SQLite FTS，而不是向量库。", "category": "decision"}
+{"stable_key": "entity_timezone", "content": "用户所在时区是 Asia/Shanghai。", "category": "entity"}

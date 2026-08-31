@@ -320,10 +320,7 @@ class RAGTool(Tool):
                 )
             elif action == "clear":
                 return _rag_response_from_text(
-                    self._clear_knowledge_base(
-                        confirm=parameters.get("confirm", False),
-                        namespace=parameters.get("namespace", "default"),
-                    )
+                    "⚠️ 清空功能已下线。如需重置知识库，请直接在 Qdrant 控制台/脚本中操作对应命名空间。"
                 )
             else:
                 return ToolResponse.error(
@@ -349,7 +346,7 @@ class RAGTool(Tool):
                     "ask=检索并由 LLM 生成综合答案(需 question，用户问资料内容时优先)；"
                     "search=仅返回原文片段与来源(需 query，不生成答案，用于核对引用)；"
                     "stats=查看分块数与管道状态(无副作用，无结果时先调用)；"
-                    "clear=永久清空命名空间(需 confirm=true，仅用户明确要求时)"
+                    "clear=已下线（请在 Qdrant 控制台手动重置命名空间）"
                 ),
                 required=True,
             ),
@@ -446,13 +443,6 @@ class RAGTool(Tool):
                 name="debug",
                 type="boolean",
                 description="ask 可选。是否在回答中展示检索、生成耗时与平均相似度，默认 false",
-                required=False,
-                default=False,
-            ),
-            ToolParameter(
-                name="confirm",
-                type="boolean",
-                description="clear 必填且须为 true。未传或为 false 时仅返回警告，不执行清空",
                 required=False,
                 default=False,
             ),
@@ -919,48 +909,6 @@ class RAGTool(Tool):
             avg_score=avg_score,
             debug=debug,
         )
-
-    @tool_action(
-        "rag_clear",
-        "永久清空指定命名空间全部向量数据（不可恢复）。"
-        "仅当用户明确要求删除/重置知识库时使用，且必须传 confirm=true。"
-        "默认勿调用；清空前可用 rag_stats 确认范围。",
-    )
-    def _clear_knowledge_base(self, confirm: bool = False, namespace: str = "default") -> str:
-        """清空知识库
-
-        Args:
-            confirm: 必须为 true 才会执行，否则仅返回警告
-            namespace: 要清空的命名空间，默认 default
-
-        Returns:
-            执行结果
-        """
-        try:
-            if not confirm:
-                return (
-                    "⚠️ 危险操作：清空知识库将删除所有数据！\n"
-                    "请使用 confirm=true 参数确认执行。"
-                )
-            
-            pipeline = self._get_pipeline(namespace)
-            store = pipeline.get("store")
-            namespace_id = pipeline.get("namespace", self.rag_namespace)
-            if store and hasattr(store, "clear_namespace"):
-                success = store.clear_namespace(namespace_id)
-            else:
-                success = store.clear_collection() if store else False
-            
-            if success:
-                # 清理该命名空间 pipeline 缓存，下次访问自动重建
-                self._pipelines.pop(namespace_id, None)
-                return f"✅ 知识库已成功清空（命名空间：{namespace_id}）"
-            else:
-                return "❌ 清空知识库失败"
-            
-        except Exception as e:
-            logger.exception("清空知识库失败")
-            return f"❌ 清空知识库失败: {str(e)}"
 
     @tool_action(
         "rag_stats",

@@ -1,0 +1,20 @@
+{"query_id": "r001", "query": "本地 Qdrant 默认监听哪个地址？", "relevant_docs": ["qdrant_ops.md"]}
+{"query_id": "r002", "query": "向量集合距离度量推荐用什么？", "relevant_docs": ["qdrant_ops.md"]}
+{"query_id": "r003", "query": "FastAPI 后端默认开发端口是多少？", "relevant_docs": ["fastapi_backend.md"]}
+{"query_id": "r004", "query": "后端依赖管理工具是什么？", "relevant_docs": ["fastapi_backend.md"]}
+{"query_id": "r005", "query": "默认 embedding 模型名称是什么？", "relevant_docs": ["embedding_models.md"]}
+{"query_id": "r006", "query": "中文检索可以考虑换成哪些 embedding？", "relevant_docs": ["embedding_models.md"]}
+{"query_id": "r007", "query": "记忆自动注入默认 top_k 是多少？", "relevant_docs": ["memory_channel.md"]}
+{"query_id": "r008", "query": "Memory 写入有哪些去重策略？", "relevant_docs": ["memory_channel.md"]}
+{"query_id": "r009", "query": "RAG 如何用命名空间隔离知识库？", "relevant_docs": ["rag_pipeline.md"]}
+{"query_id": "r010", "query": "RAG 基线检索函数是什么？", "relevant_docs": ["rag_pipeline.md"]}
+{"query_id": "r011", "query": "跨会话原文用什么索引技术？", "relevant_docs": ["session_recall.md"]}
+{"query_id": "r012", "query": "session_search 和 Memory 如何分工？", "relevant_docs": ["session_recall.md"]}
+{"query_id": "r013", "query": "用户画像聚合读取哪些记忆分类？", "relevant_docs": ["profile_agg.md"]}
+{"query_id": "r014", "query": "画像结果写到哪个文件？", "relevant_docs": ["profile_agg.md"]}
+{"query_id": "r015", "query": "ContextGuard 主要解决什么问题？", "relevant_docs": ["context_window.md"]}
+{"query_id": "r016", "query": "工具结果过长时上下文如何处理？", "relevant_docs": ["context_window.md"]}
+{"query_id": "r017", "query": "Memory 自动注入相似度阈值大概多少？", "relevant_docs": ["memory_channel.md"]}
+{"query_id": "r018", "query": "更换 embedding 后为什么要重建集合？", "relevant_docs": ["qdrant_ops.md", "embedding_models.md"]}
+{"query_id": "r019", "query": "rag_ask 和 rag_search 属于哪套能力？", "relevant_docs": ["rag_pipeline.md"]}
+{"query_id": "r020", "query": "为什么不要把完整对话 transcript 写进长期记忆？", "relevant_docs": ["session_recall.md"]}
