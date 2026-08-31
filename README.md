@@ -243,6 +243,7 @@ LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
 |------|------|
 | [docs/MyClaw项目说明文档.md](docs/MyClaw项目说明文档.md) | 产品总览：工作区、记忆、Skill 自进化、系统提示词等 |
 | [docs/MyClaw面试亮点详解.md](docs/MyClaw面试亮点详解.md) | 工程亮点（含 Skill 自进化、三通道回忆、提示词冻结） |
+| [docs/MyClaw_Agent能力评测框架.md](docs/MyClaw_Agent能力评测框架.md) | Agent 分层评测（门控/Plan/工具/SSE）；代码见 `backend/eval/` |
 | [docs/MyClaw实现详解/MyClaw_Memory实现文档.md](docs/MyClaw实现详解/MyClaw_Memory实现文档.md) | 长期记忆 + 跨会话 Session Recall |
 | [docs/MyClaw实现详解/MyClaw_SKILL实现文档.md](docs/MyClaw实现详解/MyClaw_SKILL实现文档.md) | Skill 加载、管理界面与自进化落地 |
 | [docs/MyClaw实现详解/MyClaw意图识别+用户画像.md](docs/MyClaw实现详解/MyClaw意图识别+用户画像.md) | Ask/Plan/Craft、Plan 两阶段、画像聚合 |

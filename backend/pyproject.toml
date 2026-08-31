@@ -50,3 +50,13 @@ packages = ["src"]
 
 [tool.hatch.build.targets.wheel.sources]
 "src" = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "eval: Agent capability evaluation (L0/L1)",
+    "tool: tool-contract tests (L1)",
+    "requires_llm: needs live LLM / running server (L2)",
+    "requires_qdrant: needs Qdrant / embedding stack",
+]
