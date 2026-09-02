@@ -11,14 +11,53 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .agent.harness.scorers import score_scenario
-from .agent.harness.sse_client import run_chat_stream
-from .agent.harness.types import CaseResult, Scenario
+from .agent.harness.sse_client import cancel_chat, run_chat_stream
+from .agent.harness.types import CaseResult, Scenario, StreamTrace
 from .agent.suites import load_scenarios
 from .paths import AGENT_REPORTS_DIR, EVALS_ROOT
 
 logger = logging.getLogger(__name__)
 
 _BACKEND_ROOT = EVALS_ROOT.parent
+
+
+async def _run_one(
+    sc: Scenario,
+    *,
+    base_url: str,
+    session_id: Optional[str],
+    workspace_path: Optional[str],
+) -> StreamTrace:
+    """执行单个场景；若配置了 cancel_after_s，则在 N 秒后触发取消。"""
+    stream_task = asyncio.create_task(
+        run_chat_stream(
+            base_url,
+            message=sc.message,
+            mode=sc.mode,
+            plan_confirmed=sc.plan_confirmed,
+            session_id=session_id,
+            skill=sc.skill,
+            workspace_path=workspace_path,
+            timeout_s=sc.timeout_s,
+        )
+    )
+    if not sc.cancel_after_s:
+        return await stream_task
+
+    async def _canceller() -> None:
+        await asyncio.sleep(sc.cancel_after_s)
+        try:
+            await cancel_chat(base_url)
+        except Exception as exc:  # noqa: BLE001 — 取消失败不该让场景崩掉
+            logger.warning("cancel 调用失败: %s", exc)
+
+    cancel_task = asyncio.create_task(_canceller())
+    try:
+        return await stream_task
+    finally:
+        # 流已结束则撤销取消，避免误伤下一个场景
+        if not cancel_task.done():
+            cancel_task.cancel()
 
 
 async def run_agent_suite(
@@ -50,15 +89,8 @@ async def run_agent_suite(
         ws = sc.workspace_path if sc.workspace_path is not None else workspace_path
 
         try:
-            trace = await run_chat_stream(
-                base_url,
-                message=sc.message,
-                mode=sc.mode,
-                plan_confirmed=sc.plan_confirmed,
-                session_id=sid,
-                skill=sc.skill,
-                workspace_path=ws,
-                timeout_s=sc.timeout_s,
+            trace = await _run_one(
+                sc, base_url=base_url, session_id=sid, workspace_path=ws
             )
         except Exception as exc:  # noqa: BLE001 — 评测需要吞掉并记失败
             results.append(

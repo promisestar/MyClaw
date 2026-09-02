@@ -1,7 +1,7 @@
 # MyClaw Agent 能力评测框架
 
-> 本文档依据当前仓库实现（`MyClawAgent.achat`、`EnhancedSimpleAgent.arun_stream_with_tools`、`ToolModeFilter`、`TodoScheduler`、`ContextGuard`、SSE `/api/chat/send/stream` 等）设计一套可落地的分层评测体系。  
-> 代码入口位于 `backend/evals/`（`python -m evals --channel agent`），确定性单测位于 `backend/tests/eval/`。
+> 本文档依据当前仓库实现（`MyClawAgent.achat`、`EnhancedSimpleAgent.arun_stream_with_tools`、`ToolModeFilter`、`TodoScheduler`、`ContextGuard`、SSE `/api/chat/send/stream`、`evals/agent/harness/{sse_client,scorers,tool_aliases}.py` 等）描述可落地的分层评测体系。  
+> 统一代码入口位于 `backend/evals/`（`python -m evals --channel ...`）：`--channel agent` 跑 Agent L2 场景（50 个 YAML 场景 → JSON 报告）；`--channel memory|rag|...` 跑 Memory/RAG **离线检索质量**评测。确定性单测位于 `backend/tests/eval/`（Agent 契约）与 `backend/tests/evals/`（检索指标 / SSE 分帧 / 工具别名）。
 
 ---
 
@@ -58,25 +58,32 @@ MyClaw 不是纯聊天机器人，而是带工具门控、两阶段规划、上�
 
 `write` / `Write` / `edit` / `Edit` / `bash` / `execute_command` / `automation` / `memory_add`
 
-> 注意：Bash 真实注册名为 **`execute_command`**（不是 `bash`）。`bash` 键为兼容保留。评测断言应使用真实注册名。
+> 注意：Bash 真实注册名为 **`execute_command`**（不是 `bash`）。`bash` 键为兼容保留；scorer 已做别名映射。
 
-### 2.4 真实工具注册名（评测用例必须用这些名字）
+### 2.4 工具名与 SSE 实际上报名
 
-| 类别 | 注册名 |
-|------|--------|
-| 文件 | `Read`, `Write`, `Edit` |
-| 检索 | `search_content`, `search_file`, `list_dir` |
-| Shell | `execute_command` |
-| 计算 | `python_calculator`（hello_agents CalculatorTool） |
-| 网络 | `web_search`, `web_fetch`, `http_request` |
-| 记忆 | `memory_search`, `memory_add`（Memory expandable 展开） |
-| 知识 | `rag`（`action=` 分发，默认不展开） |
-| 浏览器 | `browser` |
-| 定时 | `automation` |
-| 技能 | `Skill`, `skill_manage` |
-| MCP | `mcp` 或配置名；子工具 `mcp_{name}_*` |
-| 编排 | `subagent`, `task` |
-| 可选 | `session_search` |
+L2 场景的 `require_tools` / `require_any_tools` / `forbid_successful_tools` 写在 YAML 里，**scorer 会通过 `tool_aliases.py` 做别名对齐**，不必在场景里重复写 expandable 的 action 名。
+
+| 场景语义名（YAML 推荐） | SSE `tool_start.tool` 常见实际上报名 | 说明 |
+|------------------------|----------------------------------------|------|
+| 文件 | `Read`, `Write`, `Edit` | 大小写互通 |
+| 检索 | `search_content`, `search_file`, `list_dir` | 非 expandable |
+| Shell | `execute_command`（别名 `bash`） | |
+| 计算 | `python_calculator`（别名 `calculator`） | |
+| 网络搜索 | `web_search` | expandable action：**`search_web`** |
+| 网页抓取 | `web_fetch` | expandable action：**`fetch_url`** |
+| 记忆 | `memory` / `memory_search` / `memory_add` | Memory expandable 展开为后两者 |
+| 知识 | `rag` | 未展开时用父名；展开后为 `rag_search` / `rag_ask` 等 |
+| 浏览器 | `browser` | |
+| 定时 | `automation` | |
+| 技能 | `Skill`, `skill_manage` | |
+| MCP | `mcp` | 网关以 `config.json` 的 `mcp.servers[].name` 注册（如 **`github`**）；子工具为 **`mcp_{name}_*`** |
+| 编排 | `subagent`, `task` | |
+| 可选 | `session_search`, `http_request` | |
+
+别名映射实现：`backend/evals/agent/harness/tool_aliases.py`；打分入口：`scorers.py`。
+
+> **注意**：Bash 真实注册名为 **`execute_command`**（`bash` 为兼容保留）。规划 prompt 里的 `read`/`edit` 是文案，断言仍应对齐上表。
 
 ### 2.5 工程保护常量（来自实现）
 
@@ -91,14 +98,19 @@ MyClaw 不是纯聊天机器人，而是带工具门控、两阶段规划、上�
 
 ---
 
-## 3. 四层评测模型
+## 3. 四层评测模型（Agent）+ 检索离线轨
 
 ```
 L0  确定性单元评测     无 LLM，CI 必跑
 L1  工具契约评测       无/弱 LLM，直接调 Tool.run
-L2  Agent 场景评测     需 LLM + 服务，产出 pass@k / 门控通过率
+L2  Agent 场景评测     需 LLM + 后端；CLI 产出 JSON 报告（gate_pass_rate / avg_soft_score）
 L3  工程与回归观测     延迟、token、取消、工作区隔离、日志完整性
+
+R   Memory/RAG 离线检索   需 Qdrant + Embedding，不烧对话 LLM（扩展检索除外）
+    产出 Hit@K / Recall@K / Precision@K / MRR；与 L2 的 memory_roundtrip / rag_ask 互补
 ```
+
+说明：L2 里的 `memory_roundtrip`、`rag_ask` 测的是 **Agent 闭环是否调用工具并答出内容**；R 轨测的是 **同一套线上检索 API 在标注集上的召回与排序质量**。换 embedding、改阈值、开关 CrossEncoder / MQE / HyDE 时，应优先看 R 轨数字，而不是只靠人工试聊。
 
 ### L0 — 确定性单元（进 CI）
 
@@ -139,13 +151,127 @@ L1 可用 `@pytest.mark.tool`；依赖外部服务的用例用 `@pytest.mark.req
 
 ### L2 — Agent 端到端场景（需 LLM）
 
-**必须走 stream API**。每个场景是一份 YAML/JSON（见 `backend/evals/agent/suites/scenarios/`），包含：
+**必须走 stream API**（`POST /api/chat/send/stream`）。CLI 入口：`python -m evals --channel agent`（`run_agent.py`）。
 
-- `id` / `title` / `mode` / `plan_confirmed` / `message`
-- `workspace` 夹具说明
-- `expect`：事件序列约束、工具白/黑名单、最终状态断言
+#### 前置条件
+
+| 依赖 | 说明 |
+|------|------|
+| **后端已启动** | 默认 `http://127.0.0.1:8000`（`MYCLAW_EVAL_BASE_URL` / `--base-url`） |
+| **LLM 已配置** | 与线上一致（`LLM_*` / `config.json`） |
+| **工作区已授权** | 夹具复制到临时目录后，调用 `POST /api/workspace/authorize`（见 §5） |
+| **PyYAML** | `dev` 依赖组；缺失时回退 7 个内置兜底场景并 **stderr 告警** |
+
+**不依赖前端**：L2 只通过 HTTP SSE 调后端；前端 dev server 可选。
+
+#### 场景定义（YAML）
+
+每个场景位于 `backend/evals/agent/suites/scenarios/`（主文件 `core.yaml`，当前 **50 个**），字段包括：
+
+| 字段 | 含义 |
+|------|------|
+| `id` / `title` / `message` | 场景标识与用户消息 |
+| `mode` / `plan_confirmed` | Ask / Plan / Craft 及 Plan 确认态 |
+| `skill` | 可选，注入技能上下文 |
+| `reuse_session_from` | 复用上一场景的 `session_id`（如 `plan_confirm_exec`） |
+| `workspace_path` | 覆盖 CLI `--workspace`（少数场景用未授权路径测边界） |
+| `timeout_s` | 单场景 SSE 超时，默认 180s |
+| `cancel_after_s` | 流式开始 N 秒后自动 `POST /api/chat/cancel`（`cancel_mid_run`） |
+| `expect` | 硬断言，见下表 |
+| `tags` | 筛选标签；`core` 为默认 suite |
+
+**Expectation 断言字段**（`harness/types.py`）：
+
+| 字段 | 含义 |
+|------|------|
+| `require_events` | 必须出现的 SSE 事件名（如 `plan_generated`） |
+| `forbid_successful_tools` | 禁止「成功 finish」的工具（Ask/未确认 Plan 会自动合并只读副作用集） |
+| `require_tools` | 必须全部调用 |
+| `require_any_tools` | 至少调用其一（走工具别名） |
+| `plan_min_items` / `plan_max_items` | `plan_generated.plan` 条数区间 |
+| `result_contains_any` | `tool_finish.result` + `done.content` 应含子串 |
+| `error_contains_any` | SSE `error` 应含子串（如 `COMMAND_BLOCKED`） |
+| `min_done_chars` | `done.content` 最短长度（有 `plan_generated` 时可豁免） |
+| `expect_cancelled` | 必须收到 `cancelled` 事件 |
+
+#### 运行链路
+
+```
+load_scenarios(suite, ids)
+  → 对每个 Scenario：
+      run_chat_stream(POST /api/chat/send/stream, workspace_path=...)
+        → sse_client 解析 SSE（兼容 \r\n\r\n 与 \n\n）
+        → 汇总 StreamTrace（events / tools / plan / done_content / errors）
+      score_scenario(scenario, trace)  → CaseResult
+  → write_agent_report → evals/reports/agent_<UTC>.json
+```
+
+- **工作区绑定**：请求体 `workspace_path` 触发 `agent.bind_workspace`；未授权则 SSE `error` 并结束。
+- **会话复用**：`reuse_session_from` 由 runner 维护 `session_map`，供 Plan 确认、跨会话记忆等场景串联。
+- **取消场景**：`cancel_after_s` 在独立 asyncio 任务中调用 `/api/chat/cancel`，与主流并行。
+
+#### 终端输出与报告
+
+运行中每个场景即时打印：
+
+```text
+[PASS] ask_readonly_gate — Ask 模式不得成功执行写工具
+[FAIL] craft_edit_file — Craft 修改夹具文件
+    ! 未调用任一期望工具: Read, Edit, Write
+```
+
+结束后：
+
+```text
+Hard pass: 40/50
+Report: .../evals/reports/agent_20260902T020445Z.json
+```
+
+**Agent L2 只产出 JSON**（无 Markdown 副产物）。结构：
+
+```json
+{
+  "generated_at": "20260902T020445Z",
+  "channel": "agent",
+  "summary": {
+    "total": 50,
+    "hard_pass": 40,
+    "hard_fail": 10,
+    "gate_pass_rate": 0.8,
+    "avg_soft_score": 0.94
+  },
+  "results": [
+    {
+      "id": "ask_readonly_gate",
+      "title": "...",
+      "hard_pass": true,
+      "soft_score": 1.0,
+      "violations": [],
+      "metrics": {
+        "latency_ms": 13072.3,
+        "tool_calls": 1,
+        "tools": ["Read"],
+        "events": ["session", "step_start", "chunk", "tool_start", "tool_finish", "done"],
+        "chunk_chars": 1234,
+        "plan_items": 0,
+        "context_usage": { "...": "..." }
+      },
+      "session_id": "s-20260902-..."
+    }
+  ]
+}
+```
+
+- **退出码**：全部 `hard_pass` → `0`，否则 `1`（适合 CI 红线，但 L2 通常按需手动跑）。
+- **`CaseResult.to_dict()` 不含原始 `StreamTrace`**（仅 `metrics` 摘要）；完整事件序列在 `metrics.events` / `metrics.tools`。
 
 #### 核心场景清单
+
+> 下表是设计时的最小清单。`backend/evals/agent/suites/scenarios/core.yaml` 已扩展为 **50 个**
+> 端到端场景（Ask 只读门控 8 / Plan 两阶段 5 / Craft 文件与代码 9 / Bash 安全 4 /
+> 工作区边界 3 / 记忆与跨会话 4 / RAG 3 / 任务与编排 4 / 联网与浏览器 5 / 技能与 MCP 3 /
+> 健壮性 2），并新增 `cancel_after_s` 字段支持「长任务中途取消」场景。
+> 场景定义以 YAML 为准，分组与运行方式见 `backend/evals/README.md`。
 
 | ID | 模式 | 目标 | 硬断言（pass/fail） | 软指标 |
 |----|------|------|---------------------|--------|
@@ -167,35 +293,45 @@ L1 可用 `@pytest.mark.tool`；依赖外部服务的用例用 `@pytest.mark.req
 
 #### 评分方式
 
-每个场景输出：
+**hard_pass** 与 **soft_score 共用同一套 `violations` 列表**（`scorers.py`），区别仅在于如何解读：
+
+| 指标 | 规则 | 用途 |
+|------|------|------|
+| **hard_pass** | `violations` 为空 → `true` | 回归红线、CLI 退出码 |
+| **soft_score** | 无违规 → `1.0`；否则 `max(0, 1.0 − 0.2 × 违规条数)` | 周报趋势；**当前未接入 LLM-as-judge** |
+
+违规项示例：缺少 `plan_generated`、只读模式下副作用工具成功 finish、未调用期望工具、`done.content` 过短、`result_contains_any` 未命中、非预期 `SSE error` 等。
+
+单场景结果字段（写入报告 `results[]`）：
 
 ```json
 {
   "id": "ask_readonly_gate",
   "hard_pass": true,
-  "soft_score": 0.8,
+  "soft_score": 1.0,
+  "violations": [],
   "metrics": {
     "latency_ms": 12345,
     "tool_calls": 2,
-    "steps": 3,
-    "tokens_estimate": null
+    "tools": ["Read"],
+    "events": ["session", "step_start", "chunk", "tool_start", "tool_finish", "done"],
+    "chunk_chars": 800,
+    "plan_items": 0
   },
-  "violations": [],
-  "trace_id": "a1b2c3d4",
-  "session_id": "deadbeef"
+  "session_id": "s-..."
 }
 ```
 
-- **hard_pass**：工程门控与契约，失败即场景失败（适合回归红线）。
-- **soft_score**：任务完成质量，可用规则打分或 LLM-as-judge；不进 CI 门禁，进周报。
-
 建议周报聚合：
 
-- 门控通过率 = hard_pass 场景数 / 总场景数  
-- 任务成功率 = soft_score ≥ 阈值 的比例  
-- Ask 违规写工具率（应为 0）  
-- Plan 解析成功率  
-- p50/p95 端到端延迟、平均工具调用次数
+- **门控通过率** = `summary.gate_pass_rate`（= hard_pass / total）
+- **平均软分** = `summary.avg_soft_score`
+- **任务成功率（可选）** = soft_score ≥ 阈值（如 0.8）的场景占比
+- Ask 违规写工具率、Plan 解析成功率（按 tag 过滤）
+- p50/p95 延迟：由 `metrics.latency_ms` 离线统计
+- 平均工具调用次数：`metrics.tool_calls` 均值
+
+> **规划中的增强**：LLM-as-judge 评回答正确性/任务完成度（文档原 P2 项），与当前规则 soft_score 互补，尚未实现。
 
 ### L3 — 工程与观测
 
@@ -209,75 +345,284 @@ L1 可用 `@pytest.mark.tool`；依赖外部服务的用例用 `@pytest.mark.req
 
 ---
 
-## 4. 夹具与环境隔离
+## 4. Memory 与 RAG 离线检索评测（R 轨）
+
+本节说明如何用统一 CLI 定量评估 **向量检索召回质量**：给定 query，相关记忆或文档是否出现在 top-K、排序是否合理。实现与脚手架细节见 `backend/evals/README.md`；能力本身见 [MyClaw_Memory实现文档](MyClaw实现详解/MyClaw_Memory实现文档.md)、[MyClaw_RAG实现文档](MyClaw实现详解/MyClaw_RAG实现文档.md)。
+
+### 4.1 评测目标与边界
+
+| 评什么 | 不评什么 |
+|--------|----------|
+| Memory：`search_memories` 的 Hit/Recall/MRR（可选 CrossEncoder 重排） | 端到端问答正确率、LLM 是否「用上」记忆 |
+| RAG：`search_vectors` / `search_vectors_expanded` 的文档级命中 | Session Recall（SQLite FTS）、画像 `query=category` 路径 |
+| 换 embedding、阈值、`MEMORY_RERANK_*`、MQE/HyDE 的相对对比 | 生产 collection 内容（评测写入隔离库） |
+
+脚手架 **只调用检索 API**，不修改 Agent 主对话链路；退出码在指标算完后即为 `0`（**不设 CI 通过线**），异常（Qdrant/embedding 不可用）为 `1`。
+
+### 4.2 通道一览（`--channel`）
+
+| 通道 | 调用路径 | 用途 |
+|------|----------|------|
+| `memory` | `MemoryVectorStore.search_memories(..., enable_rerank=False)` | Memory **纯向量**基线 |
+| `memory_reranked` | 同上，`enable_rerank=True`，先取 `candidate_k` 再 CrossEncoder 截断到 `top_k` | 与基线 **A/B**，验证重排是否提升排序 |
+| `rag` | `search_vectors` | RAG 基线检索 |
+| `rag_expanded` | `search_vectors_expanded`（可 `--disable-mqe` / `--disable-hyde`） | MQE / HyDE / 重排一体的扩展检索 |
+| `retrieval` / `all` | 依次：`memory` → `memory_reranked` → `rag` → `rag_expanded` | 全通道；Memory 两通道共用 collection，**内部只 seed 一次** |
+
+Agent L2 仍用 `--channel agent`（见第 3 节），与 R 轨互不替代。
+
+### 4.3 环境与隔离写入
+
+在 `backend` 目录运行；CLI 会 `load_dotenv(backend/.env)`。
+
+| 依赖 | 说明 |
+|------|------|
+| Qdrant | 与线上一致的 `QDRANT_URL` / `QDRANT_API_KEY` 等 |
+| Embedding | `src.rag.embedding` 单例（`EMBED_MODEL_*`） |
+| 重排（可选） | `RERANK_ENABLED`、`RERANK_MODEL_NAME`（默认 `BAAI/bge-reranker-base`）；Memory 线上开关另见 `MEMORY_RERANK_ENABLED` / `MEMORY_RERANK_CANDIDATE_K` |
+
+**不会清空生产库**：评测写入独立 collection / namespace。
+
+| 通道 | Collection | 其它 |
+|------|------------|------|
+| `memory` / `memory_reranked` | `helloclaw_eval_memory` | `source=eval`；id 映射 `evals/reports/memory_id_map.json` |
+| `rag` / `rag_expanded` | `helloclaw_eval_rag` | `rag_namespace=eval` |
+
+对比 Memory 有无重排时：第一次可加 `--reseed`，第二次 **不要**再 `--reseed`，保证同一语料、同一 id map。
+
+### 4.4 指标定义
+
+对每条 query，设相关集合为 \(R\)，检索返回有序 ID 列表（截断到检索 `limit`，再按各 K 切片）：
+
+| 指标 | 含义 |
+|------|------|
+| **Hit@K** | top-K 是否至少命中一个相关项（0/1） |
+| **Recall@K** | top-K 命中相关项数 / \|R\| |
+| **Precision@K** | top-K 命中相关项数 / K |
+| **MRR** | 第一个相关项秩次的倒数；未命中为 0 |
+
+报告中的 `mean_*` 为各 query **宏平均**。默认 \(K \in \{1,3,5,10\}\)，检索 `limit` 默认为 \(\max(K)\)。
+
+与线上行为的对照建议：
+
+- Memory **自动注入**默认 `top_k=3`、阈值约 `0.3` → 重点看报告里的 **Hit@3 / Recall@3 / MRR**。
+- 工具 `memory_search` 常用更大 top_k → 可对照 Hit@5 / Hit@10。
+- **重排**主要改善排序：优先看 MRR、Hit@1；若 Hit@10 几乎不变而小 K 下降，往往是重排模型把相关项挤出前列（换中文友好 reranker 或关重排），而不是「没召回」。
+
+### 4.5 标注集约定
+
+#### Memory（`evals/datasets/memory/`）
+
+| 文件 | 约定 |
+|------|------|
+| `corpus.jsonl` | 每行：`stable_key`、`content`、`category` |
+| `queries.jsonl` | 每行：`query`、`relevant_keys`（可选 `category`、`query_id`） |
+
+Seed 时 `add_memory` 得到的真实 `memory_id` 写入 `memory_id_map.json`；评测把 `relevant_keys` 解析成 ID 再与检索结果比对。增补流程：加语料 → 改/加查询 → `--reseed`。
+
+#### RAG（`evals/datasets/rag/`）
+
+| 文件 | 约定 |
+|------|------|
+| `corpus/*.md` | 主题分明的短文档 |
+| `queries.jsonl` | `relevant_docs` 填文件名（如 `qdrant_ops.md`） |
+
+**命中单位为文档级**：chunk 命中后按 `source_path` 归一化为 basename，再与标注比对，切块参数变化时标注仍可用。增补流程：新增 `.md` → 写相关查询 → `--reseed`。
+
+### 4.6 推荐命令
+
+```bash
+cd backend
+
+# 指标纯函数单测（不连 Qdrant）
+uv run pytest tests/evals/test_metrics.py -q
+
+# ---------- Memory：纯向量 vs 重排 A/B ----------
+uv run python -m evals --channel memory --reseed --ks 1,3,5,10 --top-k 10 --score-threshold 0.3
+uv run python -m evals --channel memory_reranked --ks 1,3,5,10 --top-k 10 --candidate-k 20
+# 对比 reports/memory_*.md 与 memory_reranked_*.md
+
+# ---------- RAG：基线 vs 扩展检索 ----------
+uv run python -m evals --channel rag --reseed --ks 1,3,5,10
+uv run python -m evals --channel rag_expanded --reseed
+uv run python -m evals --channel rag_expanded --disable-mqe --disable-hyde   # 仅扩检索路径中的重排等
+
+# ---------- 一次跑齐全部检索通道 ----------
+uv run python -m evals --channel retrieval --reseed
+```
+
+stdout 会打印各通道摘要，例如：
+
+```text
+[memory] queries=28 MRR=0.5137 Hit@3=0.6071 Recall@5=0.6607
+[memory_reranked] queries=28 MRR=... Hit@3=... Recall@5=...
+```
+
+详细 JSON/Markdown 落在 `backend/evals/reports/{channel}_{timestamp}.*`。
+
+### 4.7 常用 CLI 参数（检索）
+
+| 参数 | 说明 |
+|------|------|
+| `--channel` | 见 §4.2 |
+| `--ks` | 逗号分隔 K，默认 `1,3,5,10` |
+| `--top-k` | 检索 limit，默认 `max(ks)` |
+| `--score-threshold` | Memory 默认 `0.3`；RAG 默认 `None`（可用 CLI 覆盖） |
+| `--candidate-k` | 仅 `memory_reranked`：重排前向量候选池 |
+| `--reseed` | 清空评测 collection/namespace 并重建语料 |
+| `--enable-mqe` / `--disable-mqe` | `rag_expanded` |
+| `--enable-hyde` / `--disable-hyde` | `rag_expanded` |
+| `--mqe-expansions` | MQE 额外查询条数 |
+| `-v` | Debug 日志 |
+
+评测里 Memory 的 `enable_rerank` **由通道强制指定**，不受线上 `MEMORY_RERANK_ENABLED` 干扰，以便公平对比。线上 Agent/工具是否重排仍由 `MEMORY_RERANK_ENABLED`（及全局 `RERANK_*`）控制。
+
+### 4.8 已知局限
+
+1. **合成集规模小**：适合冒烟与相对对比（换模型、改阈值、开关重排），不能替代大规模人工标注。  
+2. **中文 + 弱 embedding / 弱 reranker**：绝对分数可能偏低；英文 MS MARCO 类 CrossEncoder 曾在 Memory 上把相关项挤出前列——默认已改为 `BAAI/bge-reranker-base`，换模后应重新跑 `memory` vs `memory_reranked`。  
+3. **RAG 文档级折叠**：同一文档多 chunk 折成一个文档键；Precision@K 分母仍是 K。  
+4. **检索会触发 Memory 访问强化**：仅作用于评测 collection。  
+5. **与 L2 场景分工**：要验证「对话里是否真的记住/答对」，仍需 L2 的 `memory_roundtrip` / `rag_ask`（或人工），不能只看 R 轨。
+
+---
+
+## 5. 夹具与环境隔离
 
 评测 **禁止** 默认写真实业务仓库。推荐：
 
 ```
 backend/evals/agent/fixtures/
-  mini_repo/          # 含几个 .py / README / 样本 PDF
-  docs_kb/            # RAG 用短文档（可选，检索评测见 evals/datasets/rag/）
+  mini_repo/          # L2 主夹具：sample_app.py、src/utils.py、config/、data/、docs/、notes/、README.md
+  docs_kb/            # 可选；RAG 离线检索语料见 evals/datasets/rag/
 ```
 
-每次 L2 运行：
+### L2 标准流程
 
-1. 复制 fixtures 到 `tempfile` 工作区  
-2. 通过 API `authorize` + `workspace_path` 绑定  
-3. 使用独立 `session_id`  
-4. 可选：将 `TOOL_LOG_DIR`、home 指向临时目录，避免污染 `~/.helloclaw`
+1. **复制夹具**到临时目录（勿直接在 fixtures 目录上跑，避免污染 git 夹具）：
 
-环境变量：
+```bash
+# Windows（PowerShell）
+xcopy /E /I evals\agent\fixtures\mini_repo $env:TEMP\myclaw_eval_ws
+
+# Linux / macOS
+cp -r evals/agent/fixtures/mini_repo /tmp/myclaw_eval_ws
+```
+
+2. **启动后端**（另开终端）：
+
+```bash
+cd backend
+uv run uvicorn src.main:app --reload --port 8000
+```
+
+3. **API 授权工作区**（必须；白名单写入 `~/.helloclaw/workspaces.json`）：
+
+```bash
+# PowerShell
+Invoke-RestMethod -Method POST `
+  -Uri "http://127.0.0.1:8000/api/workspace/authorize" `
+  -ContentType "application/json" `
+  -Body (@{ path = "$env:TEMP\myclaw_eval_ws" } | ConvertTo-Json)
+
+# curl（Windows 请用 curl.exe，JSON 路径用绝对路径）
+curl.exe -X POST "http://127.0.0.1:8000/api/workspace/authorize" \
+  -H "Content-Type: application/json" \
+  -d "{\"path\": \"C:\\\\Users\\\\YOU\\\\AppData\\\\Local\\\\Temp\\\\myclaw_eval_ws\"}"
+```
+
+成功响应：`{"status":"ok","workspace":"<绝对路径>"}`。可选 `GET /api/workspace/list` 验证。
+
+4. **跑 L2**（`--workspace` 指向同一路径；PowerShell 用 `"$env:TEMP\myclaw_eval_ws"`，勿写 `%TEMP%`）：
+
+```bash
+uv run python -m evals --channel agent --suite core --workspace "$env:TEMP\myclaw_eval_ws"
+
+# 冒烟：3 个红线场景
+uv run python -m evals --channel agent --ids ask_readonly_gate,plan_generate,bash_sandbox --workspace "$env:TEMP\myclaw_eval_ws"
+```
+
+5. 使用独立 `session_id`（默认每条场景新建；`reuse_session_from` 场景除外）。
+6. 可选：将 `TOOL_LOG_DIR`、home 指向临时目录，避免污染 `~/.helloclaw`。
+
+### 环境变量
 
 | 变量 | 用途 |
 |------|------|
 | `MYCLAW_EVAL_BASE_URL` | 默认 `http://127.0.0.1:8000` |
-| `MYCLAW_EVAL_REPORT_DIR` | 报告输出目录 |
+| `MYCLAW_EVAL_REPORT_DIR` | 报告目录，默认 `backend/evals/reports/` |
+| `MYCLAW_EVAL_WORKSPACE` | 等价于 CLI `--workspace`（未传参时） |
 | `LLM_*` / `config.json` | 与日常一致；评测注明所用模型 |
+| `QDRANT_*` / `EMBED_*` / `RERANK_*` | R 轨检索与重排（见 §4.3） |
+| `MEMORY_RERANK_ENABLED` / `MEMORY_RERANK_CANDIDATE_K` | 线上 Memory 是否重排（R 轨 A/B 不依赖此开关） |
 
 ---
 
-## 5. 代码布局
+## 6. 代码布局
 
 ```
 backend/
 ├── evals/
 │   ├── cli.py / __main__.py   # 统一 CLI：python -m evals --channel ...
-│   ├── run_agent.py           # Agent L2 场景
-│   ├── run_memory.py / run_rag.py / ...
+│   ├── run_agent.py           # Agent L2：SSE 调用、cancel、写 JSON 报告
+│   ├── run_memory.py          # Memory / Memory 重排
+│   ├── run_rag.py / run_rag_expanded.py
+│   ├── metrics.py / schema.py / io_utils.py / paths.py
 │   ├── agent/
 │   │   ├── harness/
-│   │   │   ├── sse_client.py      # 消费 /send/stream
-│   │   │   ├── scorers.py         # 门控/计划/工具序列断言
-│   │   │   └── types.py           # Scenario / CaseResult
+│   │   │   ├── sse_client.py      # 消费 /send/stream（兼容 sse-starlette \r\n\r\n）
+│   │   │   ├── scorers.py         # 硬断言 + soft_score 规则扣分
+│   │   │   ├── tool_aliases.py    # 工具名 ↔ SSE 实际上报名
+│   │   │   └── types.py           # Scenario / Expectation / StreamTrace / CaseResult
 │   │   ├── suites/
-│   │   │   └── scenarios/*.yaml   # L2 场景定义
+│   │   │   ├── __init__.py        # load_scenarios；YAML 失败时 7 场景兜底
+│   │   │   └── scenarios/*.yaml   # L2 场景（core.yaml = 50 个）
 │   │   └── fixtures/mini_repo/    # 最小夹具
-│   └── datasets/                  # Memory/RAG 检索标注
+│   ├── datasets/
+│   │   ├── memory/                # corpus.jsonl + queries.jsonl
+│   │   └── rag/                   # corpus/*.md + queries.jsonl
+│   └── reports/                   # 运行产物（gitignore）
 ├── tests/
 │   ├── eval/                  # L0/L1 Agent pytest（CI）
-│   └── evals/                 # 检索指标单测
-└── pyproject.toml             # pytest markers
+│   └── evals/                 # 检索指标 + SSE/别名单测
+│       ├── test_metrics.py
+│       ├── test_sse_client.py
+│       └── test_tool_aliases.py
+└── pyproject.toml             # pytest markers；dev 依赖含 PyYAML
 ```
 
 常用命令：
 
 ```bash
-# L0/L1（CI）
-cd backend && uv run pytest tests/eval -q
+# L0/L1 + 评测脚手架单测（CI）
+cd backend && uv run pytest tests/eval tests/evals -q
 
-# L2 Agent（需已启动后端 + LLM）
-cd backend && uv run python -m evals --channel agent --suite core --base-url http://127.0.0.1:8000
+# L2 Agent（需已启动后端 + LLM + 已授权工作区）
+cd backend && uv run python -m evals --channel agent --suite core \
+  --workspace "$env:TEMP/myclaw_eval_ws"
 
 # 只跑门控红线场景
-uv run python -m evals --channel agent --ids ask_readonly_gate,plan_generate,bash_sandbox
+uv run python -m evals --channel agent \
+  --ids ask_readonly_gate,plan_generate,bash_sandbox \
+  --workspace "$env:TEMP/myclaw_eval_ws"
 
-# Memory/RAG 检索（需 Qdrant）
+# Memory/RAG 检索（需 Qdrant）；详见第 4 节
+uv run python -m evals --channel memory --reseed
+uv run python -m evals --channel memory_reranked --candidate-k 20
+uv run python -m evals --channel rag --reseed
 uv run python -m evals --channel retrieval --reseed
 ```
 
+| CLI 参数（`--channel agent`） | 说明 |
+|-------------------------------|------|
+| `--base-url` | 后端地址，默认 `MYCLAW_EVAL_BASE_URL` 或 `http://127.0.0.1:8000` |
+| `--suite` | 按 tag 过滤，默认 `core` |
+| `--ids` | 逗号分隔场景 id，优先级高于 `--suite` |
+| `--workspace` | 已授权工作区绝对路径 |
+
 ---
 
-## 6. 与面试/研发叙事的对应关系
+## 7. 与面试/研发叙事的对应关系
 
 评测框架本身也能说明工程成熟度：你不是「测模型答得漂不漂亮」，而是在测：
 
@@ -285,34 +630,42 @@ uv run python -m evals --channel retrieval --reseed
 2. **计划机正确性**（解析 → 暂存 → 确认 → 清理）  
 3. **运行时保护**（去重、限量、重试、取消、沙箱）  
 4. **上下文治理**（Guard 委托边界）  
-5. **可观测性**（SSE + tool_logs + task-progress）
+5. **可观测性**（SSE + tool_logs + task-progress）  
+6. **记忆与知识召回质量**（隔离 collection 上的 Hit@K / MRR，以及重排 / MQE / HyDE 的相对增益）
 
 这些正是 `docs/MyClaw面试亮点详解.md` 中多数亮点的可验证版本。
 
 ---
 
-## 7. 落地节奏建议
+## 8. 落地节奏建议
 
-| 阶段 | 内容 | 产出 |
-|------|------|------|
-| P0（1–2 天） | L0 单测全绿进 CI；SSE client + 3 个红线场景（ask 门控 / plan 生成 / bash 拦截） | pytest + 首份 JSON 报告 |
-| P1 | 补 craft 改文件、workspace 隔离、cancel；固定 fixtures | 每周 soft_score 趋势 |
-| P2 | SubAgent / Memory / RAG / Skill / 多模态；LLM-as-judge | 能力矩阵看板 |
-| P3 | mock LLM 路径覆盖 dedup/limit/retry（不烧 token） | 纯工程回归套件 |
+| 阶段 | 内容 | 状态 / 产出 |
+|------|------|-------------|
+| **P0** | L0 单测进 CI；SSE client（`\r\n\r\n` 分帧）；50 场景 YAML；JSON 报告 + 退出码 | ✅ 已落地 |
+| **P1** | 工具别名 scorer；`cancel_after_s`；fixtures + 工作区授权流程；Memory/RAG `--reseed` 基线 | ✅ 大部分已落地 |
+| **P2** | LLM-as-judge soft 分；能力矩阵看板；多模态 attachments 场景 | 进行中 / 待做 |
+| **P3** | mock LLM 覆盖 dedup/limit/retry（不烧 token） | 待做 |
+
+当前典型一次全量 L2（50 场景）在本地约 **数十分钟级**（取决于 LLM 与联网/MCP 场景），门控通过率以 `gate_pass_rate` 为准（示例：`0.8` = 40/50 hard_pass）。
 
 ---
 
-## 8. 已知实现差异（写用例时务必注意）
+## 9. 已知实现差异（写用例时务必注意）
 
 1. **`/send/sync` 不传 `mode`/`plan_confirmed`**：模式相关评测只用 stream 或直接 `achat`。  
-2. **工具大小写**：文件工具为 `Read`/`Write`/`Edit`；规划示例里的 `read`/`edit` 是 prompt 文案，断言应用真实注册名。  
-3. **`SIDE_EFFECT_TOOLS` 含 `bash` 与 `execute_command`**：运行时以 `execute_command` 为准。  
-4. **Plan 解析失败会发 `error` 并 return**：场景应区分「模型没产出 JSON」与「框架解析 bug」——可用固定 mock 文本单测后者。  
-5. **Calculator 注册名是 `python_calculator`**，且被标为有副作用（禁止委托），不要写成 `calculator` 去对 tool_start（ContextGuard 的 `NO_DELEGATE` 仍可能写 `calculator` 兼容名）。
+2. **工具大小写**：文件工具为 `Read`/`Write`/`Edit`；scorer 已做大小写别名。  
+3. **Expandable 工具 SSE 名 ≠ 父工具名**：如 `web_search` → `search_web`，`web_fetch` → `fetch_url`；YAML 写语义名即可，由 `tool_aliases.py` 对齐。  
+4. **MCP**：网关以 `mcp.servers[].name` 注册（如 `github`）；断言 `mcp` 时会认可 `mcp_*` 与常见网关名。非常规 server 名需在 `_MCP_GATEWAY_NAMES` 补充。  
+5. **`SIDE_EFFECT_TOOLS` 含 `bash` 与 `execute_command`**：运行时以 `execute_command` 为准。  
+6. **Plan 解析失败会发 `error`**：计入 `violations`（若无 `error_contains_any` 豁免）。  
+7. **SSE 分帧**：后端 `sse-starlette` 使用 `\r\n\r\n` 分隔事件；`sse_client.py` 须同时支持 `\r\n\r\n` 与 `\n\n`，否则会出现「HTTP 200 但 done/content/tools 全空」的假失败。  
+8. **Calculator 注册名是 `python_calculator`**，且被标为有副作用（禁止委托）。  
+9. **Agent L2 报告仅 JSON**，字段以 `CaseResult.to_dict()` 为准（无 `trace_id` / `tokens_estimate` / 原始 trace 落盘）。  
+10. **R 轨与线上重排开关解耦**：`memory` / `memory_reranked` 由 CLI 通道强制开/关重排；线上行为看 `MEMORY_RERANK_ENABLED`。英文 MS MARCO MiniLM 对中文短记忆重排可能伤 MRR，优先使用 `BAAI/bge-reranker-base` 等中英友好模型。
 
 ---
 
-## 9. 参考实现路径
+## 10. 参考实现路径
 
 | 模块 | 路径 |
 |------|------|
@@ -325,5 +678,11 @@ uv run python -m evals --channel retrieval --reseed
 | Bash 沙箱 | `backend/src/tools/builtin/bash.py` |
 | 工具日志 | `backend/src/logging/tool_logger.py` / `api/tool_logs.py` |
 | 任务进度 | `backend/src/api/agent.py` |
-| 本评测包 | `backend/evals/` |
-| L0 测试 | `backend/tests/eval/` |
+| Memory 检索 / 重排 | `backend/src/memory/vector_store.py` |
+| RAG 检索 / 扩展 / CrossEncoder | `backend/src/rag/pipeline.py`、`embedding.py` |
+| 统一评测包 | `backend/evals/`（说明见 `backend/evals/README.md`） |
+| L2 SSE 客户端 | `backend/evals/agent/harness/sse_client.py` |
+| L2 打分 / 别名 | `backend/evals/agent/harness/scorers.py`、`tool_aliases.py` |
+| 工作区授权 API | `backend/src/api/workspace.py` |
+| L0 Agent 测试 | `backend/tests/eval/` |
+| 评测脚手架单测 | `backend/tests/evals/`（metrics / SSE / tool_aliases） |

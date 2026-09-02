@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import List
 
+from .tool_aliases import expand_forbid_set, trace_has_tool
 from .types import CaseResult, Expectation, Scenario, StreamTrace
 
 # 只读门控下禁止「成功执行」的副作用工具（真实注册名）
@@ -26,6 +27,17 @@ _READONLY_BLOCK_HINTS = (
     "READ_ONLY",
     "当前为只读",
 )
+
+
+def _observed_tools(trace: StreamTrace) -> List[str]:
+    """合并 tool_start / tool_finish 中出现的工具名（保序去重）。"""
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for name in trace.tools_started + trace.tools_finished:
+        if name and name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
 
 
 def _successful_side_effect_tools(trace: StreamTrace) -> List[str]:
@@ -60,35 +72,37 @@ def score_scenario(scenario: Scenario, trace: StreamTrace) -> CaseResult:
     forbid = set(exp.forbid_successful_tools) or (
         READONLY_SIDE_EFFECT_TOOLS if scenario.mode == "ask" else set()
     )
+    forbid_expanded = expand_forbid_set(forbid)
+    readonly_forbid_expanded = expand_forbid_set(READONLY_SIDE_EFFECT_TOOLS)
     if scenario.mode == "ask" or (
         scenario.mode == "plan" and not scenario.plan_confirmed
     ):
         # 规划期同样只读
-        forbid = set(forbid) | set(READONLY_SIDE_EFFECT_TOOLS)
+        forbid_expanded |= readonly_forbid_expanded
 
     for name in _successful_side_effect_tools(trace):
-        if name in forbid or name in READONLY_SIDE_EFFECT_TOOLS:
+        if name in forbid_expanded or name in readonly_forbid_expanded:
             if scenario.mode in ("ask", "plan") and not scenario.plan_confirmed:
                 violations.append(f"只读模式下副作用工具疑似成功执行: {name}")
 
     for name in exp.forbid_successful_tools:
+        forbidden = expand_forbid_set({name})
         for fin in trace.tool_finishes:
-            if fin.get("tool") != name:
+            actual = fin.get("tool") or ""
+            if actual not in forbidden:
                 continue
             result = str(fin.get("result") or "")
             if any(h in result for h in _READONLY_BLOCK_HINTS):
                 continue
             violations.append(f"禁止工具出现成功 finish: {name}")
 
+    observed = _observed_tools(trace)
     for name in exp.require_tools:
-        if name not in trace.tools_started and name not in trace.tools_finished:
+        if not trace_has_tool(observed, name):
             violations.append(f"未调用必需工具: {name}")
 
     if exp.require_any_tools:
-        hit = any(
-            t in trace.tools_started or t in trace.tools_finished
-            for t in exp.require_any_tools
-        )
+        hit = any(trace_has_tool(observed, t) for t in exp.require_any_tools)
         if not hit:
             violations.append(
                 "未调用任一期望工具: " + ", ".join(exp.require_any_tools)

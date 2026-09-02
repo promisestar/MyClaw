@@ -305,7 +305,7 @@ def _build_cross_encoder() -> Optional[Any]:
     """根据环境变量构建 CrossEncoder 实例。
 
     环境变量：
-    - RERANK_MODEL_NAME: 模型名称（默认 cross-encoder/ms-marco-MiniLM-L-6-v2）
+    - RERANK_MODEL_NAME: 模型名称（默认 BAAI/bge-reranker-base，中英友好）
     - RERANK_ENABLED: "0"/"false"/"no" 禁用重排序，跳过加载
     """
     if _env_flag("RERANK_ENABLED") is False:
@@ -313,7 +313,8 @@ def _build_cross_encoder() -> Optional[Any]:
         if os.getenv("RERANK_ENABLED", "").strip().lower() in ("0", "false", "no", "off"):
             return None
 
-    model_name = os.getenv("RERANK_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2").strip()
+    # 默认用 BGE reranker：对中文短文本远好于英文 MS MARCO MiniLM
+    model_name = os.getenv("RERANK_MODEL_NAME", "BAAI/bge-reranker-base").strip()
     load_path, local_files_only = _resolve_local_model(model_name)
 
     try:
@@ -323,10 +324,13 @@ def _build_cross_encoder() -> Optional[Any]:
         if local_files_only:
             load_kwargs["local_files_only"] = True
         ce = CrossEncoder(load_path, **load_kwargs)
+        logger.info("CrossEncoder 已加载: %s", model_name)
         return ce
     except Exception:
         logger.warning(
-            "CrossEncoder 加载失败（sentence_transformers 不可用），重排序将不可用，回退到纯向量排序"
+            "CrossEncoder 加载失败（model=%s），重排序将不可用，回退到纯向量排序",
+            model_name,
+            exc_info=True,
         )
         return None
 

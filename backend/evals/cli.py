@@ -39,16 +39,25 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m evals",
         description=(
             "MyClaw 统一评测：Agent L2 场景（--channel agent）或 "
-            "Memory/RAG 离线检索（--channel memory|rag|rag_expanded|retrieval）"
+            "Memory/RAG 离线检索（--channel memory|memory_reranked|rag|...）"
         ),
     )
     p.add_argument(
         "--channel",
-        choices=("agent", "memory", "rag", "rag_expanded", "retrieval", "all"),
+        choices=(
+            "agent",
+            "memory",
+            "memory_reranked",
+            "rag",
+            "rag_expanded",
+            "retrieval",
+            "all",
+        ),
         default="retrieval",
         help=(
-            "评测通道：agent=Agent L2 场景；memory/rag/rag_expanded=单通道检索；"
-            "retrieval/all=全部检索通道（默认 retrieval）"
+            "评测通道：agent=Agent L2；memory=纯向量 Memory；"
+            "memory_reranked=Memory+CrossEncoder 重排；"
+            "rag / rag_expanded=RAG；retrieval/all=全部检索通道（含 memory 与 memory_reranked）"
         ),
     )
 
@@ -90,6 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Similarity threshold. Memory default 0.3; RAG default None",
+    )
+    retrieval.add_argument(
+        "--candidate-k",
+        type=int,
+        default=None,
+        help=(
+            "Memory 重排前向量候选池大小（仅 memory_reranked；"
+            "默认 MEMORY_RERANK_CANDIDATE_K 或 20）"
+        ),
     )
     retrieval.add_argument(
         "--enable-mqe",
@@ -138,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _resolve_retrieval_channels(channel: str) -> List[str]:
     if channel in ("retrieval", "all"):
-        return ["memory", "rag", "rag_expanded"]
+        return ["memory", "memory_reranked", "rag", "rag_expanded"]
     return [channel]
 
 
@@ -170,19 +188,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     channels = _resolve_retrieval_channels(args.channel)
     exit_code = 0
+    # memory / memory_reranked 共用 collection：仅第一次允许 reseed
+    memory_seeded = False
 
     for ch in channels:
         try:
-            if ch == "memory":
+            if ch in ("memory", "memory_reranked"):
                 from .run_memory import run_memory_eval
 
                 thr = 0.3 if args.score_threshold is None else args.score_threshold
+                do_reseed = args.reseed and not memory_seeded
                 report = run_memory_eval(
                     ks=args.ks,
                     top_k=args.top_k,
                     score_threshold=thr,
-                    reseed=args.reseed,
+                    reseed=do_reseed,
+                    enable_rerank=(ch == "memory_reranked"),
+                    candidate_k=args.candidate_k,
                 )
+                memory_seeded = True
             elif ch == "rag":
                 from .run_rag import run_rag_eval
 

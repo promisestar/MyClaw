@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -11,7 +12,11 @@ _SCENARIO_DIR = Path(__file__).resolve().parent / "scenarios"
 
 
 def _builtin_scenarios() -> List[Scenario]:
-    """与 YAML 等价的内置核心场景（无 PyYAML 依赖时仍可跑）。"""
+    """内置兜底核心场景（无 PyYAML 依赖时仍可跑）。
+
+    只保留最关键的门控/契约场景，方便零依赖环境下冒烟；
+    完整场景集以 scenarios/*.yaml 为准（当前 50 个）。
+    """
     return [
         Scenario(
             id="ask_readonly_gate",
@@ -132,7 +137,16 @@ def load_scenarios(
     ids: Optional[List[str]] = None,
 ) -> List[Scenario]:
     """加载场景；优先读 YAML，失败则用内置定义。"""
-    scenarios = _try_load_yaml() or _builtin_scenarios()
+    scenarios = _try_load_yaml()
+    if scenarios is None:
+        # YAML 不可用（缺 PyYAML 或目录为空）时回退到内置兜底场景，
+        # 必须显式告警，否则会「静默只跑 7 个场景」。
+        print(
+            "⚠️ 未能从 scenarios/*.yaml 加载场景，已回退内置兜底场景"
+            "（请确认已安装 PyYAML，且 YAML 可被解析）",
+            file=sys.stderr,
+        )
+        scenarios = _builtin_scenarios()
     if suite and suite != "all":
         scenarios = [s for s in scenarios if suite in s.tags or suite == "core" and "core" in s.tags]
     if ids:
@@ -183,6 +197,11 @@ def _try_load_yaml() -> Optional[List[Scenario]]:
                     workspace_path=raw.get("workspace_path"),
                     reuse_session_from=raw.get("reuse_session_from"),
                     timeout_s=float(raw.get("timeout_s") or 180),
+                    cancel_after_s=(
+                        float(raw["cancel_after_s"])
+                        if raw.get("cancel_after_s") is not None
+                        else None
+                    ),
                     expect=exp,
                     tags=list(raw.get("tags") or ["core"]),
                 )

@@ -45,6 +45,8 @@ class Scenario:
     # 复用上一场景的 session（由 runner 填）
     reuse_session_from: Optional[str] = None
     timeout_s: float = 180.0
+    # 流式开始 N 秒后调用 /api/chat/cancel（用于取消类场景；None 表示不取消）
+    cancel_after_s: Optional[float] = None
     expect: Expectation = field(default_factory=Expectation)
     tags: List[str] = field(default_factory=list)
 

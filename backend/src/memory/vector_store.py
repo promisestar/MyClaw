@@ -80,6 +80,31 @@ except ValueError:
 # L2 是否启用：阈值 >= 1.0 视为关闭（任何余弦相似度都不可能命中）
 _L2_ENABLED = MEMORY_DEDUPE_THRESHOLD < 1.0
 
+# ── Memory 检索 CrossEncoder 重排 ─────────────────────────
+# MEMORY_RERANK_ENABLED：Agent/工具检索是否在向量召回后做重排（默认关闭，保持旧行为）
+# MEMORY_RERANK_CANDIDATE_K：重排前向量候选池大小（应 ≥ top_k）
+# 还依赖全局 RERANK_ENABLED / RERANK_MODEL_NAME（见 src.rag.embedding）
+
+
+def _env_flag_true(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def memory_rerank_enabled() -> bool:
+    """是否启用 Memory 检索重排（读 MEMORY_RERANK_ENABLED，默认 false）。"""
+    return _env_flag_true("MEMORY_RERANK_ENABLED", default=False)
+
+
+def memory_rerank_candidate_k(default: int = 20) -> int:
+    """重排前向量候选数（读 MEMORY_RERANK_CANDIDATE_K）。"""
+    try:
+        return max(1, int(os.getenv("MEMORY_RERANK_CANDIDATE_K", str(default))))
+    except ValueError:
+        return default
+
 
 def _normalize_content(content: str) -> str:
     """归一化文本用于 L1 字面去重的 hash 计算。
@@ -460,6 +485,9 @@ class MemoryVectorStore:
         top_k: int = 5,
         score_threshold: float = 0.3,
         category: Optional[str] = None,
+        *,
+        enable_rerank: Optional[bool] = None,
+        candidate_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """语义检索相关记忆
 
@@ -467,9 +495,13 @@ class MemoryVectorStore:
             query: 查询文本
             top_k: 返回结果数量
             score_threshold: 相似度阈值（余弦距离，0-1）
+            category: 可选分类过滤
+            enable_rerank: 是否 CrossEncoder 重排；None 时读 MEMORY_RERANK_ENABLED
+            candidate_k: 重排前向量候选数；None 时读 MEMORY_RERANK_CANDIDATE_K
 
         Returns:
-            记忆列表，每项包含 id, score, content, category, timestamp 等
+            记忆列表，每项包含 id, score, content, category, timestamp 等；
+            启用重排时可能含 rerank_score。
         """
         if not self.available:
             return []
@@ -478,6 +510,12 @@ class MemoryVectorStore:
             # 空查询 → 返回最近的记忆
             if not query or not query.strip():
                 return self._list_recent(top_k)
+
+            do_rerank = memory_rerank_enabled() if enable_rerank is None else bool(enable_rerank)
+            fetch_k = int(top_k)
+            if do_rerank:
+                pool = int(candidate_k) if candidate_k is not None else memory_rerank_candidate_k()
+                fetch_k = max(int(top_k), pool)
 
             # 向量化查询
             query_vector = self._embedder.encode(query)
@@ -494,10 +532,10 @@ class MemoryVectorStore:
             else:
                 where = {"memory_type": "longterm"}
 
-            # 执行语义搜索
+            # 执行语义搜索（重排时先取更大候选池）
             raw_results = self._qdrant.search_similar(
                 query_vector=query_vector,
-                limit=top_k,
+                limit=fetch_k,
                 score_threshold=score_threshold,
                 where=where,
             )
@@ -517,7 +555,20 @@ class MemoryVectorStore:
                     "decay_score": meta.get("decay_score", 1.0),
                 })
 
-            logger.debug("记忆检索: query='%s' → %d 结果", query[:50], len(results))
+            if do_rerank and results:
+                # 懒加载，避免 vector_store ↔ pipeline 循环导入
+                from ..rag.pipeline import rerank_with_cross_encoder
+
+                results = rerank_with_cross_encoder(query, results, top_k=top_k)
+                logger.debug(
+                    "记忆检索+重排: query='%s' candidates=%d → top_k=%d",
+                    query[:50],
+                    fetch_k,
+                    top_k,
+                )
+            else:
+                results = results[:top_k]
+                logger.debug("记忆检索: query='%s' → %d 结果", query[:50], len(results))
 
             # 访问强化：重置被检索记忆的衰减计时器（用进废退）
             if results:

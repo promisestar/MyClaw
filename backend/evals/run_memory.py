@@ -1,4 +1,10 @@
-"""Memory 通道离线评测 runner。"""
+"""Memory 通道离线评测 runner。
+
+支持两条可比通道（同一语料 / queries / collection）：
+
+- ``memory``：纯向量召回（强制 ``enable_rerank=False``）
+- ``memory_reranked``：向量多召回 + CrossEncoder 重排后截断到 top_k
+"""
 
 from __future__ import annotations
 
@@ -51,16 +57,26 @@ def run_memory_eval(
     top_k: Optional[int] = None,
     score_threshold: float = 0.3,
     reseed: bool = False,
+    enable_rerank: bool = False,
+    candidate_k: Optional[int] = None,
     id_map_path: Optional[Path] = None,
     reports_dir: Optional[Path] = None,
 ) -> ChannelReport:
-    """运行 Memory 检索评测并写报告。"""
-    from src.memory.vector_store import MemoryVectorStore
+    """运行 Memory 检索评测并写报告。
+
+    ``enable_rerank=False`` 写 channel=memory；True 写 channel=memory_reranked。
+    评测显式传入开关，不受线上 MEMORY_RERANK_ENABLED 环境影响，便于 A/B 对比。
+    """
+    from src.memory.vector_store import MemoryVectorStore, memory_rerank_candidate_k
 
     ks_list = [int(k) for k in ks]
     limit = int(top_k or max(ks_list))
     map_path = id_map_path or MEMORY_ID_MAP_PATH
     out_dir = reports_dir or REPORTS_DIR
+    channel = "memory_reranked" if enable_rerank else "memory"
+    pool = int(candidate_k) if candidate_k is not None else memory_rerank_candidate_k()
+    if enable_rerank:
+        pool = max(limit, pool)
 
     need_seed = reseed or (not map_path.exists()) or memory_point_count(collection_name) == 0
     if need_seed:
@@ -89,6 +105,8 @@ def run_memory_eval(
             top_k=limit,
             score_threshold=score_threshold,
             category=q.category,
+            enable_rerank=enable_rerank,
+            candidate_k=pool if enable_rerank else None,
         )
         ranked = [str(h.get("id")) for h in hits if h.get("id") is not None]
         metrics = evaluate_query(ranked, relevant_ids, ks_list)
@@ -109,7 +127,7 @@ def run_memory_eval(
         mrrs.append(detail.mrr)
 
     report = ChannelReport(
-        channel="memory",
+        channel=channel,
         collection=collection_name,
         top_k=limit,
         ks=ks_list,
@@ -120,8 +138,13 @@ def run_memory_eval(
         mean_precision_at=mean_dict_of_floats(precision_dicts, [str(k) for k in ks_list]),
         mean_mrr=(sum(mrrs) / len(mrrs)) if mrrs else 0.0,
         details=details,
-        extra={"id_map_path": str(map_path), "id_map_size": len(id_map)},
+        extra={
+            "id_map_path": str(map_path),
+            "id_map_size": len(id_map),
+            "enable_rerank": enable_rerank,
+            "candidate_k": pool if enable_rerank else limit,
+        },
     )
-    json_path, md_path = write_report_pair(out_dir, "memory", report.to_dict())
+    json_path, md_path = write_report_pair(out_dir, channel, report.to_dict())
     logger.info("Memory report written: %s / %s", json_path, md_path)
     return report

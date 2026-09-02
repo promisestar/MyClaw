@@ -102,6 +102,7 @@ sequenceDiagram
 行为要点：
 
 - 用当前用户消息（多模态时先拍平为纯文本）做 query，调用 `MemoryVectorStore.search_memories`。
+  若环境变量 `MEMORY_RERANK_ENABLED=true`，则在向量召回更大候选池后用 CrossEncoder 重排再截断到 `top_k`（与工具 `memory_search` 共用同一开关）。
 - 命中则写入本轮 `turn_context`，标题为 `## 相关记忆（自动注入）`，并提示不足时可再调 `memory_search`。
 - **基座 system 在会话内冻结**；记忆块每轮可变，但只出现在发给模型的 user 前缀，**不会**追加进 `system_prompt`，也**不会**写入会话历史。
 - 记忆不可用、配置关闭、query 为空或无命中时返回空串，不影响对话。
@@ -148,7 +149,8 @@ MemoryVectorStore
 ├── qdrant_store: QdrantVectorStore (collection="helloclaw_memory")
 ├── embedder: EmbeddingModel (从 embedding.py 单例获取)
 ├── add_memory(content, category, session_id, source) → memory_id
-├── search_memories(query, top_k, score_threshold, category) → List[dict]
+├── search_memories(query, top_k, score_threshold, category, *, enable_rerank, candidate_k) → List[dict]
+│     # enable_rerank=None 时读 MEMORY_RERANK_ENABLED；为 True 时先取候选池再 CrossEncoder 重排
 ├── delete_memories(memory_ids) → bool
 ├── process_decay() → {deleted, updated, total}
 ├── cleanup_expired(days) → int          # 兼容包装 → process_decay
@@ -536,6 +538,7 @@ cd backend && python -m unittest tests.session_store.test_session_store -v
 - **Qdrant**：与 RAG 共享连接，不同 collection；`QDRANT_COLLECTION` 可覆盖记忆 collection 名。  
 - **Payload index**：初始化自动建 `category`、`content_hash`。  
 - **去重**：`MEMORY_DEDUPE_THRESHOLD`（默认 `1.0` = 关 L2）。  
+- **Memory 重排**：`MEMORY_RERANK_ENABLED`（默认 `false`）；候选池 `MEMORY_RERANK_CANDIDATE_K`（默认 `20`）。模型加载仍受全局 `RERANK_ENABLED` / `RERANK_MODEL_NAME` 控制。评测对比：`python -m evals --channel memory` vs `--channel memory_reranked`。  
 - **Embedding**：`EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME`；换模后旧向量空间不一致，宜重建或接受效果下降。  
 - **HTTP**：同步 Qdrant / SQLite 操作经 `run_in_threadpool`，避免堵事件循环。  
 - **兼容**：`MemoryTool` / Capture 仍保留 `workspace_manager` 回退参数。  

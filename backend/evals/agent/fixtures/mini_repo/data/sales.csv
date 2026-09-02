@@ -1,0 +1,13 @@
+﻿date,region,product,quantity,price
+2026-01-04,east,keyboard,12,199.00
+2026-01-04,west,mouse,30,59.00
+2026-01-05,east,monitor,4,1299.00
+2026-01-05,south,keyboard,8,199.00
+2026-01-06,north,mouse,25,59.00
+2026-01-06,east,monitor,2,1299.00
+2026-01-07,west,keyboard,15,199.00
+2026-01-07,south,mouse,18,59.00
+2026-01-08,north,monitor,3,1299.00
+2026-01-08,east,keyboard,9,199.00
+2026-01-09,west,monitor,1,1299.00
+2026-01-09,south,keyboard,20,199.00

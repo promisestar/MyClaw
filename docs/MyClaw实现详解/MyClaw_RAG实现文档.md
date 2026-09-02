@@ -410,14 +410,14 @@ def rerank_with_cross_encoder(query, items, top_k=10):
 
 **与基础检索的关系**：
 - Cross-Encoder 仅对已召回的候选集做精排，不做全量扫描
-- 默认使用 `cross-encoder/ms-marco-MiniLM-L-6-v2`（轻量，适合重排序场景）
+- 默认使用 `BAAI/bge-reranker-base`（中英友好，适合 Memory/RAG 重排；可用 `RERANK_MODEL_NAME` 覆盖）
 - 通过环境变量 `RERANK_ENABLED=0` 可禁用，回退到纯向量排序
 
 **配置环境变量**：
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `RERANK_MODEL_NAME` | Cross-Encoder 模型名称 | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| `RERANK_MODEL_NAME` | Cross-Encoder 模型名称 | `BAAI/bge-reranker-base` |
 | `RERANK_ENABLED` | 设为 `0`/`false` 禁用 | 默认启用 |
 
 ---
