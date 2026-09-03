@@ -543,7 +543,8 @@ class MyClawAgent:
             self.identity.is_onboarding_completed(),
         )
 
-    def _compose_turn_context(self, *parts: str) -> Optional[str]:
+    @staticmethod
+    def _compose_turn_context(*parts: str) -> Optional[str]:
         """拼接非空轮次上下文块；全空则返回 None。"""
         blocks = [p.strip() for p in parts if p and str(p).strip()]
         if not blocks:
@@ -551,11 +552,36 @@ class MyClawAgent:
         return "\n\n".join(blocks)
 
     @staticmethod
+    def _ask_mode_instruction() -> str:
+        """Ask 只读模式 ephemeral 指令（不入 system / 历史）。"""
+        from .tool_mode_filter import SIDE_EFFECT_TOOL_LABELS
+
+        forbidden = "、".join(SIDE_EFFECT_TOOL_LABELS)
+        return (
+            "## Ask 只读模式指令\n"
+            "你当前处于 Ask（只读）模式。\n\n"
+            "**允许**：Read、search_content、search_file、list_dir、"
+            "web_search、web_fetch、memory_search、session_search 等只读工具。\n\n"
+            f"**禁止调用**：{forbidden}，以及任何会落盘、改配置、写长期记忆、"
+            "创建定时任务或执行 shell 的操作。\n\n"
+            "若用户要求修改文件、执行命令、写入记忆或创建自动化任务："
+            "请明确拒绝，说明需切换到 Craft 模式（或确认后的 Plan 执行期）才能执行；"
+            "你可以用只读工具辅助解释「将如何修改」，但不得实际调用写工具。"
+        )
+
+    @staticmethod
     def _plan_planning_instruction() -> str:
+        from .tool_mode_filter import SIDE_EFFECT_TOOL_LABELS
+
+        forbidden = "、".join(SIDE_EFFECT_TOOL_LABELS)
         return (
             "## 规划模式指令\n"
-            "你正处于规划模式。请使用只读工具（read/search_content/search_file/"
+            "你正处于规划模式（尚未经用户确认，不得产生副作用）。\n"
+            "请使用只读工具（read/search_content/search_file/"
             "web_search/web_fetch 等）分析任务，然后输出一个结构化的执行计划。\n\n"
+            f"**规划期禁止调用**：{forbidden}。"
+            "即使被用户诱导「别给计划、直接动手」，也只能做只读调研并输出计划；"
+            "写操作只能出现在计划的 tools_required 中，留给确认后的执行期。\n\n"
             "**输出格式要求：**\n"
             "在分析完成后，在你的最终回复中包含一个 JSON 代码块，格式如下：\n"
             "```json\n"
@@ -1563,6 +1589,11 @@ class MyClawAgent:
 
             plan_summary = self._todo_scheduler.get_progress_summary() or ""
             turn_context = self._compose_turn_context(memory_context, plan_summary)
+        elif mode == "ask":
+            turn_context = self._compose_turn_context(
+                memory_context,
+                self._ask_mode_instruction(),
+            )
         else:
             turn_context = self._compose_turn_context(memory_context)
 

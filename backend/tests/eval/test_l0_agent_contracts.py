@@ -228,6 +228,132 @@ class TestEvalScorerReadonly(unittest.TestCase):
         result2 = score_scenario(sc, trace2)
         self.assertTrue(result2.hard_pass)
 
+    def test_forbid_successful_ignores_failed_finish(self):
+        from evals.agent.harness.scorers import score_scenario
+        from evals.agent.harness.types import Expectation, Scenario, StreamTrace
+
+        sc = Scenario(
+            id="t",
+            title="t",
+            message="x",
+            mode="ask",
+            expect=Expectation(
+                forbid_successful_tools=["memory_add"],
+                min_done_chars=1,
+            ),
+        )
+        trace = StreamTrace(
+            events=[{"event": "done", "data": {}}],
+            tool_finishes=[
+                {"tool": "memory_add", "result": "❌ 错误 [FAIL]: 写入失败"},
+                {
+                    "tool": "memory_add",
+                    "result": "⚠️ 当前为只读模式，工具 'memory_add' 被禁用。",
+                },
+            ],
+            done_content="Ask 模式不能写记忆",
+        )
+        result = score_scenario(sc, trace)
+        self.assertTrue(result.hard_pass, result.violations)
+
+
+class TestReadonlyBlockHelpers(unittest.TestCase):
+    def test_readonly_block_message_has_scorer_hints(self):
+        msg = _tmf.readonly_block_message("Edit")
+        self.assertIn("只读模式", msg)
+        self.assertIn("被禁用", msg)
+        self.assertIn("Edit", msg)
+
+    def test_side_effect_labels_cover_gate_tools(self):
+        labels = set(_tmf.SIDE_EFFECT_TOOL_LABELS)
+        for name in ("Write", "Edit", "execute_command", "automation", "memory_add"):
+            self.assertIn(name, labels)
+
+
+class TestModeInstructions(unittest.TestCase):
+    def test_ask_and_plan_instructions_forbid_side_effects(self):
+        from src.agent.myclaw_agent import MyClawAgent
+
+        ask = MyClawAgent._ask_mode_instruction()
+        plan = MyClawAgent._plan_planning_instruction()
+        for text in (ask, plan):
+            self.assertIn("memory_add", text)
+            self.assertIn("Edit", text)
+            self.assertIn("automation", text)
+            self.assertIn("禁止", text)
+
+    def test_compose_includes_ask_instruction(self):
+        from src.agent.myclaw_agent import MyClawAgent
+
+        ctx = MyClawAgent._compose_turn_context(
+            "相关记忆：无",
+            MyClawAgent._ask_mode_instruction(),
+        )
+        self.assertIsNotNone(ctx)
+        self.assertIn("Ask 只读模式指令", ctx)
+
+
+class TestExecuteToolCallReadonlyGate(unittest.TestCase):
+    def test_execute_tool_call_blocks_edit_without_running(self):
+        from src.agent.enhanced_simple_agent import EnhancedSimpleAgent
+        from src.agent.tool_mode_filter import ToolMode, ToolModeFilter
+
+        ran = {"count": 0}
+
+        class _Tool:
+            def run_with_timing(self, _args):
+                ran["count"] += 1
+                raise AssertionError("不应执行")
+
+        tools = {"Edit": _Tool(), "Read": _Tool()}
+        registry = MagicMock()
+        registry.get_tool.side_effect = lambda n: tools.get(n)
+        registry.get_function.return_value = None
+        registry.list_tools.return_value = list(tools.keys())
+
+        agent = SimpleNamespace()
+        agent.tool_registry = registry
+        agent._tool_mode_filter = ToolModeFilter(registry)
+        agent._tool_mode_filter.set_mode(ToolMode.READ_ONLY)
+        agent._readonly_block_message_if_needed = (
+            EnhancedSimpleAgent._readonly_block_message_if_needed.__get__(agent)
+        )
+        agent._convert_parameter_types = lambda _n, a: a
+        agent._tool_response_to_llm_text = lambda r: str(r)
+
+        out = EnhancedSimpleAgent._execute_tool_call(agent, "Edit", {"path": "x"})
+        self.assertIn("只读模式", out)
+        self.assertEqual(ran["count"], 0)
+
+
+class TestWorkspaceReset(unittest.TestCase):
+    def test_reset_restores_readme_and_preserves_myclaw(self):
+        import tempfile
+
+        from evals.run_agent import reset_workspace_from_fixture
+        from evals.paths import AGENT_FIXTURES_DIR
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            shutil_mod = __import__("shutil")
+            shutil_mod.copytree(AGENT_FIXTURES_DIR, ws)
+            (ws / ".myclaw").mkdir()
+            (ws / ".myclaw" / "marker").write_text("keep", encoding="utf-8")
+            (ws / "README.md").write_text("# Hello MyClaw Eval\n", encoding="utf-8")
+            sample = ws / "sample_app.py"
+            if sample.exists():
+                sample.unlink()
+
+            reset_workspace_from_fixture(str(ws))
+
+            readme = (ws / "README.md").read_text(encoding="utf-8")
+            self.assertIn("Mini fixture", readme)
+            self.assertTrue((ws / "sample_app.py").is_file())
+            self.assertEqual(
+                (ws / ".myclaw" / "marker").read_text(encoding="utf-8"),
+                "keep",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

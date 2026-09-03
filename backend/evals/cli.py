@@ -77,7 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent.add_argument(
         "--workspace",
         default=None,
-        help="已授权工作区路径（建议指向 evals/agent/fixtures/mini_repo 副本）",
+        help=(
+            "已授权工作区路径（建议为 evals/agent/fixtures/mini_repo 的副本）。"
+            "runner 会在每个场景开始前用夹具覆盖还原工作区文件，并保留 .myclaw 授权元数据。"
+        ),
     )
     agent.add_argument(
         "--judge",

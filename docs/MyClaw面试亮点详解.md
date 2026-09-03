@@ -1064,25 +1064,31 @@ Plan 模式是整个系统中交互最复杂的模式，需要在无状态的 HT
 
 **① 如何在不修改外部库的前提下过滤工具？**
 
-`hello_agents` 的 `ToolRegistry` 是外部包，不能直接加 mode 参数。MyClaw 设计了 `ToolModeFilter` 包装器：
+`hello_agents` 的 `ToolRegistry` 是外部包，不能直接加 mode 参数。MyClaw 设计了 `ToolModeFilter` 包装器，并在执行层做三处硬拦（流式早执行 `_try_execute_ready_tool`、FINISH 批量 `_execute_tools_batch`、底层 `_execute_tool_call`），同时用 Ask/Plan 的 ephemeral `turn_context` 提示词降低违规调用意愿：
 
 ```python
 class ToolModeFilter:
     """包装外部 ToolRegistry，通过 wrapper 模式实现模式切换。
     
-    不修改 ToolRegistry 源码，通过代理模式拦截 get_tools()/get_tool()。
+    不修改 ToolRegistry 源码；READ_ONLY 时屏蔽 SIDE_EFFECT_TOOLS。
     """
-    _SIDE_EFFECT_TOOLS = frozenset({"write", "edit", "execute_command", "automation"})
+    # 与 tool_mode_filter.py 一致（含 memory_add、bash 兼容名）
+    SIDE_EFFECT_TOOLS = frozenset({
+        "write", "Write", "edit", "Edit",
+        "bash", "execute_command", "automation", "memory_add",
+    })
 
     def set_mode(self, mode: ToolMode):
         self._mode = mode  # READ_ONLY 时屏蔽副作用工具
 
-    def get_tools(self) -> List[Tool]:
-        all_tools = self._registry.get_tools()
+    def get_available_tool_names(self) -> List[str]:
+        names = self._registry.list_tools()
         if self._mode == ToolMode.FULL:
-            return all_tools
-        return [t for t in all_tools if t.name not in self._SIDE_EFFECT_TOOLS]
+            return names
+        return [n for n in names if n not in self.SIDE_EFFECT_TOOLS]
 ```
+
+关键教训：只拦 `_execute_tools_batch` 不够——流式「边收边跑」会在 FINISH 之前执行工具；漏拦会导致 Ask 下 `Edit`/`memory_add` 真实落盘，并污染评测共享工作区。
 
 **② 如何在无状态 HTTP 间传递 Plan？**
 

@@ -201,6 +201,19 @@ class EnhancedSimpleAgent(SimpleAgent):
         if self._tool_mode_filter:
             self._tool_mode_filter.set_mode(mode)
 
+    def _readonly_block_message_if_needed(self, tool_name: str) -> Optional[str]:
+        """READ_ONLY 下若工具为副作用工具，返回拒绝文案；否则返回 None。"""
+        if not self._tool_mode_filter:
+            return None
+        from .tool_mode_filter import SIDE_EFFECT_TOOLS, ToolMode, readonly_block_message
+
+        if (
+            self._tool_mode_filter.mode == ToolMode.READ_ONLY
+            and tool_name in SIDE_EFFECT_TOOLS
+        ):
+            return readonly_block_message(tool_name)
+        return None
+
     def _build_tool_schemas(self) -> list:
         """构建工具 schema 列表 — 覆盖父类方法，应用模式过滤。
 
@@ -335,6 +348,10 @@ class EnhancedSimpleAgent(SimpleAgent):
         相对基类：成功时若 ``data.content`` 未出现在 ``text`` 中则合并进去，
         避免 Read 等工具把正文只放在 data 导致模型看不到文件内容。
         """
+        blocked = self._readonly_block_message_if_needed(tool_name)
+        if blocked is not None:
+            return blocked
+
         if not self.tool_registry:
             return "❌ 错误：未配置工具注册表"
 
@@ -598,6 +615,34 @@ class EnhancedSimpleAgent(SimpleAgent):
         tc_state["executed"] = True
         executed_ids.add(tool_call_id)
 
+        # ── 只读门控：流式早执行路径必须拦截（不可只依赖 FINISH 批量路径）──
+        blocked = self._readonly_block_message_if_needed(tool_name)
+        if blocked is not None:
+            tool_results_by_id[tool_call_id] = blocked
+            tool_call_records.append({
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "args": arguments,
+                "result": blocked,
+                "status": "blocked_readonly",
+            })
+            yield StreamEvent.create(
+                StreamEventType.TOOL_CALL_START,
+                self.name,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                args=arguments,
+            )
+            await asyncio.sleep(0)
+            yield StreamEvent.create(
+                StreamEventType.TOOL_CALL_FINISH,
+                self.name,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                result=blocked,
+            )
+            return
+
         # ── 去重检查：相同工具 + 相同参数只执行一次 ──
         dedup_key = f"{tool_name}:{args_str}"
         if dedup_key in self._tool_call_dedup:
@@ -798,16 +843,14 @@ class EnhancedSimpleAgent(SimpleAgent):
             else:
                 tool = self.tool_registry.get_tool(tool_name) if self.tool_registry else None
             # 工具被模式过滤时，跳过并返回拒绝信息
+            blocked = self._readonly_block_message_if_needed(tool_name)
+            if blocked is not None:
+                tool_results_by_id[tc["id"]] = blocked
+                executed_ids.add(tc["id"])
+                continue
             if tool is None and self.tool_registry and self.tool_registry.get_tool(tool_name):
-                # 工具存在但被模式过滤
-                from .tool_mode_filter import SIDE_EFFECT_TOOLS
-                if tool_name in SIDE_EFFECT_TOOLS:
-                    tool_results_by_id[tc["id"]] = (
-                        f"⚠️ 当前为只读模式，工具 '{tool_name}' 被禁用。"
-                        f"请切换到 Craft 或 Plan 模式执行修改操作。"
-                    )
-                    executed_ids.add(tc["id"])
-                    continue
+                # 其它「注册表有、过滤器无」情况（非 SIDE_EFFECT 名单）仍跳过
+                continue
             has_side_effects = getattr(tool, "has_side_effects", True) if tool else True
             if has_side_effects:
                 serial_calls.append(tc)

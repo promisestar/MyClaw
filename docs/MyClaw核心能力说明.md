@@ -41,8 +41,24 @@ MyClaw 是一个**个性化 AI Agent 应用**。目标不是「单次问答」�
 
 ### 3.3 Ask / Plan / Craft 与上下文守卫
 
-- **Ask**：只读工具；**Plan**：先 READ_ONLY 出 TODO → 用户确认 → FULL 执行（进度摘要注入 turn_context）；**Craft**：全自动。
-- **ContextGuard**：按模型窗口**动态**调整委派阈值；大输出可摘要委托子代理；工具 `output_size_hint` 用绝对值，避免与阈值同比例缩放导致路由失效。
+三种模式由用户显式选择（前端 Segmented），后端在 `MyClawAgent.achat` 入口设置 `ToolMode`，并采用 **schema 过滤 + 执行硬拦 + turn_context 提示词** 三层约束，避免「只靠 prompt 劝阻」或「只拦 FINISH 批量路径」导致的漏网。
+
+| 模式 | `ToolMode` | 行为要点 |
+|------|------------|----------|
+| **Ask** | `READ_ONLY` | 只读工具；注入 `_ask_mode_instruction()`；写工具调用会被拒绝 |
+| **Plan（未确认）** | `READ_ONLY` | 注入强化后的 `_plan_planning_instruction()` → 只读调研 → 解析 TODO → `plan_generated` → **结束** |
+| **Plan（已确认）** | `FULL` | 恢复 plan → 进度摘要进 turn_context → 全工具执行 |
+| **Craft** | `FULL` | 全自动 ReAct，不注入只读禁令 |
+
+**执行硬拦覆盖路径**（`EnhancedSimpleAgent`）：
+
+1. 流式早执行 `_try_execute_ready_tool`（边收边跑，历史上曾绕过门控）
+2. FINISH 批量 `_execute_tools_batch`
+3. 底层 `_execute_tool_call`（纵深防御）
+
+`SIDE_EFFECT_TOOLS` 含：`Write`/`Edit`/`execute_command`/`bash`/`automation`/`memory_add`。拒绝文案统一含「只读模式」「被禁用」，供评测 scorer 识别。模式指令走 ephemeral **`turn_context`**（与相关记忆拼接），**不写入**冻结 system、不入会话历史。
+
+- **ContextGuard**：按模型窗口动态调整委派阈值；大输出可摘要委托子代理；工具 `output_size_hint` 用绝对值；副作用工具永不委托。
 - **Read 正文回传**：修正「只写 data、LLM 只读 text」的断层，保证文件内容进入上下文。
 
 ### 3.4 子代理与工具面精简

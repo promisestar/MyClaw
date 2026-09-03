@@ -83,8 +83,8 @@ LLM Agent 解析对话 → 提取新偏好 → 增量更新字段
 
 | 模式 | 允许的工具 | 禁止的工具 | 执行流程 |
 |------|-----------|-----------|---------|
-| **Ask** | read, search_content, search_file, list_dir, web_search, web_fetch, http_request, browser(只读action), memory_*, rag, skill, mcp | write, edit, execute_command, automation | 单轮 ReAct，LLM 直接回复 |
-| **Plan** | 规划期同 Ask；执行期全部 | 规划期禁止副作用工具 | 两阶段：规划→用户确认→执行 |
+| **Ask** | read, search_content, search_file, list_dir, web_search, web_fetch, http_request, browser(只读action), memory_search, session_search, rag, skill, mcp | write, edit, execute_command, bash, automation, **memory_add** | 单轮 ReAct；turn_context 注入 Ask 只读指令；LLM 直接回复 |
+| **Plan** | 规划期同 Ask；执行期全部 | 规划期禁止副作用工具（含 memory_add） | 两阶段：规划→用户确认→执行；规划指令含写操作禁令 |
 | **Craft** | 全部 | 无 | 自动 ReAct 循环，无需确认 |
 
 ### 1.3 前端实现
@@ -172,71 +172,108 @@ class ToolMode(Enum):
     READ_ONLY = "read_only"  # Ask / Plan 规划期
     FULL = "full"            # Craft / Plan 执行期
 
-# 副作用工具集合（READ_ONLY 模式下被屏蔽）
-SIDE_EFFECT_TOOLS = frozenset({"write", "edit", "execute_command", "automation"})
+# 副作用工具集合（READ_ONLY 模式下被屏蔽；含大小写变体）
+SIDE_EFFECT_TOOLS = frozenset({
+    "write", "Write", "edit", "Edit",
+    "bash", "execute_command", "automation", "memory_add",
+})
+
+# 提示词展示用规范名（与代码门控名单对齐，避免文案漂移）
+SIDE_EFFECT_TOOL_LABELS = (
+    "Write", "Edit", "execute_command", "bash", "automation", "memory_add",
+)
+
+def readonly_block_message(tool_name: str) -> str:
+    """统一拒绝文案（须含「只读模式」「被禁用」，供评测 scorer 识别）。"""
+    ...
 
 class ToolModeFilter:
     """包装外部 ToolRegistry，根据模式过滤工具。
-    
-    设计要点：不修改外部包 ToolRegistry 源码，
-    通过 wrapper 模式实现模式切换。
+
+    设计要点：不修改外部包 ToolRegistry 源码，通过 wrapper 实现模式切换。
     """
-    def __init__(self, registry: ToolRegistry):
-        self._registry = registry
-        self._mode = ToolMode.FULL
-
     def set_mode(self, mode: ToolMode) -> None: ...
-    def get_tools(self) -> List[Tool]: ...       # 按模式过滤
-    def get_tool(self, name: str) -> Optional[Tool]: ...  # 返回 None 表示被过滤
+    def get_available_tool_names(self) -> List[str]: ...
+    def get_filtered_schemas(self) -> List[dict]: ...  # READ_ONLY 下再按 function.name 过滤
+    def get_tool(self, name: str) -> Optional[Tool]: ...  # 副作用工具返回 None
 ```
 
-#### 1.4.2 工具门控：`_execute_tools_batch` 中的运行时检查
+> Bash 真实注册名为 **`execute_command`**；`bash` 为兼容保留。Memory 在注册时 expandable 展开为 `memory_search` / `memory_add`，后者进入副作用名单。
 
-在 `enhanced_simple_agent.py` 的 `_execute_tools_batch` 方法中，执行前对每个工具调用检查：
+#### 1.4.2 工具门控：三层执行拦截（不可只拦 FINISH 批量路径）
+
+流式 ReAct 存在两条工具执行入口：
+
+| 路径 | 时机 | 说明 |
+|------|------|------|
+| `_try_execute_ready_tool` | LLM 流式过程中参数 JSON 一旦完整即执行 | 「边收边跑」，历史上若未做门控会绕过只读限制 |
+| `_execute_tools_batch` | `FINISH` 后批量执行剩余调用 | 原先主要在此做 `ToolModeFilter` 检查 |
+
+当前实现在 **两条路径 + 底层执行** 均硬拦截：
 
 ```
-对于每个待执行的工具调用 tc：
-├── 通过 ToolModeFilter.get_tool(name) 获取工具
-├── 如果 tool 为 None 且原始 registry 中存在 → 工具被模式过滤
-│   ├── 生成拒绝信息："当前为只读模式，工具 'xxx' 被禁用"
-│   └── recorded_ids.add(tc["id"])，跳过该调用
-└── 根据 has_side_effects 元数据分组（并行/串行）
+待执行工具 tc：
+├── _readonly_block_message_if_needed(name)
+│   └── READ_ONLY 且 name ∈ SIDE_EFFECT_TOOLS
+│       → 返回统一拒绝文案，不调用真实工具
+│       → 早执行路径仍 emit tool_start / tool_finish（status=blocked_readonly）
+├── _execute_tools_batch：过滤后按 has_side_effects 并行/串行
+└── _execute_tool_call：入口再次检查（纵深防御，防止未来新路径漏网）
 ```
 
-#### 1.4.3 `achat()` 入口模式分流
+仅依赖 schema 过滤不够：模型可能凭 system/历史幻觉调用未暴露的工具名；因此 **执行层硬拦是 Ask/Plan 安全的底线**，提示词用于降低违规调用意愿。
+
+#### 1.4.3 `achat()` 入口：模式分流 + turn_context 提示词
+
+模式指令与相关记忆一样，走 ephemeral **`turn_context`**（经 `_compose_turn_context` 拼接），**不写入**冻结 system、**不入**会话历史。
 
 ```python
 # myclaw_agent.py — achat()
-async def achat(self, message, session_id=None, mode="craft", 
+async def achat(self, message, session_id=None, mode="craft",
                 plan_confirmed=False, **kwargs):
 
     # 工具模式设置
     if mode == "ask":
         self._agent.set_tool_mode(ToolMode.READ_ONLY)
     elif mode == "plan" and not plan_confirmed:
-        self._agent.set_tool_mode(ToolMode.READ_ONLY)  # 规划期只读
+        self._agent.set_tool_mode(ToolMode.READ_ONLY)
     else:
-        self._agent.set_tool_mode(ToolMode.FULL)       # Craft / 执行期
+        self._agent.set_tool_mode(ToolMode.FULL)
+
+    memory_context = self._inject_relevant_memories(message)
 
     # Plan 规划期
     if mode == "plan" and not plan_confirmed:
-        # 1. 注入规划指令（prompt 要求输出结构化 TODO JSON）
-        # 2. 运行 READ_ONLY ReAct 循环
-        # 3. 解析 TODO JSON（_parse_plan_from_response）
-        # 4. 暂存 Plan 到调度器 + 文件
-        # 5. 发送 plan_generated SSE 事件 → 前端展示确认卡片
-        # 6. 规划阶段结束，不进入执行
+        turn_context = self._compose_turn_context(
+            memory_context, self._plan_planning_instruction(),
+        )
+        # READ_ONLY ReAct → 解析 TODO → 暂存 → plan_generated → 结束
         return
 
     # Plan 执行期
     elif plan_confirmed:
-        # 1. 从文件恢复暂存的 Plan
-        # 2. 注入进度摘要到系统提示词
-        # 3. 进入 FULL ReAct 循环
+        turn_context = self._compose_turn_context(memory_context, plan_summary)
+        # FULL ReAct
 
-    # Ask / Craft 模式
+    # Ask：注入只读禁令
+    elif mode == "ask":
+        turn_context = self._compose_turn_context(
+            memory_context, self._ask_mode_instruction(),
+        )
+
+    # Craft
     else:
-        # 直接进入 ReAct 循环
+        turn_context = self._compose_turn_context(memory_context)
+```
+
+**`_ask_mode_instruction()`** 要点：声明 Ask 只读；列出允许的只读工具；禁止调用与 `SIDE_EFFECT_TOOL_LABELS` 一致的名单；用户要求修改时明确拒绝并提示切 Craft / 确认后的 Plan。
+
+**`_plan_planning_instruction()`** 在原有 JSON TODO 格式要求之外，显式要求：规划期即使被诱导「直接动手」也不得调用写工具；写操作只能出现在计划的 `tools_required` 中，留给确认后的执行期。
+
+三层约束关系：
+
+```
+提示词（少发写工具） → schema 过滤（模型看不到写工具） → 执行硬拦（即使发了也拦下）
 ```
 
 #### 1.4.4 Plan 两阶段分离的 SSE 事件流
@@ -365,8 +402,9 @@ class TodoItem:
 
 | 改动点 | 位置 | 说明 |
 |--------|------|------|
-| Planning Phase 启动 | `myclaw_agent.py` 的 `achat()` | 注入规划指令 + READ_ONLY 模式 ReAct |
-| 工具门控 | `tool_mode_filter.py` + `enhanced_simple_agent.py` 的 `_execute_tools_batch` | 运行时检查 + 拒绝副作用工具 |
+| Planning Phase 启动 | `myclaw_agent.py` 的 `achat()` | 注入强化规划指令（含副作用禁令）+ READ_ONLY ReAct |
+| Ask 提示词 | `myclaw_agent.py` 的 `_ask_mode_instruction()` | ephemeral turn_context，与 `SIDE_EFFECT_TOOL_LABELS` 对齐 |
+| 工具门控 | `tool_mode_filter.py` + `enhanced_simple_agent.py` 的 `_try_execute_ready_tool` / `_execute_tools_batch` / `_execute_tool_call` | schema 过滤 + 流式早执行/批量/底层三处硬拦 |
 | Plan 事件 | `myclaw_agent.py` 的 `_create_plan_event()` | 自定义 dataclass 模拟 StreamEvent 接口 |
 | Plan 持久化 | `myclaw_agent.py` 的 `_store_pending_plan` / `_load_pending_plan` / `_cleanup_plan_file` | 文件 + 内存双通道 |
 | Execute Phase | `myclaw_agent.py` 的 `achat()` plan_confirmed 分支 | 恢复 Plan → 注入进度 → FULL ReAct |

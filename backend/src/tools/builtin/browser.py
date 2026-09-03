@@ -15,7 +15,7 @@ import os
 import sys
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +80,12 @@ class BrowserSession:
         future = self._executor.submit(self._dispatch, action, kwargs)
         try:
             return future.result(timeout=self.max_timeout_s)
+        except FuturesTimeoutError:
+            future.cancel()
+            raise RuntimeError(
+                f"浏览器操作超时（>{self.max_timeout_s:.0f}s，action={action}）。"
+                "请检查网络或页面是否可访问；如浏览器不可用请向用户说明原因。"
+            )
         except Exception as e:
             # 超时或异常时取消 future
             future.cancel()

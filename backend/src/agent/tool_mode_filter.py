@@ -48,6 +48,24 @@ SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "memory_add",
 })
 
+# 提示词展示用的规范名（与 SIDE_EFFECT_TOOLS 对齐，去重大小写变体）
+SIDE_EFFECT_TOOL_LABELS: tuple[str, ...] = (
+    "Write",
+    "Edit",
+    "execute_command",
+    "bash",
+    "automation",
+    "memory_add",
+)
+
+
+def readonly_block_message(tool_name: str) -> str:
+    """READ_ONLY 下拒绝副作用工具时的统一文案（须含「只读模式」「被禁用」供评测识别）。"""
+    return (
+        f"⚠️ 当前为只读模式，工具 '{tool_name}' 被禁用。"
+        f"请切换到 Craft 或 Plan 模式执行修改操作。"
+    )
+
 
 # ============================================================================
 # 工具模式过滤器
@@ -127,9 +145,21 @@ class ToolModeFilter:
         """获取当前模式下可用工具的 schema 列表（用于 LLM function calling）。
 
         schema 格式为 OpenAI function calling 标准（Tool.to_openai_schema()）。
+        READ_ONLY 下额外按 function.name 过滤，防止 expandable 展开名漏网。
         """
         tools = self.get_available_tools()
-        return [tool.to_openai_schema() for tool in tools if hasattr(tool, 'to_openai_schema')]
+        schemas: List[Dict[str, Any]] = []
+        for tool in tools:
+            if not hasattr(tool, "to_openai_schema"):
+                continue
+            schema = tool.to_openai_schema()
+            if self._mode == ToolMode.READ_ONLY:
+                fn = (schema.get("function") or {}) if isinstance(schema, dict) else {}
+                name = fn.get("name") or getattr(tool, "name", "")
+                if name in SIDE_EFFECT_TOOLS:
+                    continue
+            schemas.append(schema)
+        return schemas
 
     def get_tool(self, name: str) -> Optional["Tool"]:
         """按名获取工具。

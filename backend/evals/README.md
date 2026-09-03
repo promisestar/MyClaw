@@ -99,11 +99,15 @@ uv run python -m evals --channel agent --suite core --workspace "$env:TEMP\mycla
 uv run python -m evals --channel agent --ids ask_readonly_gate,plan_generate,bash_sandbox
 ```
 
+`--workspace` 应为已授权的夹具副本。runner 会在**每个场景开始前**用 `fixtures/mini_repo`
+覆盖还原工作区文件（保留 `.myclaw` 授权元数据），避免前序 Craft/门控失败污染后续断言。
+所有场景在 `timeout_s` 到期时会调用 `/api/chat/cancel`，防止单场景长时间挂死。
+
 场景 YAML 需要 PyYAML（已加入 `dev` 依赖组）；若缺失、YAML 语法错误或字段缺失，
 都会打印告警并回退到 `suites/__init__.py` 里的 7 个内置兜底场景，**不会静默只跑兜底**。
 
-`cancel_mid_run` 场景通过新增的 `cancel_after_s` 字段实现：流式开始 N 秒后
-自动调用 `POST /api/chat/cancel`，断言收到 `cancelled` 事件。
+`cancel_mid_run` 场景通过 `cancel_after_s` 字段实现：流式开始 N 秒后
+自动调用 `POST /api/chat/cancel`，断言收到 `cancelled` 事件（与场景 `timeout_s` 取较早者）。
 
 > ⚠️ 后端 `/api/chat/cancel` 作用于**全局当前活跃令牌**（无 session 维度），
 > 因此评测必须串行执行（runner 已是串行）。runner 在流结束后会立即撤销待触发的

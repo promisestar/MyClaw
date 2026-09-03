@@ -6,10 +6,11 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .agent.harness.judge import (
     JudgeResult,
@@ -21,11 +22,44 @@ from .agent.harness.scorers import score_scenario
 from .agent.harness.sse_client import cancel_chat, run_chat_stream
 from .agent.harness.types import CaseResult, JudgeConfig, Scenario, StreamTrace
 from .agent.suites import load_scenarios
-from .paths import AGENT_REPORTS_DIR, EVALS_ROOT
+from .paths import AGENT_FIXTURES_DIR, AGENT_REPORTS_DIR, EVALS_ROOT
 
 logger = logging.getLogger(__name__)
 
 _BACKEND_ROOT = EVALS_ROOT.parent
+
+# 工作区重置时保留（授权元数据 / 缓存），不从夹具覆盖
+_WORKSPACE_PRESERVE = frozenset({".myclaw", ".pytest_cache", ".backups", "__pycache__"})
+
+
+def reset_workspace_from_fixture(workspace_path: str) -> None:
+    """用 mini_repo 夹具覆盖还原评测工作区文件，保留 .myclaw 等元数据。
+
+    每场景开始前调用，避免前序副作用污染后续断言（如 README / sample_app）。
+    """
+    ws = Path(workspace_path)
+    fixture = AGENT_FIXTURES_DIR
+    if not ws.is_dir():
+        logger.warning("工作区不存在，跳过重置: %s", workspace_path)
+        return
+    if not fixture.is_dir():
+        logger.warning("夹具目录不存在，跳过重置: %s", fixture)
+        return
+
+    for src in fixture.iterdir():
+        if src.name in _WORKSPACE_PRESERVE:
+            continue
+        dst = ws / src.name
+        try:
+            if src.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        except OSError as exc:
+            logger.warning("重置工作区条目失败 %s -> %s: %s", src, dst, exc)
 
 
 def _resolve_attachments(
@@ -67,7 +101,7 @@ async def _run_one(
     session_id: Optional[str],
     workspace_path: Optional[str],
 ) -> StreamTrace:
-    """执行单个场景；若配置了 cancel_after_s，则在 N 秒后触发取消。"""
+    """执行单个场景；timeout_s 到期或 cancel_after_s 触发时调用 /chat/cancel。"""
     attachments = _resolve_attachments(sc, workspace_path)
     stream_task = asyncio.create_task(
         run_chat_stream(
@@ -79,29 +113,33 @@ async def _run_one(
             skill=sc.skill,
             workspace_path=workspace_path,
             attachments=attachments or None,
-            timeout_s=sc.timeout_s,
+            timeout_s=sc.timeout_s + 30.0,  # 客户端略宽于服务端 cancel，避免竞态误杀
         )
     )
-    if sc.cancel_after_s is None:
+
+    # 场景级硬超时：到期 cancel，防止 browser 等挂死拖垮整 suite
+    deadlines: List[float] = [float(sc.timeout_s)]
+    if sc.cancel_after_s is not None:
+        deadlines.append(float(sc.cancel_after_s))
+    cancel_after = min(deadlines) if deadlines else None
+
+    if cancel_after is None:
         return await stream_task
 
     async def _canceller() -> None:
-        await asyncio.sleep(sc.cancel_after_s)
-        # 流已自行结束就没必要取消了：后端 /chat/cancel 作用于全局令牌，
-        # 迟到的 cancel 会打在下一个场景上。
+        await asyncio.sleep(cancel_after)
         if stream_task.done():
             return
         try:
             await cancel_chat(base_url)
+            logger.info("[%s] 已在 %.1fs 触发 cancel", sc.id, cancel_after)
         except Exception as exc:  # noqa: BLE001 — 取消失败不该让场景崩掉
-            logger.warning("cancel 调用失败: %s", exc)
+            logger.warning("[%s] cancel 调用失败: %s", sc.id, exc)
 
     cancel_task = asyncio.create_task(_canceller())
     try:
         return await stream_task
     finally:
-        # 必须 await 收尾：cancel() 只是投递请求，同 tick 内不会立即生效，
-        # 不等待的话 sleep 可能在撤销落地前走完并发出 cancel。
         if not cancel_task.done():
             cancel_task.cancel()
         await asyncio.gather(cancel_task, return_exceptions=True)
@@ -204,6 +242,12 @@ async def run_agent_suite(
                 continue
 
         ws = sc.workspace_path if sc.workspace_path is not None else workspace_path
+
+        if ws:
+            try:
+                reset_workspace_from_fixture(ws)
+            except Exception as exc:  # noqa: BLE001 — 重置失败记警告，仍尝试跑场景
+                logger.warning("[%s] 工作区重置失败: %s", sc.id, exc)
 
         try:
             trace = await _run_one(

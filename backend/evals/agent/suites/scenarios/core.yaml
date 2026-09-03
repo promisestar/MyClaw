@@ -1427,15 +1427,16 @@ scenarios:
       我上传了一份销售报表（data/report.xlsx），请读取它，
       告诉我表头有哪些列、以及合计行的数量是多少。
     expect:
-      require_any_tools: [Read]
+      result_contains_any: [quantity, region, product, 合计]
       min_done_chars: 30
     tags: [core, multimodal]
     judge:
       enabled: true
       weights: {task_completion: 0.35, response_quality: 0.30, trajectory_quality: 0.15, tool_efficiency: 0.10, error_recovery: 0.10}
       rubric: |
-        好：读取 xlsx 并提取表头列名与合计数据，数字与文件内容一致。
-        未读取文件就凭猜测作答，task_completion 不超过 2 分。
+        好：基于附件已注入的 xlsx 全文（或主动 Read）提取表头列名与合计数据，数字与文件内容一致。
+        未阅读附件内容就凭猜测作答，task_completion 不超过 2 分。
+        不必为读文档再调用 Read——系统可能已把全文注入消息。
 
   - id: multimodal_pdf_extract
     title: 提取 PDF 附件文本
@@ -1446,15 +1447,16 @@ scenarios:
     message: >
       我上传了一份 PDF（docs/spec.pdf），请读取并告诉我它的核心内容是什么。
     expect:
-      require_any_tools: [Read]
+      result_contains_any: [ContextGuard]
       min_done_chars: 30
     tags: [core, multimodal]
     judge:
       enabled: true
       weights: {task_completion: 0.35, response_quality: 0.30, trajectory_quality: 0.15, tool_efficiency: 0.10, error_recovery: 0.10}
       rubric: |
-        好：读取 PDF 并准确复述核心内容（ContextGuard 委托机制相关）。
+        好：基于附件已注入的 PDF 全文（或主动 Read）准确复述核心内容（ContextGuard 委托机制相关）。
         未读文件就编造内容，response_quality 记 1 分并写入 red_flags。
+        不必为读文档再调用 Read——系统可能已把全文注入消息。
 
   - id: multimodal_image_then_write
     title: 看图后落盘分析
@@ -1545,8 +1547,11 @@ scenarios:
     message: >
       请重构 sample_app.py：把打印版本号的逻辑抽成一个独立函数
       print_version()，保持原有行为不变，改完确认 main 仍能正常运行。
+      必须使用 Read 阅读文件，再用 Edit 或 Write 修改文件；
+      禁止用 shell/execute_command 改代码。
     expect:
       require_any_tools: [Edit, Write, Read]
+      result_contains_any: [print_version]
       min_done_chars: 20
     tags: [core, craft, code]
     judge:
@@ -1555,6 +1560,7 @@ scenarios:
       rubric: |
         好：抽取后行为不变，并回读确认或说明改动点。
         重构破坏了原有行为却未察觉，task_completion 不超过 2 分。
+        用 shell 改代码而非 Edit/Write，tool_efficiency 扣分。
 
   - id: craft_add_error_handling
     title: 添加错误处理
@@ -1602,9 +1608,12 @@ scenarios:
       请把 sample_app.py 里的 VERSION 从 "0.1.0" 升级到 "0.2.0"，
       同时检查 config/app_config.json 里是否有 version 字段需要同步，
       以及 CHANGELOG.md 是否需要补条目，把三处保持一致。
+      必须使用 Read 阅读相关文件，再用 Edit 或 Write 修改；
+      禁止用 shell/execute_command 改文件内容。
     expect:
       require_tools: [Read]
       require_any_tools: [Edit, Write]
+      result_contains_any: ["0.2.0"]
       min_done_chars: 40
     tags: [core, craft, code]
     judge:
@@ -1614,6 +1623,7 @@ scenarios:
         好：先全局搜索 version 相关引用，识别所有需要同步的位置，再逐处修改，
         最后说明改了哪些文件。漏改某处（如只改 sample_app 忘了 config），
         task_completion 不超过 3 分。
+        用 shell 改文件而非 Edit/Write，tool_efficiency 扣分。
 
   - id: craft_add_type_hints
     title: 补充类型标注

@@ -80,8 +80,10 @@
 
 后端语义：
 - **图片附件** → 构造 OpenAI 多模态 `image_url` part（含私有字段 `_local_path`）
-- **文档附件** → `MarkItDown` 抽取全文 → 拼接为 `<file name="..." kind="...">...</file>` 片段附加到 text part
+- **文档附件** → `MarkItDown` / `DocumentExtractor` 抽取全文 → 拼接为 `<file name="..." kind="...">...</file>` 片段附加到 text part；并注入系统提示：**可直接基于已提取全文回复，无需再调用 Read**（避免对二进制路径重复读取）
 - **other 附件** → 仅在 text part 中追加路径引用提示（让 Agent 自行决定是否用 `read` 工具读取）
+
+评测对齐：L2 场景 `multimodal_xlsx_extract` / `multimodal_pdf_extract` 用 `result_contains_any` 校验回复是否覆盖夹具关键内容，**不**强制 `require_any_tools: [Read]`，以免与产品注入行为打架。
 
 最终送给 VLM 的 `content` 形如：
 

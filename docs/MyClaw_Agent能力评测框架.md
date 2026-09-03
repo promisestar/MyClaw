@@ -9,7 +9,7 @@
 
 MyClaw 不是纯聊天机器人，而是带工具门控、两阶段规划、上下文路由、安全沙箱和多工作区绑定的 **生产级 Agent 运行时**。传统「问一句、看答一句」的人工体验测试，只能覆盖表层对话质量，无法稳定验证：
 
-- Ask 模式下副作用工具是否被 **代码级屏蔽**（而不只是 prompt 劝阻）
+- Ask 模式下副作用工具是否被 **代码级屏蔽**（schema + 流式早执行/批量/底层三处硬拦，辅以 turn_context 提示词；而不只是 prompt 劝阻）
 - Plan 规划期能否产出可解析 TODO，确认后能否恢复并执行
 - 工具去重 / 单轮限量 / 重试 / 取消是否按设计生效
 - Bash 危险命令与工作区白名单是否拦截
@@ -49,14 +49,18 @@ MyClaw 不是纯聊天机器人，而是带工具门控、两阶段规划、上�
 
 | 模式 | `ToolMode` | 行为要点 |
 |------|------------|----------|
-| `ask` | `READ_ONLY` | schema 过滤 + 执行期拦截 `SIDE_EFFECT_TOOLS` |
-| `plan` + `plan_confirmed=false` | `READ_ONLY` | 注入规划指令 → ReAct → `_parse_plan_from_response` → 暂存 `{session}_plan.json` → 发 `plan_generated` → **结束** |
+| `ask` | `READ_ONLY` | schema 过滤 + **三处执行硬拦** + `_ask_mode_instruction()`（turn_context） |
+| `plan` + `plan_confirmed=false` | `READ_ONLY` | 强化版 `_plan_planning_instruction()` → ReAct → `_parse_plan_from_response` → 暂存 → `plan_generated` → **结束** |
 | `plan_confirmed=true` | `FULL` | 恢复 plan → 注入进度摘要 → ReAct → 清理 plan 文件 |
-| `craft`（默认） | `FULL` | 全工具 ReAct |
+| `craft`（默认） | `FULL` | 全工具 ReAct，不注入只读禁令 |
 
 `SIDE_EFFECT_TOOLS`（`tool_mode_filter.py`）当前包含：
 
 `write` / `Write` / `edit` / `Edit` / `bash` / `execute_command` / `automation` / `memory_add`
+
+提示词展示名见 `SIDE_EFFECT_TOOL_LABELS`（与上表对齐，避免文案与代码漂移）。拒绝文案由 `readonly_block_message()` 统一生成，须含「只读模式」「被禁用」。
+
+**执行硬拦为何要三处？** 流式循环在参数 JSON 完整时会走 `_try_execute_ready_tool`「边收边跑」；若只在 `_execute_tools_batch`（FINISH 批量）过滤，Ask/Plan 规划期仍可能真实执行 `Edit`/`memory_add`。当前在早执行路径、批量路径与 `_execute_tool_call` 入口均拦截。L0 单测见 `tests/eval/test_l0_agent_contracts.py`。
 
 > 注意：Bash 真实注册名为 **`execute_command`**（不是 `bash`）。`bash` 键为兼容保留；scorer 已做别名映射。
 
@@ -176,8 +180,8 @@ L1 可用 `@pytest.mark.tool`；依赖外部服务的用例用 `@pytest.mark.req
 | `skill` | 可选，注入技能上下文 |
 | `reuse_session_from` | 复用上一场景的 `session_id`（如 `plan_confirm_exec`） |
 | `workspace_path` | 覆盖 CLI `--workspace`（少数场景用未授权路径测边界） |
-| `timeout_s` | 单场景 SSE 超时，默认 180s |
-| `cancel_after_s` | 流式开始 N 秒后自动 `POST /api/chat/cancel`（`cancel_mid_run`） |
+| `timeout_s` | 单场景超时（默认 180s）。到期后 runner 会调用 `/api/chat/cancel`，避免 browser 等挂死拖垮整 suite；httpx 客户端超时略宽于该值 |
+| `cancel_after_s` | 流式开始 N 秒后自动 cancel（`cancel_mid_run`）；与 `timeout_s` 取较早者触发 |
 | `attachments` | 多模态附件列表（`path` 相对工作区根；`kind`/`mime_type` 按扩展名推断，`size` 由 runner 现算） |
 | `expect` | 硬断言，见下表 |
 | `judge` | LLM-as-judge 场景级配置（`enabled` / `rubric` / `weights`）；未声明视为关闭 |
@@ -188,7 +192,7 @@ L1 可用 `@pytest.mark.tool`；依赖外部服务的用例用 `@pytest.mark.req
 | 字段 | 含义 |
 |------|------|
 | `require_events` | 必须出现的 SSE 事件名（如 `plan_generated`） |
-| `forbid_successful_tools` | 禁止「成功 finish」的工具（Ask/未确认 Plan 会自动合并只读副作用集） |
+| `forbid_successful_tools` | 禁止「成功 finish」的工具（Ask/未确认 Plan 会自动合并只读副作用集）。失败 / blocked / 「只读模式被禁用」等 **不算成功** |
 | `require_tools` | 必须全部调用 |
 | `require_any_tools` | 至少调用其一（走工具别名） |
 | `plan_min_items` / `plan_max_items` | `plan_generated.plan` 条数区间 |
@@ -203,7 +207,9 @@ L1 可用 `@pytest.mark.tool`；依赖外部服务的用例用 `@pytest.mark.req
 ```
 load_scenarios(suite, ids)
   → 对每个 Scenario：
+      reset_workspace_from_fixture(workspace)   # 夹具覆盖还原，保留 .myclaw
       run_chat_stream(POST /api/chat/send/stream, workspace_path=...)
+        → 并行：min(timeout_s, cancel_after_s?) 到期 → POST /api/chat/cancel
         → sse_client 解析 SSE（兼容 \r\n\r\n 与 \n\n）
         → 汇总 StreamTrace（events / tools / plan / done_content / errors）
       score_scenario(scenario, trace)  → CaseResult
@@ -214,9 +220,11 @@ load_scenarios(suite, ids)
   → write_agent_report → evals/reports/agent_<UTC>.json
 ```
 
+- **工作区重置**：`run_agent.py` 的 `reset_workspace_from_fixture` 在每场景开始前用 `evals/agent/fixtures/mini_repo` 覆盖还原文件（含被改脏的 README、`sample_app.py` 等），**保留** `.myclaw` 授权元数据，避免前序副作用污染后续断言。`--workspace` 应为夹具副本且已授权。
 - **工作区绑定**：请求体 `workspace_path` 触发 `agent.bind_workspace`；未授权则 SSE `error` 并结束。
-- **会话复用**：`reuse_session_from` 由 runner 维护 `session_map`，供 Plan 确认、跨会话记忆等场景串联。
-- **取消场景**：`cancel_after_s` 在独立 asyncio 任务中调用 `/api/chat/cancel`，与主流并行。
+- **会话复用**：`reuse_session_from` 由 runner 维护 `session_map`；工作区文件仍会按场景重置（记忆类依赖 Qdrant/session，不依赖脏文件）。
+- **超时与取消**：所有场景在 `timeout_s` 到期时 cancel；`cancel_after_s` 更早则优先。防止单场景小时级挂死。
+- **多模态文档场景**：xlsx/pdf 等 `kind=doc` 附件会由后端全文注入并提示「无需再 Read」；场景断言宜用 `result_contains_any` 校验内容，不宜强制 `require_any_tools: [Read]`。
 
 #### 终端输出与报告
 
@@ -728,7 +736,7 @@ uv run python -m evals --channel retrieval --reseed
 | `--base-url` | 后端地址，默认 `MYCLAW_EVAL_BASE_URL` 或 `http://127.0.0.1:8000` |
 | `--suite` | 按 tag 过滤，默认 `core` |
 | `--ids` | 逗号分隔场景 id，优先级高于 `--suite` |
-| `--workspace` | 已授权工作区绝对路径 |
+| `--workspace` | 已授权工作区绝对路径（建议为 `mini_repo` 副本；runner 每场景前会用夹具覆盖还原文件并保留 `.myclaw`） |
 | `--judge` | 启用 LLM-as-judge（默认关闭，仅参考，不影响 hard_pass） |
 | `--judge-repeat` | 每条轨迹重复 judge 次数，检验自一致性（默认 1） |
 
@@ -755,7 +763,7 @@ uv run python -m evals --channel retrieval --reseed
 |------|------|-------------|
 | **P0** | L0 单测进 CI；SSE client（`\r\n\r\n` 分帧）；50 场景 YAML；JSON 报告 + 退出码 | ✅ 已落地 |
 | **P1** | 工具别名 scorer；`cancel_after_s`；fixtures + 工作区授权流程；Memory/RAG `--reseed` 基线 | ✅ 大部分已落地 |
-| **P2** | 轨迹质量分（L2.1 确定性指标 + L2.2 LLM-as-judge）；能力矩阵看板；多模态 attachments 场景 | ✅ L2.1/L2.2 已落地；看板与多模态待做 |
+| **P2** | 轨迹质量分（L2.1 + L2.2 judge）；多模态 attachments；工作区每场景夹具还原；`timeout_s` 到期 cancel；门控覆盖流式早执行 + Ask/Plan turn_context 提示词 | ✅ 已落地（能力矩阵看板仍可增强） |
 | **P3** | mock LLM 覆盖 dedup/limit/retry（不烧 token） | 待做 |
 | **P4** | L2.3 执行验证（真跑脚本/校验落盘）；judge 黄金集校准（Spearman > 0.6） | 待做 |
 
@@ -769,12 +777,15 @@ uv run python -m evals --channel retrieval --reseed
 2. **工具大小写**：文件工具为 `Read`/`Write`/`Edit`；scorer 已做大小写别名。  
 3. **Expandable 工具 SSE 名 ≠ 父工具名**：如 `web_search` → `search_web`，`web_fetch` → `fetch_url`；YAML 写语义名即可，由 `tool_aliases.py` 对齐。  
 4. **MCP**：网关以 `mcp.servers[].name` 注册（如 `github`）；断言 `mcp` 时会认可 `mcp_*` 与常见网关名。非常规 server 名需在 `_MCP_GATEWAY_NAMES` 补充。  
-5. **`SIDE_EFFECT_TOOLS` 含 `bash` 与 `execute_command`**：运行时以 `execute_command` 为准。  
+5. **`SIDE_EFFECT_TOOLS` 含 `bash` 与 `execute_command`**：运行时以 `execute_command` 为准；另含 `memory_add`。门控须覆盖流式早执行路径，否则 Ask 仍可能真实落盘。  
 6. **Plan 解析失败会发 `error`**：计入 `violations`（若无 `error_contains_any` 豁免）。  
 7. **SSE 分帧**：后端 `sse-starlette` 使用 `\r\n\r\n` 分隔事件；`sse_client.py` 须同时支持 `\r\n\r\n` 与 `\n\n`，否则会出现「HTTP 200 但 done/content/tools 全空」的假失败。  
 8. **Calculator 注册名是 `python_calculator`**，且被标为有副作用（禁止委托）。  
 9. **Agent L2 报告仅 JSON**，字段以 `CaseResult.to_dict()` 为准（无 `trace_id` / `tokens_estimate` / 原始 trace 落盘）。  
-10. **R 轨与线上重排开关解耦**：`memory` / `memory_reranked` 由 CLI 通道强制开/关重排；线上行为看 `MEMORY_RERANK_ENABLED`。英文 MS MARCO MiniLM 对中文短记忆重排可能伤 MRR，优先使用 `BAAI/bge-reranker-base` 等中英友好模型。
+10. **R 轨与线上重排开关解耦**：`memory` / `memory_reranked` 由 CLI 通道强制开/关重排；线上行为看 `MEMORY_RERANK_ENABLED`。英文 MS MARCO MiniLM 对中文短记忆重排可能伤 MRR，优先使用 `BAAI/bge-reranker-base` 等中英友好模型。  
+11. **共享工作区会脏**：即使门控修好，Craft 场景仍会改文件；runner 已在每场景前夹具还原。手工复跑前也可自行 copy 干净副本。  
+12. **文档附件不要强制 Read**：`kind=doc` 会全文注入并提示无需 Read；`multimodal_xlsx_extract` / `multimodal_pdf_extract` 用 `result_contains_any` 验内容。  
+13. **`forbid_successful_tools` 与成功副作用判定对齐**：含 `error`/`失败`/`blocked`/只读拒绝的 finish **不**计为成功违规。
 
 ---
 
