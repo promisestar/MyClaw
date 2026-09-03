@@ -35,7 +35,7 @@ MyClaw 是一个**个性化 AI Agent 应用**。目标不是「单次问答」�
 
 | 通道 | 存什么 | 如何进模型 |
 |------|--------|------------|
-| Memory | 短事实 / 偏好（Qdrant） | 每轮 top-K → turn_context；工具仅保留 `memory_search` / `memory_add` |
+| Memory | 短事实 / 偏好（Qdrant） | 每轮最多 K 条过阈值 → turn_context（0 命中不注入）；工具仅保留 `memory_search` / `memory_add`（无正则自动捕获） |
 | Profile | 稳定风格 | `USER.md` AUTO 区写入冻结 system；对话驱动聚合 |
 | Session Recall | 历史原文 | `session_search` 按需检索，禁止大段 transcript 灌 Memory |
 

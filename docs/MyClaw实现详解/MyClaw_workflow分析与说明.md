@@ -75,7 +75,7 @@ flowchart TB
     H5 --> H6[HelloAgents Config: sessions 目录、上下文窗口、subagent 等]
     H6 --> H7[_setup_tools: Read/Write/Edit/Calculator + Memory/ExecuteCommand/WebSearch/WebFetch]
     H7 --> H8[EnhancedSimpleAgent 包装 LLM + tools + system_prompt]
-    H8 --> H9[MemoryFlushManager / MemoryCaptureManager]
+    H8 --> H9[MemoryFlushManager]
 ```
 
 | 子环节 | 说明 |
@@ -170,16 +170,16 @@ flowchart TB
     A5 --> A7
     A6 --> A7
     A7 --> A8[async for _agent.arun_stream_with_tools]
-    A8 --> A9[_capture_memories 异步]
+    A8 --> A9[_maybe_aggregate_profile 条件满足时]
     A9 --> A10[_check_and_run_memory_flush 可能触发静默 run]
 ```
 
 | 环节 | 说明 |
 |------|------|
 | 新会话 | 无 `session_id` 时生成短 id，清空 Agent 历史，重置 **MemoryFlush** 状态，避免旧会话压缩状态串到新会话。 |
-| 流式主体 | 将所有 `StreamEvent` 原样 `yield` 给 `chat.py`，由后者包装为 SSE。 |
-| `_capture_memories` | 对话结束后异步分析用户消息等，可能写入工作空间记忆（失败仅打日志，不阻断响应）。 |
-| `_check_and_run_memory_flush` | 用字符/3 估算 token；超阈值则构造 flush 提示词，**同步** `_agent.run(flush_prompt)` 做静默回合，引导模型把记忆写入文件；用户已收完主流，此步对用户不可见。 |
+| 流式主体 | 将所有 `StreamEvent` 原样 `yield` 给 `chat.py`，由后者包装为 SSE。对话中的记忆入库依赖 Agent 主动调用 `memory_add`（无对话结束正则自动捕获）。 |
+| `_maybe_aggregate_profile` | 对话结束后按条件（如每 10 轮或 preference 过多）从已有记忆聚合到 `USER.md`。 |
+| `_check_and_run_memory_flush` | 用字符/3 估算 token；超阈值则构造 flush 提示词，**同步** `_agent.run(flush_prompt)` 做静默回合，引导模型用 `memory_add` 写入要点；用户已收完主流，此步对用户不可见。 |
 
 ### 5.3 `EnhancedSimpleAgent.arun_stream_with_tools`（核心 ReAct 循环）
 

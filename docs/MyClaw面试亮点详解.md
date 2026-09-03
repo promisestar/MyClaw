@@ -567,19 +567,24 @@ Agent 需要跨会话记住两类截然不同的东西：
 
 ### 实现方案
 
-#### A. Memory 四层（事实层）
+#### A. Memory 写入 / 检索 / 遗忘（事实层）
 
 ```
-写入路径：
-  用户消息 → MemoryCaptureManager（正则自动提取）
-           → L1 字面去重（content_hash 精确匹配）
-           → L2 语义去重（embedding top-1 相似度，默认关闭）
+写入路径（显式，无正则自动捕获）：
+  Agent memory_add（source=agent，默认）
+  Memory Flush 静默回合 → memory_add（source=flush）
+  HTTP POST /api/memory/capture（source=api）
+           → L1 字面去重（content_hash 精确匹配，默认开）
+           → L2 语义去重（embedding top-1 相似度，默认关；
+              换中文 embedding 后 MEMORY_DEDUPE_THRESHOLD=0.90~0.93 可开）
            → Qdrant 向量存储
 
 检索路径：
   自动注入（被动）：
     每轮用户消息 → _inject_relevant_memories
-                 → 语义检索 top-3（score_threshold=0.3）
+                 → 语义检索：最多 auto_inject_top_k（默认 3）条
+                    且 score >= auto_inject_threshold（默认 0.3）
+                 → 0 命中则不注入；不足 K 条只注入实际命中
                  → 格式化为「相关记忆（自动注入）」写入 turn_context
                  → 仅合并进本轮发给模型的 user 前缀（不入 system、不入会话历史）
                  → Qdrant 不可用时静默降级（跳过注入）
@@ -617,13 +622,13 @@ Agent 需要跨会话记住两类截然不同的东西：
 
 #### C. Profile（人设层）
 
-`ProfileAggregator` 把 preference/entity 等记忆沉淀到 `USER.md`，经 `_build_system_prompt` **常驻**注入——偏稳定风格，与每轮 top-K 自动注入互补。
+`ProfileAggregator` 把 preference/entity 等记忆沉淀到 `USER.md`，经 `_build_system_prompt` **常驻**注入——偏稳定风格，与每轮「最多 K 条过阈值」自动注入互补。画像质量依赖上游显式写入（`memory_add` / Flush / API），系统不再正则自动抓取用户原话。
 
 ### 设计亮点
 
 **1. 写入双层去重（Memory）**：
 - L1 字面去重（默认启用）：`content` 经归一化后求 SHA1[:16]，精确匹配，零误判
-- L2 语义去重（默认关闭）：embedding top-1 相似度 ≥ 阈值即视为重复。默认关闭是因为当前 embedding 模型对中文反义/同义辨别力不足
+- L2 语义去重（默认关闭，`MEMORY_DEDUPE_THRESHOLD=1.0`）：embedding top-1 相似度 ≥ 阈值即视为重复。默认关闭是因为当前 embedding 模型对中文反义/同义辨别力不足；换 `BAAI/bge-small-zh-v1.5` 等后将阈值设为 0.90～0.93 即可启用
 
 **2. 分类差异化衰减**：
 
@@ -637,7 +642,7 @@ Agent 需要跨会话记住两类截然不同的东西：
 
 **4. 懒处理策略**：衰减计算和删除只在程序启动时或手动调用时执行，不随每轮对话触发，零运行时开销。
 
-**5. 自动注入（被动检索）**：每轮用户消息到达时，后台语义检索 top-3 相关记忆，经 `turn_context` 挂到本轮 user 前缀（不改 system、不写历史）。配置项支持开关、top_k 和相似度阈值。Qdrant 不可用时静默降级。
+**5. 自动注入（被动检索）**：每轮用户消息到达时，语义检索相关记忆，**最多**注入 `auto_inject_top_k` 条（默认 3）且须过 `auto_inject_threshold`（默认 0.3）；0 命中则不注入。结果经 `turn_context` 挂到本轮 user 前缀（不改 system、不写历史）。配置项支持开关、上限条数和相似度阈值。Qdrant 不可用时静默降级。
 
 **6. 事实 / 原文硬边界（Session Recall）**：
 - JSON 为 source of truth，`index.db` 可丢可重建——与 Hermes「写入即索引」同构，但 MyClaw 不改 hello-agents 内核，用 save/delete 挂钩增量维护。  
@@ -650,7 +655,7 @@ Agent 需要跨会话记住两类截然不同的东西：
 
 ### 面试展示要点
 
-> "回忆不是一个桶。我们拆成三通道：Memory 用 Qdrant 存短事实，每轮 top-3 挂到 user 侧临时上下文（不打断 system 前缀缓存），再加衰减和用进废退；Profile 把偏好沉淀进 USER.md 常驻于冻结 system；Session Recall 用全局会话 JSON + SQLite FTS，Agent 用 session_search 按需钻原文——锚定窗口加 bookend，不把旧对话每轮灌进 prompt。事实和原文分开，是为了既省 token，又答得出『上次我们具体怎么说的』。"
+> "回忆不是一个桶。我们拆成三通道：Memory 用 Qdrant 存短事实，每轮最多注入若干条过阈值的相关记忆挂到 user 侧临时上下文（不打断 system 前缀缓存；无关话题可为 0），再加衰减和用进废退；写入靠 memory_add / Flush / API，不做正则自动抓取。Profile 把偏好沉淀进 USER.md 常驻于冻结 system；Session Recall 用全局会话 JSON + SQLite FTS，Agent 用 session_search 按需钻原文——锚定窗口加 bookend，不把旧对话每轮灌进 prompt。事实和原文分开，是为了既省 token，又答得出『上次我们具体怎么说的』。"
 
 ---
 
@@ -972,7 +977,6 @@ def bind_workspace(self, workspace_path: str):
     self.skill_loader.clear()                  # 清缓存重新加载
     self._subagent_orchestrator.workspace_path = abs_path
     self._agent.workspace_root = Path(abs_path).resolve()
-    self._memory_capture_manager.workspace_manager = self.workspace
     self.ensure_session_system_prompt(force=True)  # 会话边界重建（identity 不变）
     # sessions/tasks 已全局化（~/.helloclaw/），无需重绑
 ```
@@ -1412,9 +1416,8 @@ def bind_workspace(self, workspace_path: str):
     self._agent.workspace_root = Path(abs_path)       # ⑤ Agent 工作区根
     self._browser_session._uploads_dir = Path(...)    # ⑥ 浏览器上传
     self._automation_store = AutomationStore(...)     # ⑦ 定时任务
-    self._memory_capture_manager.workspace_manager = ...  # ⑧ 记忆捕获
-    self.ensure_session_system_prompt(force=True)  # ⑨ 系统提示词（会话边界重建，identity 不变）
-    # ⑩⑪⑫ ... 更多引用点
+    self.ensure_session_system_prompt(force=True)  # ⑧ 系统提示词（会话边界重建，identity 不变）
+    # ⑨⑩⑪ ... 更多引用点（Memory 为全局 Qdrant，无需随工作区重绑）
 
     print(f"🔄 已切换工作区: {abs_path}")
 ```
@@ -1547,9 +1550,9 @@ SIDE_EFFECT_BLACKLIST = {
 
 #### 设计哲学：窗口分配经济学
 
-核心原则是 **"系统提示词的每条规则都是一种成本"**。注入子代理使用指引消耗 ~800 token，注入任务管理指引 ~600 token，注入记忆检索 top-3 ~500-2000 token。每加一条，都是在跟用户的对话内容抢空间。
+核心原则是 **"系统提示词的每条规则都是一种成本"**。注入子代理使用指引消耗 ~800 token，注入任务管理指引 ~600 token，注入记忆检索（最多若干条过阈值，常约 0～3 条）~0–2000 token。每加一条，都是在跟用户的对话内容抢空间。
 
-所以我做了"条件注入"：BOOTSTRAP 入职引导只在入职完成前注入，完成后自动消失。记忆自动注入也有 Qdrant score_threshold 过滤，相关性不够的不注入。这些都是"按需付费"的思路——不用就不占窗口。
+所以我做了"条件注入"：BOOTSTRAP 入职引导只在入职完成前注入，完成后自动消失。记忆自动注入也有 Qdrant score_threshold 过滤，相关性不够的不注入（可整轮为 0）。这些都是"按需付费"的思路——不用就不占窗口。
 
 #### 这个为什么难
 

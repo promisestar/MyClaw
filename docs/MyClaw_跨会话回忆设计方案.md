@@ -16,7 +16,7 @@
 | 能力 | 实现 |
 |------|------|
 | 长期事实 / 偏好记忆 | Qdrant `helloclaw_memory` + 语义检索 |
-| 每轮自动注入 | `_inject_relevant_memories`，默认 top-K=**3** |
+| 每轮自动注入 | `_inject_relevant_memories`，**最多** top-K=`auto_inject_top_k`（默认 **3**）且过 `auto_inject_threshold`（默认 0.3）；0 命中不注入 |
 | 工具深挖 | `memory_search` / `memory_add` / … |
 | 用户画像 | `ProfileAggregator` → `USER.md` 常驻 system prompt |
 | 会话原文落盘 | `~/.helloclaw/sessions/<id>.json`（**全局**，跨工作区保留） |
@@ -37,7 +37,7 @@ Agent **无法**在当前会话中回答：「上周那个会话里我们怎么�
 1. **原文可召回**：Agent 可按关键词 / 短语 / 时间，跨所有全局会话检索消息原文。  
 2. **可钻取**：命中后能拉「锚定窗口」（前后若干条）与会话首尾 bookend，必要时滚动翻阅。  
 3. **与 Memory 分工清晰**：事实偏好走 Memory；「那次对话说了什么」走 Session Recall。  
-4. **不破坏现有体验**：自动注入 top-3、画像、Flush 行为保持；Session Recall **默认不自动注入全文**（按需工具，控 token）。  
+4. **不破坏现有体验**：自动注入「最多 K 条过阈值」、画像、Flush 行为保持；Session Recall **默认不自动注入全文**（按需工具，控 token）。  
 5. **贴合 MyClaw 架构**：会话已在 `~/.helloclaw/sessions/` 全局化；索引亦全局，与多工作区兼容。  
 6. **可演进**：首期 FTS 关键词召回；二期可选语义 / 标题摘要 / 压缩归档可发现性。
 
@@ -65,7 +65,7 @@ flowchart TB
 
 | 通道 | 存什么 | 进模型方式 | 典型问法 |
 |------|--------|------------|----------|
-| **Memory** | 短条目事实/偏好 | 每轮 top-3 自动注入 + 工具 | 「我喜欢什么风格？」 |
+| **Memory** | 短条目事实/偏好 | 每轮最多 K 条过阈值自动注入 + 工具 | 「我喜欢什么风格？」 |
 | **Profile** | 聚合后的用户画像 | 常驻 system prompt | 「按我的习惯来」 |
 | **Session Recall（新）** | 消息级原文索引 | **仅工具按需** | 「上次部署失败的日志我们怎么排查的？」 |
 
@@ -405,7 +405,7 @@ get_anchored_view(session_id, message_id, window=5, bookend=3)
 | 策略 | 说明 | 建议 |
 |------|------|------|
 | Session 不自动注入 | 避免每轮额外数千 token | **采用** |
-| Memory 继续 top-3 | 不变 | **保持** |
+| Memory 继续「最多 K + 阈值」 | 不变（默认最多 3、阈值 0.3） | **保持** |
 | 可选「轻量会话提示」 | 若 browse 发现 24h 内强相关会话，仅在 system 中加一行 hint：`相关旧会话 id=…，可用 session_search` | **二期可选**，默认关 |
 | 双通道同时命中 | 模型可并用；AGENTS 写明 Memory 优先答偏好，细节用 session_search 核实 | 文档 + prompt |
 
@@ -603,7 +603,7 @@ def probe_sqlite_fts_capabilities() -> dict:
 
 ### 16.2 一句话总结
 
-> **完整跨会话回忆 = 保留并增强现有 Memory（事实层）+ 新增基于全局会话 JSON 的 SQLite FTS Session Recall（原文层）+ 画像常驻（人设层）；Agent 用 `session_search` 按需钻取，不与每轮 top-3 自动注入抢 token。**
+> **完整跨会话回忆 = 保留并增强现有 Memory（事实层）+ 新增基于全局会话 JSON 的 SQLite FTS Session Recall（原文层）+ 画像常驻（人设层）；Agent 用 `session_search` 按需钻取，不与每轮「最多 K 条过阈值」自动注入抢 token。**
 
 ---
 

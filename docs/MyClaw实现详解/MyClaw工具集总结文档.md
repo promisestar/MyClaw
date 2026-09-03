@@ -328,10 +328,10 @@ MyClaw 的修复：
 | `memory_add` | `content`, `category`, `session_id` | 添加记忆条目 |
 
 **实现要点**：
-- **自动捕获**：`MemoryCaptureManager` 在每轮对话结束后自动提取要点并存为记忆
-- **双路检索**：语义检索（Qdrant）+ 关键词过滤，相关记忆自动注入本轮用户消息前缀
+- **显式写入**：Agent 调 `memory_add`（`source=agent`）；接近压缩阈值时 Memory Flush 静默回合引导写入（`source=flush`）；也可经 HTTP `POST /api/memory/capture`（`source=api`）。**无**对话结束正则自动捕获
+- **双路检索**：语义检索（Qdrant）+ 可选分类过滤；每轮最多自动注入 `auto_inject_top_k` 条过阈值记忆到本轮用户消息前缀（可能为 0）
 - **衰减机制**：长期未引用的记忆逐渐降低权重；启动时与 HTTP cleanup 触发 `process_decay`
-- **去重**：文本 hash + embedding 余弦相似度双重去重
+- **去重**：L1 文本 hash（默认开）+ L2 embedding 余弦相似度（默认关，`MEMORY_DEDUPE_THRESHOLD=1.0`）
 
 **适用场景**：记住用户偏好、保存项目背景、跨会话知识继承。
 

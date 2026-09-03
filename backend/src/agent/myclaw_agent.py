@@ -20,7 +20,6 @@ from .multimodal_bridge import (
     install_simple_agent_multimodal_patch,
 )
 from ..memory.memory_flush import MemoryFlushManager
-from ..memory.capture import MemoryCaptureManager
 from ..memory.vector_store import MemoryVectorStore
 from ..multimodal import MultimodalConfig, build_user_content
 
@@ -280,12 +279,6 @@ class MyClawAgent:
         # 此时 config / ContextManager / MemoryFlushManager 均已就绪，
         # 同步动态上下文窗口（覆盖 _init_llm 中因 config 尚未创建而跳过的首次调用）
         self._sync_context_window()
-
-        # 初始化 Memory Capture 管理器（传入 memory_store）
-        self._memory_capture_manager = MemoryCaptureManager(
-            memory_store=self._memory_store,
-            workspace_manager=self.workspace,  # 过渡期回退
-        )
 
         # 初始化用户画像聚合器
         self._profile_aggregator = ProfileAggregator(
@@ -759,10 +752,6 @@ class MyClawAgent:
         if self._agent is not None and hasattr(self._agent, "workspace_root"):
             self._agent.workspace_root = Path(abs_path).resolve()
 
-        # 更新 MemoryCaptureManager 的 workspace 引用
-        if hasattr(self, "_memory_capture_manager") and self._memory_capture_manager:
-            self._memory_capture_manager.workspace_manager = self.workspace
-
         # 重建系统提示词（identity 不变 + 新工作区 AGENTS 叠加）
         if self._agent is not None:
             self.ensure_session_system_prompt(force=True)
@@ -950,13 +939,16 @@ class MyClawAgent:
     def _inject_relevant_memories(self, user_message: str) -> str:
         """检索与用户消息相关的记忆，返回格式化的轮次上下文文本。
 
-        每轮用户消息到达时后台语义检索 top-K 记忆，作为 ephemeral turn_context
+        每轮用户消息到达时后台语义检索相关记忆，作为 ephemeral turn_context
         注入本轮发给模型的 user 前缀（不写入 system、不入会话历史）。
-        如果记忆系统不可用或无相关记忆，返回空字符串。
+
+        注入语义：**最多** ``auto_inject_top_k`` 条（默认 3），且相似度
+        ``score >= auto_inject_threshold``（默认 0.3）；命中不足 N 条时只注入
+        实际命中项，0 条则不注入（返回空字符串）。
 
         配置项（config.json 的 memory 段）：
         - auto_inject: bool, 是否启用自动注入（默认 True）
-        - auto_inject_top_k: int, 返回结果数量（默认 3）
+        - auto_inject_top_k: int, 最多注入条数（默认 3）
         - auto_inject_threshold: float, 相似度阈值（默认 0.3）
 
         Args:
@@ -1004,6 +996,12 @@ class MyClawAgent:
                 top_k=top_k,
                 score_threshold=score_threshold,
             )
+
+            # 二次过滤：确保仅注入过阈值的条目（防御重排路径带回低分结果）
+            memories = [
+                m for m in memories
+                if m.get("score", 0) >= score_threshold
+            ][:top_k]
 
             if not memories:
                 return ''
@@ -1620,35 +1618,12 @@ class MyClawAgent:
             if hasattr(self, '_pending_plans'):
                 self._pending_plans.pop(session_id, None)
 
-        # 对话结束后自动捕获记忆（异步执行，不阻塞用户）
-        await self._capture_memories(message)
-
         # 检查是否需要触发用户画像聚合
         self._chat_turn_count += 1
         await self._maybe_aggregate_profile()
 
         # 对话结束后检查是否需要触发 Memory Flush（异步执行，不阻塞用户）
         await self._check_and_run_memory_flush()
-
-    async def _capture_memories(self, user_message: str):
-        """自动捕获对话中的记忆
-
-        Args:
-            user_message: 用户消息
-        """
-        try:
-            session_id = getattr(self, "_current_session_id", None)
-            # 使用 MemoryCaptureManager 分析并存储记忆到 Qdrant
-            memories = await self._memory_capture_manager.acapture_and_store(
-                user_message, session_id=session_id
-            )
-
-            if memories:
-                print(f"📝 自动捕获 {len(memories)} 条记忆")
-                for m in memories:
-                    print(f"   - [{m['category']}] {m['content'][:50]}...")
-        except Exception as e:
-            print(f"⚠️ 记忆捕获失败: {e}")
 
     async def _maybe_aggregate_profile(self):
         """检查是否需要触发用户画像聚合。

@@ -245,7 +245,7 @@ class MemoryVectorStore:
         content: str,
         category: str = "fact",
         session_id: Optional[str] = None,
-        source: str = "capture",
+        source: str = "agent",
     ) -> Optional[str]:
         """向量化并写入一条长期记忆，写入前自动做 L1（+L2，可选）去重。
 
@@ -270,7 +270,7 @@ class MemoryVectorStore:
             content: 记忆文本内容
             category: 分类标签（preference/decision/entity/fact/plan/relationship/reference）
             session_id: 关联的会话 ID
-            source: 来源（capture/agent/flush）
+            source: 来源（agent / flush / api）
 
         Returns:
             memory_id 字符串（可能是复用的旧 ID），失败返回 None
