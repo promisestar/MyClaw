@@ -522,12 +522,18 @@ class QdrantVectorStore:
             logger.error(f"❌ 删除记忆失败: {e}")
             raise
 
-    def delete_by_filter(self, where: Dict[str, Any]) -> bool:
-        """按 payload 过滤条件删除向量。"""
+    def delete_by_filter(self, where: Dict[str, Any]) -> int:
+        """按 payload 过滤条件删除向量。
+
+        Returns:
+            int: 实际匹配并删除的点数；过滤条件非法或删除失败时返回 ``-1``。
+            注意：Qdrant 在匹配 0 条时仍会返回成功，因此必须先 ``count`` 再删，
+            避免上层误报「删除成功」。
+        """
         try:
             if not where:
                 logger.warning("⚠️ delete_by_filter 缺少过滤条件，已拒绝执行")
-                return False
+                return -1
 
             conditions = []
             for key, value in where.items():
@@ -541,30 +547,43 @@ class QdrantVectorStore:
 
             if not conditions:
                 logger.warning("⚠️ delete_by_filter 没有有效过滤条件，已拒绝执行")
-                return False
+                return -1
+
+            query_filter = Filter(must=conditions)
+            matched = int(
+                self.client.count(
+                    collection_name=self.collection_name,
+                    count_filter=query_filter,
+                    exact=True,
+                ).count
+            )
+            if matched <= 0:
+                logger.warning("⚠️ delete_by_filter 未匹配到任何点: %s", where)
+                return 0
 
             self.client.delete(
                 collection_name=self.collection_name,
-                points_selector=models.FilterSelector(filter=Filter(must=conditions)),
+                points_selector=models.FilterSelector(filter=query_filter),
                 wait=True,
             )
-            logger.info("✅ 成功按过滤条件删除Qdrant向量: %s", where)
-            return True
+            logger.info("✅ 成功按过滤条件删除 %s 个Qdrant向量: %s", matched, where)
+            return matched
         except Exception as e:
             logger.error("❌ 按过滤条件删除向量失败: %s", e)
-            return False
+            return -1
 
     def clear_namespace(self, namespace: str) -> bool:
         """仅清空指定 RAG 命名空间的数据，避免误删同集合中其他 namespace。"""
         if not namespace or not str(namespace).strip():
             logger.warning("⚠️ clear_namespace 缺少 namespace，已拒绝执行")
             return False
-        return self.delete_by_filter({
+        deleted = self.delete_by_filter({
             "memory_type": "rag_chunk",
             "is_rag_data": True,
             "data_source": "rag_pipeline",
             "rag_namespace": str(namespace).strip(),
         })
+        return deleted >= 0
     
     def get_document_list(self, namespace: Optional[str] = None) -> List[Dict[str, Any]]:
         """使用 scroll API 遍历 RAG chunk，按 source_path 聚合文档信息。

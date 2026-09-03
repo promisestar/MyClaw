@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ..harness.types import Expectation, Scenario
+from ..harness.types import Expectation, JudgeConfig, Scenario
 
 _SCENARIO_DIR = Path(__file__).resolve().parent / "scenarios"
 
@@ -148,7 +148,7 @@ def load_scenarios(
         )
         scenarios = _builtin_scenarios()
     if suite and suite != "all":
-        scenarios = [s for s in scenarios if suite in s.tags or suite == "core" and "core" in s.tags]
+        scenarios = [s for s in scenarios if suite in s.tags]
     if ids:
         wanted = set(ids)
         scenarios = [s for s in scenarios if s.id in wanted]
@@ -169,41 +169,168 @@ def _try_load_yaml() -> Optional[List[Scenario]]:
 
     out: List[Scenario] = []
     for path in sorted(_SCENARIO_DIR.glob("*.yaml")):
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            # 语法错误必须走降级路径，否则异常直接冒泡，
+            # 调用方连「已回退兜底场景」的告警都看不到。
+            print(f"⚠️ 解析 {path.name} 失败: {exc}", file=sys.stderr)
+            return None
         cases = data if isinstance(data, list) else data.get("scenarios", [])
         for raw in cases:
-            exp_raw = raw.get("expect") or {}
-            exp = Expectation(
-                require_events=list(exp_raw.get("require_events") or []),
-                forbid_successful_tools=list(exp_raw.get("forbid_successful_tools") or []),
-                require_tools=list(exp_raw.get("require_tools") or []),
-                require_any_tools=list(exp_raw.get("require_any_tools") or []),
-                plan_min_items=exp_raw.get("plan_min_items"),
-                plan_max_items=exp_raw.get("plan_max_items"),
-                result_contains_any=list(exp_raw.get("result_contains_any") or []),
-                error_contains_any=list(exp_raw.get("error_contains_any") or []),
-                min_done_chars=int(exp_raw.get("min_done_chars") or 0),
-                expect_cancelled=bool(exp_raw.get("expect_cancelled") or False),
-            )
-            out.append(
-                Scenario(
-                    id=raw["id"],
-                    title=raw.get("title") or raw["id"],
-                    message=raw["message"],
-                    mode=raw.get("mode") or "craft",
-                    plan_confirmed=bool(raw.get("plan_confirmed") or False),
-                    skill=raw.get("skill"),
-                    session_id=raw.get("session_id"),
-                    workspace_path=raw.get("workspace_path"),
-                    reuse_session_from=raw.get("reuse_session_from"),
-                    timeout_s=float(raw.get("timeout_s") or 180),
-                    cancel_after_s=(
-                        float(raw["cancel_after_s"])
-                        if raw.get("cancel_after_s") is not None
-                        else None
-                    ),
-                    expect=exp,
-                    tags=list(raw.get("tags") or ["core"]),
+            try:
+                out.append(_scenario_from_raw(raw))
+            except (KeyError, TypeError, ValueError) as exc:
+                print(
+                    f"⚠️ {path.name} 中场景字段缺失或类型错误: {exc}",
+                    file=sys.stderr,
                 )
-            )
+                return None
     return out or None
+
+
+def _judge_from_raw(raw: Any) -> Optional[JudgeConfig]:
+    """解析场景的 judge 段。
+
+    写法宽容：`judge: true` 视为启用且用默认权重/rubric；
+    `judge: {enabled: false}` 显式关闭；未声明返回 None（视为关闭）。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return JudgeConfig(enabled=raw)
+    if not isinstance(raw, dict):
+        raise ValueError(f"judge 段类型错误: {type(raw).__name__}")
+
+    weights_raw = raw.get("weights") or {}
+    if not isinstance(weights_raw, dict):
+        raise ValueError("judge.weights 必须是映射")
+    weights: Dict[str, float] = {}
+    for k, v in weights_raw.items():
+        try:
+            weights[str(k)] = float(v)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"judge.weights.{k} 不是数字: {v}") from exc
+
+    return JudgeConfig(
+        enabled=bool(raw.get("enabled", True)),
+        weights=weights,
+        rubric=str(raw.get("rubric") or ""),
+    )
+
+
+_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".csv": "text/csv",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".json": "application/json",
+}
+
+_KIND_BY_SUFFIX = {
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".gif": "image",
+    ".webp": "image",
+    ".pdf": "doc",
+    ".doc": "doc",
+    ".docx": "doc",
+    ".xls": "doc",
+    ".xlsx": "doc",
+    ".ppt": "doc",
+    ".pptx": "doc",
+    ".csv": "doc",
+    ".md": "doc",
+    ".txt": "doc",
+    ".json": "doc",
+}
+
+
+def _attachments_from_raw(raw: Any) -> List[Dict[str, Any]]:
+    """解析场景的 attachments 段。
+
+    只强制要求 `path`（相对工作区根）与 `filename`；`mime_type` 与 `kind`
+    按扩展名推断，`size` 由 runner 在实际工作区里自动补（YAML 里写死大小
+    会在夹具变动时过期）。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError(f"attachments 段类型错误: {type(raw).__name__}")
+
+    out: List[Dict[str, Any]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"attachments[{i}] 必须是映射")
+        path = str(item.get("path") or "").strip()
+        if not path:
+            raise ValueError(f"attachments[{i}] 缺少 path")
+        filename = str(item.get("filename") or path.split("/")[-1])
+        suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        kind = str(item.get("kind") or _KIND_BY_SUFFIX.get(suffix, "other"))
+        if kind not in ("image", "doc", "other"):
+            raise ValueError(f"attachments[{i}].kind 非法: {kind}")
+        out.append(
+            {
+                "stored_path": path.replace("\\", "/"),
+                "filename": filename,
+                "mime_type": str(item.get("mime_type") or _MIME_BY_SUFFIX.get(suffix, "application/octet-stream")),
+                "kind": kind,
+                "size": int(item.get("size") or 0),
+            }
+        )
+    return out
+
+
+def _scenario_from_raw(raw: dict) -> Scenario:
+    """把单条 YAML 记录转成 Scenario；字段缺失时抛错由调用方降级处理。"""
+    exp_raw = raw.get("expect") or {}
+    exp = Expectation(
+        require_events=list(exp_raw.get("require_events") or []),
+        forbid_successful_tools=list(exp_raw.get("forbid_successful_tools") or []),
+        require_tools=list(exp_raw.get("require_tools") or []),
+        require_any_tools=list(exp_raw.get("require_any_tools") or []),
+        plan_min_items=exp_raw.get("plan_min_items"),
+        plan_max_items=exp_raw.get("plan_max_items"),
+        result_contains_any=list(exp_raw.get("result_contains_any") or []),
+        forbid_result_contains_any=list(
+            exp_raw.get("forbid_result_contains_any") or []
+        ),
+        error_contains_any=list(exp_raw.get("error_contains_any") or []),
+        min_done_chars=int(exp_raw.get("min_done_chars") or 0),
+        expect_cancelled=bool(exp_raw.get("expect_cancelled") or False),
+    )
+    return Scenario(
+        id=raw["id"],
+        title=raw.get("title") or raw["id"],
+        message=raw["message"],
+        mode=raw.get("mode") or "craft",
+        plan_confirmed=bool(raw.get("plan_confirmed") or False),
+        skill=raw.get("skill"),
+        session_id=raw.get("session_id"),
+        workspace_path=raw.get("workspace_path"),
+        reuse_session_from=raw.get("reuse_session_from"),
+        timeout_s=float(raw.get("timeout_s") or 180),
+        cancel_after_s=(
+            float(raw["cancel_after_s"])
+            if raw.get("cancel_after_s") is not None
+            else None
+        ),
+        expect=exp,
+        tags=list(raw.get("tags") or ["core"]),
+        judge=_judge_from_raw(raw.get("judge")),
+        attachments=_attachments_from_raw(raw.get("attachments")),
+    )

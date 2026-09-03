@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import List
 
 from .tool_aliases import expand_forbid_set, trace_has_tool
+from .trace_metrics import compute_trace_metrics
 from .types import CaseResult, Expectation, Scenario, StreamTrace
 
 # 只读门控下禁止「成功执行」的副作用工具（真实注册名）
@@ -129,6 +130,22 @@ def score_scenario(scenario: Scenario, trace: StreamTrace) -> CaseResult:
                 "结果未包含期望子串: " + " | ".join(exp.result_contains_any)
             )
 
+    # 反向断言：这类行为「绝不应发生」，出现了就是违规。
+    # 与 result_contains_any 的区别：不要求工具一定被调用，
+    # 只在**确实调用了**时才检查其结果——没调用不算违规（那是 require_* 的职责）。
+    if exp.forbid_result_contains_any:
+        for fin in trace.tool_finishes:
+            result_text = str(fin.get("result") or "")
+            if not result_text:
+                continue
+            hit = next(
+                (s for s in exp.forbid_result_contains_any if s in result_text), None
+            )
+            if hit is not None:
+                violations.append(
+                    f"工具 {fin.get('tool') or '?'} 结果出现禁止子串: {hit}"
+                )
+
     if exp.error_contains_any:
         err_blob = "\n".join(trace.errors)
         if not any(s in err_blob for s in exp.error_contains_any):
@@ -152,7 +169,15 @@ def score_scenario(scenario: Scenario, trace: StreamTrace) -> CaseResult:
         for e in trace.errors:
             violations.append(f"SSE error: {e}")
 
-    soft = 1.0 if not violations else max(0.0, 1.0 - 0.2 * len(violations))
+    # 规则分： violations 数量的线性函数（保留旧语义，便于跨版本对比）
+    rule_score = 1.0 if not violations else max(0.0, 1.0 - 0.2 * len(violations))
+
+    # L2.1 轨迹质量折扣。hard_pass 只反映「是否合规」，soft_score 再叠加
+    # 「做得好不好」，二者从此不再是同一个信息的两种写法。
+    tm = compute_trace_metrics(trace)
+    penalty = tm.weighted_penalty()
+    soft = max(0.0, rule_score * (1.0 - penalty))
+
     metrics = {
         "latency_ms": round(trace.latency_ms, 1),
         "tool_calls": len(trace.tool_finishes),
@@ -160,6 +185,8 @@ def score_scenario(scenario: Scenario, trace: StreamTrace) -> CaseResult:
         "events": trace.event_names,
         "chunk_chars": sum(len(c) for c in trace.chunks),
         "plan_items": len(trace.plan or []),
+        "rule_score": round(rule_score, 4),
+        "trace_penalty": round(penalty, 4),
     }
     if trace.context_usage:
         metrics["context_usage"] = trace.context_usage
@@ -173,4 +200,5 @@ def score_scenario(scenario: Scenario, trace: StreamTrace) -> CaseResult:
         metrics=metrics,
         session_id=trace.session_id,
         raw=trace,
+        trace_metrics=tm.to_dict(),
     )

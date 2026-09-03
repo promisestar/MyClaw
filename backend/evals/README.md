@@ -43,24 +43,43 @@ uv run pytest tests/eval -q
 
 ### L2 Agent 场景（需已启动后端 + LLM）
 
-场景定义在 `agent/suites/scenarios/core.yaml`，当前 **50 个**，覆盖：
+场景定义在 `agent/suites/scenarios/core.yaml`，当前 **100 个**，覆盖：
 
 | 分组 | 标签 | 数量 | 关注点 |
 |------|------|------|--------|
 | Ask 只读门控 | `ask` / `gate` | 8 | 写/删/命令/定时任务/记忆写入均不得成功 |
 | Plan 两阶段 | `plan` | 5 | `plan_generated`、TODO 条数、未确认不落盘 |
-| Craft 文件与代码 | `craft` | 9 | 检索→编辑、新建、JSON/CSV、修 bug、写脚本并执行 |
-| Bash 与安全 | `safety` | 4 | `COMMAND_BLOCKED` / `DIRECTORY_NOT_ALLOWED` / 正常命令可执行 |
-| 工作区边界 | `workspace` | 3 | 未授权路径报错、相对路径读到夹具内容 |
-| 记忆与跨会话 | `memory` | 4 | `memory_add` / `memory_search` / `session_search` |
-| RAG | `rag` | 3 | `add_text` → `search` / `ask` / `stats` |
-| 任务与编排 | `orchestration` | 4 | `task` / `subagent`（含并行）/ `automation` |
-| 联网与浏览器 | `net` | 5 | `web_search` / `web_fetch` / `http_request` / `browser` |
-| 技能与 MCP | `skill` / `mcp` | 3 | `Skill` / `skill_manage` / `mcp` |
-| 健壮性 | `robustness` | 2 | 文件不存在时优雅恢复、长任务中途取消 |
+| Craft 文件与代码 | `craft` | 18 | 检索→编辑、新建、JSON/CSV、修 bug、脚本、代码审查/测试/重构/调试 |
+| Bash 与安全 | `safety` | 11 | 危险命令拦截、提示注入、数据外传、密钥泄露、提权 |
+| 工作区边界 | `workspace` | 4 | 未授权路径报错、相对路径读到夹具内容 |
+| 记忆与跨会话 | `memory` | 9 | 写入/检索/跨会话/分类过滤/会话检索 |
+| RAG | `rag` | 7 | 文本/文件入库、ask/search/stats、命名空间隔离、clear |
+| 任务与编排 | `orchestration` | 13 | task 全 action、subagent、automation 全 action |
+| 联网与浏览器 | `net` | 11 | web 检索/抓取/http/浏览器导航/截图/JS 求值 |
+| 技能与 MCP | `skill` / `mcp` | 5 / 3 | 技能创建/写文件/删除、MCP 资源/调用 |
+| 上下文治理 | `guard` | 5 | ContextGuard 委托、截断、副作用工具永不委托 |
+| 多模态 | `multimodal` | 4 | 图片理解、xlsx/pdf 提取、看图落盘 |
+| 代码能力 | `code` | 7 | 审查、单元测试、重构、错误处理、调试、类型标注 |
+| 健壮性 | `robustness` | 7 | 文件缺失恢复、取消、矛盾指令、模糊请求、注入对抗 |
 
-> 依赖外部服务（联网、Playwright、Qdrant、MCP）的场景，硬断言只校验「工具被调用 + 有实质回复」，
+> 依赖外部服务（联网、Playwright、Qdrant、MCP、VLM）的场景，硬断言只校验「工具被调用 + 有实质回复」，
 > 不校验返回内容，缺 key 或依赖缺失时不会误判失败。
+
+##### 场景里的工具名怎么写
+
+场景断言写的是「父工具名」，SSE 实际上报的可能是别名或子工具名，由
+`evals/agent/harness/tool_aliases.py` 做归一化后再匹配，因此下面这些写法都有效：
+
+| 场景里可写 | 实际匹配 |
+|---|---|
+| `bash` / `execute_command` | 两者互配（后端注册名是 `execute_command`） |
+| `calculator` / `python_calculator` | 两者互配 |
+| `memory` / `memory_search` / `memory_add` | `memory` 是注册工具，后两者是其 action，均匹配 `memory` |
+| `rag` | 额外匹配 `rag_add_text` / `rag_search` / `rag_ask` / `rag_stats` |
+| `Read` / `Write` / `Edit` / `Skill` | 大小写不敏感匹配 |
+| `mcp` | 额外匹配 `mcp_*` 子工具与已知网关名 |
+
+新增工具时若断言始终不生效，优先检查这张别名表是否需要同步。
 
 1. 复制夹具并在前端/API 授权工作区：
 
@@ -75,18 +94,51 @@ xcopy /E /I evals\agent\fixtures\mini_repo %TEMP%\myclaw_eval_ws
 
 2. 启动后端，再跑场景：
 
-```bash
-uv run python -m evals --channel agent --suite core --workspace "%TEMP%\myclaw_eval_ws"
+```powershell
+uv run python -m evals --channel agent --suite core --workspace "$env:TEMP\myclaw_eval_ws"
 uv run python -m evals --channel agent --ids ask_readonly_gate,plan_generate,bash_sandbox
 ```
 
-场景 YAML 需要 PyYAML（已加入 `dev` 依赖组）；若缺失会打印告警并回退到
-`suites/__init__.py` 里的 7 个内置兜底场景，**不会静默只跑兜底**。
+场景 YAML 需要 PyYAML（已加入 `dev` 依赖组）；若缺失、YAML 语法错误或字段缺失，
+都会打印告警并回退到 `suites/__init__.py` 里的 7 个内置兜底场景，**不会静默只跑兜底**。
 
 `cancel_mid_run` 场景通过新增的 `cancel_after_s` 字段实现：流式开始 N 秒后
 自动调用 `POST /api/chat/cancel`，断言收到 `cancelled` 事件。
 
+> ⚠️ 后端 `/api/chat/cancel` 作用于**全局当前活跃令牌**（无 session 维度），
+> 因此评测必须串行执行（runner 已是串行）。runner 在流结束后会立即撤销待触发的
+> canceller 并等待其收尾，避免迟到的 cancel 误伤下一个场景。
+
 报告默认写到 `evals/reports/agent_<timestamp>.json`。
+
+#### 轨迹评分（soft_score 与 LLM-as-judge）
+
+L2 场景除了硬断言（`hard_pass`，只回答「是否合规」），还输出**轨迹质量分**：
+
+- **`soft_score`（规则分，默认开启）**：`hard_pass` 之外叠加 `trace_metrics` 的确定性
+  折扣，回答「做得好不好」。此前 `soft_score` 是 violations 数量的线性函数、与
+  `hard_pass` 信息完全重合（40 个通过场景分数全为 1.0），现已改造为
+  `rule_score × (1 - trace_penalty)`，其中 `trace_penalty` 来自 `harness/trace_metrics.py`
+  的 9 个确定性指标（幻觉、隐瞒失败、重复调用、工具误用、plan 覆盖、步数超支等）。
+  核心价值：抓「回答声称已写入但轨迹无写工具」这类**幻觉**，纯规则、可进 CI 红线。
+
+- **`judge_score`（LLM-as-judge，默认关闭）**：`harness/judge.py` 基于脱敏轨迹打分
+  （5 个维度：任务完成度/工具效率/轨迹质量/错误恢复/回答质量，1–5 分）。用
+  `--judge` 启用；`--judge-repeat N` 多次打分检验自一致性。judge 分**绝不参与
+  `hard_pass`**，只作参考，与 `soft_score` 并存便于对比。
+
+```powershell
+# 启用 LLM-as-judge（模型独立配置，缺省回退 LLM_*）
+uv run python -m evals --channel agent --suite core --judge --judge-repeat 3
+```
+
+judge 模型由 `EVAL_JUDGE_MODEL_ID` / `EVAL_JUDGE_API_KEY` / `EVAL_JUDGE_BASE_URL`
+配置，缺省回退 `LLM_*`；与被测模型同名时会告警（自评偏见）。judge 缺配置、调用
+异常或 JSON 解析失败时**只降级为 `judge=n/a`，绝不让评测失败**。
+
+场景级 judge 配置写在 `core.yaml` 的 `judge:` 段（可 `enabled: false` 关闭门控类
+场景、`rubric:` 追加专属要求、`weights:` 调整维度权重），详情见
+`docs/MyClaw_Agent轨迹评分方案.md`。
 
 ### Memory / RAG 离线检索（需 Qdrant + Embedding）
 
@@ -129,6 +181,8 @@ python -m evals --channel rag --ks 1,3,5,10 --score-threshold 0.3
 | `--suite` | agent | 场景标签，默认 `core` |
 | `--ids` | agent | 逗号分隔场景 id |
 | `--workspace` | agent | 已授权工作区路径 |
+| `--judge` | agent | 启用 LLM-as-judge 轨迹评分（默认关闭，仅参考，不影响 hard_pass） |
+| `--judge-repeat` | agent | 每条轨迹重复 judge 次数，检验自一致性（默认 1） |
 | `--ks` | 检索 | Hit/Recall/Precision 的 K 列表，默认 `1,3,5,10` |
 | `--top-k` | 检索 | 检索 limit，默认 `max(ks)` |
 | `--score-threshold` | 检索 | Memory 默认 0.3；RAG 默认 None |

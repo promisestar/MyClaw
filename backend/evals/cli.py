@@ -79,6 +79,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="已授权工作区路径（建议指向 evals/agent/fixtures/mini_repo 副本）",
     )
+    agent.add_argument(
+        "--judge",
+        action="store_true",
+        help=(
+            "启用 LLM-as-judge 轨迹评分（默认关闭）。"
+            "judge 分仅作参考，不参与 hard_pass。"
+            "模型由 EVAL_JUDGE_MODEL_ID / EVAL_JUDGE_API_KEY / EVAL_JUDGE_BASE_URL "
+            "配置，缺省回退 LLM_*"
+        ),
+    )
+    agent.add_argument(
+        "--judge-repeat",
+        type=int,
+        default=1,
+        help="每条轨迹重复 judge 的次数，用于自一致性检验（默认 1）",
+    )
 
     # --- Memory / RAG 检索 ---
     retrieval = p.add_argument_group("Memory / RAG 检索")
@@ -179,6 +195,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 suite=args.suite,
                 ids=_parse_ids(args.ids),
                 workspace_path=ws,
+                enable_judge=args.judge,
+                judge_repeat=args.judge_repeat,
             )
         except Exception as e:
             logging.exception("agent eval failed: %s", e)

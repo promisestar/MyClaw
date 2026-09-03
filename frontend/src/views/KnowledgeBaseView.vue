@@ -25,13 +25,24 @@ const openDocument = (sourcePath: string) => {
   router.push({ name: 'chat', query: { doc: sourcePath } })
 }
 
-const deleteDocument = async (sourcePath: string) => {
+const extractErrorMessage = (error: unknown, fallback: string): string => {
+  if (error && typeof error === 'object' && 'response' in error) {
+    const detail = (error as { response?: { data?: { detail?: unknown } } }).response?.data?.detail
+    if (typeof detail === 'string' && detail.trim()) return detail
+  }
+  if (error instanceof Error && error.message) return error.message
+  return fallback
+}
+
+const deleteDocument = async (item: DocumentInfo) => {
   try {
-    await knowledgeBaseApi.delete(sourcePath)
-    message.success('文档已删除')
+    const res = await knowledgeBaseApi.delete(item.source_path, item.rag_namespace || 'default')
+    message.success(`文档已删除（${res.deleted} 个分段）`)
+    // 本地先移除，再拉取一次确认与后端一致
+    documents.value = documents.value.filter((d) => d.source_path !== item.source_path)
     await loadDocuments()
   } catch (error) {
-    message.error('删除文档失败')
+    message.error(extractErrorMessage(error, '删除文档失败'))
   }
 }
 
@@ -85,7 +96,7 @@ onMounted(() => {
                   ok-text="删除"
                   cancel-text="取消"
                   ok-type="danger"
-                  @confirm="deleteDocument(item.source_path)"
+                  @confirm="deleteDocument(item)"
                 >
                   <button class="delete-btn" title="删除">
                     <DeleteOutlined />

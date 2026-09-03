@@ -12,13 +12,19 @@ export interface KnowledgeBaseListResponse {
   total: number
 }
 
+export interface KnowledgeBaseDeleteResponse {
+  message: string
+  source_path: string
+  deleted: number
+}
+
 export const knowledgeBaseApi = {
   list: async (namespace?: string) => {
     const params = namespace ? { namespace } : {}
     return api.get<KnowledgeBaseListResponse>('/knowledge-base/list', { params })
   },
   delete: async (sourcePath: string, namespace?: string) => {
-    return api.delete('/knowledge-base/document', {
+    return api.delete<KnowledgeBaseDeleteResponse>('/knowledge-base/document', {
       data: {
         source_path: sourcePath,
         namespace: namespace || 'default',
