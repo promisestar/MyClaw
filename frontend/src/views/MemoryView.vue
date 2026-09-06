@@ -54,12 +54,17 @@ const loadData = async () => {
   loading.value = true
   try {
     const [listRes, statsRes] = await Promise.all([
-      memoryApi.list({ top_k: 200 }),
+      memoryApi.list({ top_k: 500 }),
       memoryApi.stats(),
     ])
     memories.value = listRes.memories
-    total.value = listRes.total
-    stats.value = statsRes.categories
+    // 总数以 stats 的 longterm 计数为准，与侧边栏分类合计一致
+    const classified = Object.values(statsRes.categories || {}).reduce(
+      (a, b) => a + (b || 0),
+      0,
+    )
+    total.value = statsRes.total_count ?? classified ?? listRes.total
+    stats.value = statsRes.categories || {}
   } catch {
     message.error('加载记忆列表失败')
   } finally {
@@ -71,13 +76,16 @@ const search = async () => {
   loading.value = true
   try {
     const kw = keyword.value.trim()
-    const params: Record<string, unknown> = { top_k: 200 }
+    const params: Record<string, unknown> = { top_k: 500 }
     if (kw) params.keyword = kw
     if (activeCategory.value) params.category = activeCategory.value
 
     const res = await memoryApi.list(params as any)
     memories.value = res.memories
-    total.value = res.total
+    // 有分类/关键词过滤时不覆盖「全部」总数；无过滤时与列表对齐
+    if (!kw && !activeCategory.value) {
+      total.value = res.total
+    }
   } catch {
     message.error('搜索失败')
   } finally {
@@ -108,17 +116,22 @@ const deleteMemory = async (m: MemoryEntry) => {
     await memoryApi.delete(m.id)
     message.success('记忆已删除')
 
-    // 本地乐观更新（避免再发起一次列表请求）
+    // 本地乐观更新
     memories.value = memories.value.filter(x => x.id !== m.id)
     total.value = Math.max(0, total.value - 1)
     if (selectedMemory.value?.id === m.id) {
       selectedMemory.value = null
     }
-    // 同步分类计数（仅在该分类计数已知时调整）
     const cat = m.category
     if (cat && typeof stats.value[cat] === 'number') {
       stats.value = { ...stats.value, [cat]: Math.max(0, stats.value[cat] - 1) }
     }
+    // 后台再拉一次 stats，避免乐观更新与库内实际不一致
+    memoryApi.stats().then((statsRes) => {
+      stats.value = statsRes.categories || {}
+      const classified = Object.values(stats.value).reduce((a, b) => a + (b || 0), 0)
+      total.value = statsRes.total_count ?? classified
+    }).catch(() => { /* 忽略，保留乐观值 */ })
   } catch (err) {
     const msg = err instanceof Error ? err.message : '删除记忆失败'
     message.error(msg)
@@ -155,8 +168,10 @@ onMounted(loadData)
       <div>
         <h1>🧠 工作记忆</h1>
         <p>
-          共 {{ total }} 条记忆 ·
-          {{ Object.values(stats).reduce((a, b) => a + (b || 0), 0) || total }} 条已分类
+          共 {{ total }} 条记忆
+          <template v-if="Object.keys(stats).length">
+            · {{ Object.values(stats).reduce((a, b) => a + (b || 0), 0) }} 条已分类
+          </template>
         </p>
       </div>
       <div class="header-actions">

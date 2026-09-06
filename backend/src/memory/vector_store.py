@@ -544,8 +544,10 @@ class MemoryVectorStore:
             results = []
             for hit in raw_results:
                 meta = hit.get("metadata", {})
+                # 优先用 payload.memory_id，保证与 delete_memories 的过滤键一致
+                mid = meta.get("memory_id") or hit.get("id")
                 results.append({
-                    "id": hit.get("id"),
+                    "id": str(mid) if mid is not None else "",
                     "score": hit.get("score", 0.0),
                     "content": meta.get("content", ""),
                     "category": meta.get("category", "fact"),
@@ -581,42 +583,86 @@ class MemoryVectorStore:
             logger.error("记忆检索异常: %s", e, exc_info=True)
             return []
 
-    def _list_recent(self, top_k: int = 20) -> List[Dict[str, Any]]:
-        """返回最近的记忆（无查询词时的回退）"""
-        # 用全零向量 + 低阈值拿最近的点（Qdrant 会按默认排序）
-        # 实际用空字符串做向量查询更合理
+    def list_memories(
+        self,
+        top_k: int = 200,
+        category: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """全量列出长期记忆（Qdrant scroll），按 timestamp 降序截断。
+
+        与语义检索不同：本方法不依赖向量相似度，用于 Memory 管理页等
+        「列出全部 / 按分类浏览」场景，避免假查询向量只命中子集导致
+        列表条数与 ``get_stats`` 分类计数不一致。
+
+        Args:
+            top_k: 最多返回条数
+            category: 可选分类过滤
+
+        Returns:
+            记忆字典列表（含 id/content/category/timestamp/source 等）
+        """
+        if not self.available:
+            return []
+
         try:
-            dummy_vec = self._embedder.encode("recent memories")
-            if hasattr(dummy_vec, "tolist"):
-                dummy_vec = dummy_vec.tolist()
+            from qdrant_client.http.models import Filter, FieldCondition
+            from qdrant_client.http import models
 
-            raw_results = self._qdrant.search_similar(
-                query_vector=dummy_vec,
-                limit=top_k,
-                score_threshold=0.0,
-                where={"memory_type": "longterm"},
-            )
+            must = [
+                FieldCondition(
+                    key="memory_type",
+                    match=models.MatchValue(value="longterm"),
+                )
+            ]
+            if category:
+                must.append(
+                    FieldCondition(
+                        key="category",
+                        match=models.MatchValue(value=category),
+                    )
+                )
+            memory_filter = Filter(must=must)
 
-            results = []
-            for hit in raw_results:
-                meta = hit.get("metadata", {})
-                results.append({
-                    "id": hit.get("id"),
-                    "score": hit.get("score", 0.0),
-                    "content": meta.get("content", ""),
-                    "category": meta.get("category", "fact"),
-                    "timestamp": meta.get("timestamp", 0),
-                    "session_id": meta.get("session_id"),
-                    "source": meta.get("source", ""),
-                    "decay_score": meta.get("decay_score", 1.0),
-                })
-            # 按 timestamp 降序排
+            results: List[Dict[str, Any]] = []
+            offset = None
+            while True:
+                points, next_offset = self._qdrant.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=memory_filter,
+                    limit=200,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if not points:
+                    break
+                for p in points:
+                    payload = p.payload or {}
+                    mid = payload.get("memory_id") or p.id
+                    results.append({
+                        "id": str(mid) if mid is not None else "",
+                        "score": 0.0,
+                        "content": payload.get("content", ""),
+                        "category": payload.get("category", "fact"),
+                        "timestamp": payload.get("timestamp", 0),
+                        "session_id": payload.get("session_id"),
+                        "source": payload.get("source", ""),
+                        "decay_score": payload.get("decay_score", 1.0),
+                    })
+                offset = next_offset
+                if not offset:
+                    break
+
             results.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-            return results[:top_k]
+            return results[: max(1, int(top_k))]
 
         except Exception as e:
-            logger.error("列出最近记忆失败: %s", e)
+            logger.error("列出记忆失败: %s", e, exc_info=True)
             return []
+
+    def _list_recent(self, top_k: int = 20) -> List[Dict[str, Any]]:
+        """返回最近的记忆（无查询词时的回退）——委托全量 scroll 列表。"""
+        return self.list_memories(top_k=top_k)
 
     # ── 删除 ────────────────────────────────────────────
 
@@ -880,8 +926,10 @@ class MemoryVectorStore:
             scanned = decay_stats["total_scanned"]
             decay_stats["avg_score"] = round(score_sum / scanned, 4) if scanned > 0 else 0.0
 
+            # total_count 必须以 longterm scroll 为准，不能用 collection points_count
+            #（同 collection 可能含 RAG chunk，会导致「共 N 条」与分类合计不一致）
             return {
-                "total_count": total,
+                "total_count": scanned,
                 "categories": cat_counts,
                 "collection_name": self.collection_name,
                 "forget_days": self.forget_days,
@@ -889,6 +937,7 @@ class MemoryVectorStore:
                 "decay_interval_days": DECAY_INTERVAL_DAYS,
                 "decay_rates": CATEGORY_DECAY_RATES,
                 "decay_stats": decay_stats,
+                "collection_points": total,
             }
         except Exception as e:
             logger.error("获取记忆统计失败: %s", e)

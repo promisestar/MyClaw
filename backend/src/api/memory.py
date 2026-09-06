@@ -101,7 +101,10 @@ async def list_memories(
             store.search_memories, query=keyword, top_k=top_k, category=category
         )
     else:
-        results = await run_in_threadpool(store._list_recent, top_k)
+        # 无关键词：全量 scroll 列表（支持分类过滤），避免假向量检索漏条
+        results = await run_in_threadpool(
+            store.list_memories, top_k, category
+        )
 
     memories = [
         MemoryEntry(
