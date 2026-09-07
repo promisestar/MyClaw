@@ -102,10 +102,17 @@ class ToolCallLogger:
             error_type: 错误类型标签（如 "timeout", "rate_limit"，用于结构化审计）
         """
         trace = trace_id or get_trace_id()
+        sid = session_id
+        if not sid:
+            try:
+                from .llm_usage_logger import get_session_id as _get_ctx_session_id
+                sid = _get_ctx_session_id()
+            except Exception:
+                sid = None
         entry = {
             "timestamp": datetime.now().isoformat(timespec="milliseconds"),
             "trace_id": trace,
-            "session_id": session_id or "",
+            "session_id": sid or "",
             "tool_name": tool_name,
             "tool_call_id": tool_call_id,
             "args": _sanitize_args(args),
@@ -138,10 +145,19 @@ class ToolCallLogger:
 
     @classmethod
     def list_files(cls) -> list[dict]:
-        """扫描日志目录，返回所有 JSONL 文件元信息列表（按日期降序）。"""
+        """扫描日志目录，返回工具调用日志文件元信息（按日期降序）。
+
+        只匹配 ``YYYY-MM-DD.jsonl``，排除同目录下的 ``llm-usage-*.jsonl``
+        （用量日志请走 ``/api/usage/*``）。
+        """
+        import re
+
         log_dir = cls._ensure_log_dir()
+        date_name = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
         files: list[dict] = []
         for fpath in sorted(log_dir.glob("*.jsonl"), reverse=True):
+            if not date_name.match(fpath.name):
+                continue
             date_str = fpath.stem  # e.g. "2026-06-12"
             stat = fpath.stat()
             # 统计记录条数（非空 JSON 行）

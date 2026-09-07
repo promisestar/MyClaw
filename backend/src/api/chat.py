@@ -170,6 +170,9 @@ async def send_message_stream(request: ChatRequest, http_request: Request):
         try:
             # 为本次请求生成 trace_id，贯穿所有工具调用日志
             set_trace_id(generate_trace_id())
+            # 尽早写入 session 上下文（新建会话时会在 agent_start 再覆盖为实际 ID）
+            if request.session_id:
+                set_session_id(request.session_id)
 
             message = _inject_skill_context(request.message, request.skill)
             attachments = [att.model_dump() for att in request.attachments]
@@ -192,7 +195,7 @@ async def send_message_stream(request: ChatRequest, http_request: Request):
                     if event_type == "agent_start":
                         # 发送会话信息
                         session_id = getattr(agent, '_current_session_id', None)
-                        # 把 session 写进上下文，供 LLM 用量日志关联会话
+                        # 把 session 写进上下文，供工具日志 / LLM 用量日志关联会话
                         set_session_id(session_id)
                         yield {
                             "event": "session",

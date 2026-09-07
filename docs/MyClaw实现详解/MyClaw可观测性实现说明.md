@@ -116,8 +116,8 @@ MyClaw 是一个本地优先的个人 Agent 系统。其可观测性设计遵循
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/api/tool-logs/list` | 日志文件列表（日期、条数、大小、修改时间） |
-| `GET` | `/api/tool-logs/{date_str}` | 读取某日全部条目 |
+| `GET` | `/api/tool-logs/list` | 工具日志文件列表（仅 `YYYY-MM-DD.jsonl`，不含 `llm-usage-*`） |
+| `GET` | `/api/tool-logs/{date_str}` | 读取某日全部条目（`date_str` 须为 `YYYY-MM-DD`） |
 | `DELETE` | `/api/tool-logs/{date_str}` | 删除某日文件 |
 
 路径安全：`date_str` 正则 + `Path.resolve()` 前缀校验，防路径穿越。
@@ -191,9 +191,12 @@ if chunk_usage is not None:
 |------|------|------|
 | `GET` | `/api/usage/summary?days=N` | 最近 N 天汇总（按天趋势 + 按模型 + 按调用点） |
 | `GET` | `/api/usage/day/{date}` | 单日汇总 |
+| `GET` | `/api/usage/logs/{date}` | 读取某日用量原始 JSONL 条目（与 `/tool-logs/{date}` 对称） |
 | `GET` | `/api/usage/recent?date=&limit=` | 最近原始记录（排障） |
-| `GET` | `/api/usage/files` | 文件列表 |
+| `GET` | `/api/usage/files` | 文件列表（仅 `llm-usage-*.jsonl`） |
 | `DELETE` | `/api/usage/day/{date}` | 删除某日文件 |
+
+> **与工具日志分流**：两类日志同目录、不同文件名前缀。`/api/tool-logs/list` 只返回 `YYYY-MM-DD.jsonl`；用量文件请用 `/api/usage/files` 与 `/api/usage/logs/{date}`。若误请求 `/api/tool-logs/llm-usage-YYYY-MM-DD`，后端会返回 400 并提示正确路径。
 
 ### 5.7 前端
 

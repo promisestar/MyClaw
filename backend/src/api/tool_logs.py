@@ -14,6 +14,8 @@ router = APIRouter(prefix="/tool-logs", tags=["tool-logs"])
 
 # 安全校验：date_str 只允许 YYYY-MM-DD 格式
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# 误把 llm-usage 文件 stem 当作工具日志日期时的识别（与 LLMUsageLogger.FILE_PREFIX 对齐）
+_LLM_USAGE_STEM = re.compile(r"^llm-usage-(\d{4}-\d{2}-\d{2})$")
 
 
 def _get_log_dir() -> Path:
@@ -22,8 +24,23 @@ def _get_log_dir() -> Path:
     return ToolCallLogger.get_log_dir()
 
 
+def _reject_llm_usage_stem(date_str: str) -> None:
+    """若请求把 ``llm-usage-YYYY-MM-DD`` 当成工具日志日期，给出明确引导。"""
+    m = _LLM_USAGE_STEM.match(date_str or "")
+    if m:
+        d = m.group(1)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"「{date_str}」是 LLM 用量日志，不是工具调用日志。"
+                f"请改用 GET /api/usage/logs/{d}（汇总见 /api/usage/day/{d}）。"
+            ),
+        )
+
+
 def _safe_log_path(date_str: str) -> Path:
     """安全拼接日志文件路径，防止路径穿越。"""
+    _reject_llm_usage_stem(date_str)
     if not _DATE_PATTERN.match(date_str):
         raise HTTPException(status_code=400, detail=f"无效的日期格式: {date_str}，应为 YYYY-MM-DD")
     log_dir = _get_log_dir()

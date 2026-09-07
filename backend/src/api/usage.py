@@ -3,9 +3,10 @@
 数据来源：``{log_dir}/llm-usage-YYYY-MM-DD.jsonl``
 （由 EnhancedHelloAgentsLLM / 主循环 / 子代理摘要 / 上下文压缩等调用点写入）
 
-提供三类视图：
+提供视图：
 - ``/usage/summary``  最近 N 天汇总 + 按天趋势
 - ``/usage/day/{date}`` 单日汇总
+- ``/usage/logs/{date}`` 单日原始 JSONL 条目（与 tool-logs 对称）
 - ``/usage/recent``  最近若干条原始记录（排障用）
 - ``/usage/files``   日志文件列表
 
@@ -73,6 +74,45 @@ async def get_day_summary(date_str: str):
         return await run_in_threadpool(LLMUsageLogger.daily_summary, date_str)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"读取用量统计失败: {e}")
+
+
+@router.get("/logs/{date_str}")
+async def get_day_log_entries(
+    date_str: str,
+    limit: Optional[int] = Query(None, ge=1, le=5000, description="仅返回最近 N 条；默认全部"),
+):
+    """读取指定日期的 LLM 用量原始日志（``llm-usage-YYYY-MM-DD.jsonl``）。
+
+    与 ``/tool-logs/{date}`` 对称：工具日志走 tool-logs，用量日志走本接口，
+    避免共用目录时把 ``llm-usage-*`` 误当成工具日志日期参数。
+    """
+    from ..logging.llm_usage_logger import LLMUsageLogger, FILE_PREFIX
+
+    if not _DATE_PATTERN.match(date_str):
+        raise HTTPException(status_code=400, detail=f"无效的日期格式: {date_str}")
+
+    path = LLMUsageLogger._log_file_path(date_str)
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"用量日志不存在: {FILE_PREFIX}{date_str}.jsonl",
+        )
+
+    try:
+        entries = await run_in_threadpool(LLMUsageLogger._read_day, date_str)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取用量日志失败: {e}")
+
+    if limit and limit > 0:
+        entries = entries[-limit:]
+
+    return {
+        "date_str": date_str,
+        "file_name": path.name,
+        "log_type": "llm_usage",
+        "entries": entries,
+        "total": len(entries),
+    }
 
 
 @router.delete("/day/{date_str}")

@@ -76,12 +76,26 @@ export interface UsageRecentResponse {
   total: number
 }
 
+export interface UsageLogFileContentResponse {
+  date_str: string
+  file_name: string
+  log_type: 'llm_usage'
+  entries: UsageEntry[]
+  total: number
+}
+
 export const usageApi = {
   /** 最近 N 天汇总（含按天趋势） */
   summary: (days = 7) => api.get<UsageSummary>('/usage/summary', { params: { days } }),
 
   /** 单日汇总 */
   day: (dateStr: string) => api.get<UsageSummary>(`/usage/day/${dateStr}`),
+
+  /** 读取指定日期的用量原始日志全文（llm-usage-YYYY-MM-DD.jsonl） */
+  logs: (dateStr: string, limit?: number) =>
+    api.get<UsageLogFileContentResponse>(`/usage/logs/${dateStr}`, {
+      params: limit ? { limit } : undefined,
+    }),
 
   /** 最近若干条原始记录（排障用） */
   recent: (date?: string, limit = 100) =>

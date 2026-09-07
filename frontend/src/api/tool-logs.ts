@@ -24,6 +24,10 @@ export interface LogEntry {
   result_len: number
   status: string
   duration_ms: number
+  agent_name?: string
+  error_type?: string
+  retry_attempt?: number
+  retry_count?: number
 }
 
 export interface LogFileContentResponse {

@@ -1255,11 +1255,18 @@ class MyClawAgent:
         self._agent._history = prefix
         self._resend_suffix = suffix
         session_changed = getattr(self, "_current_session_id", None) != session_id
-        self._current_session_id = session_id
+        self._set_current_session_id(session_id)
         if hasattr(self._agent, "context_manager"):
             self._agent.context_manager.recalculate_history_tokens()
         if session_changed:
             self.ensure_session_system_prompt(force=True)
+
+    def _set_current_session_id(self, session_id: Optional[str]) -> None:
+        """同步会话 ID 到外层与内层 Agent，供工具日志等埋点读取。"""
+        self._current_session_id = session_id
+        agent = getattr(self, "_agent", None)
+        if agent is not None:
+            agent._current_session_id = session_id
 
     def activate_session(self, session_id: str) -> None:
         """将 Agent 内存切换到指定会话（打开历史会话 / 开始对话前调用）。
@@ -1268,6 +1275,10 @@ class MyClawAgent:
         """
         # 当内存中的session_id与传入的session_id一致时，直接返回
         if getattr(self, "_current_session_id", None) == session_id:
+            # 仍同步内层，避免升级后旧进程里内层尚未持有 session_id
+            agent = getattr(self, "_agent", None)
+            if agent is not None and getattr(agent, "_current_session_id", None) != session_id:
+                agent._current_session_id = session_id
             return
         self._reset_mcp_disclosed_tools()
         # 尝试加载该会话的任务列表
@@ -1282,7 +1293,7 @@ class MyClawAgent:
             self._agent.clear_history()
             if hasattr(self, "_memory_flush_manager"):
                 self._memory_flush_manager.reset()
-        self._current_session_id = session_id
+        self._set_current_session_id(session_id)
         if hasattr(self._agent, "context_manager"):
             self._agent.context_manager.recalculate_history_tokens()
         # 会话边界：冻结新的基座 system
@@ -1418,7 +1429,7 @@ class MyClawAgent:
         # 保存会话（session_id 已在回合开始时分配）
         try:
             self._agent.save_session(session_id)
-            self._current_session_id = session_id
+            self._set_current_session_id(session_id)
             self._rebind_system_prompt_fingerprint()
             self._index_session_safe(session_id)
         except Exception as e:
@@ -1955,7 +1966,7 @@ class MyClawAgent:
         用于初始化时重置 Agent 状态。
         """
         self._agent.clear_history()
-        self._current_session_id = None
+        self._set_current_session_id(None)
         self._reset_mcp_disclosed_tools()
 
         # 重置 MemoryFlushManager 状态
