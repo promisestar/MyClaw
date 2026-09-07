@@ -18,6 +18,8 @@ import re
 import tempfile
 from typing import Optional
 
+from ..logging.llm_usage_logger import log_response_safe
+
 logger = logging.getLogger(__name__)
 
 
@@ -273,6 +275,12 @@ class ProfileAggregator:
         try:
             from hello_agents.core.message import Message
             response = self.llm.invoke([Message(prompt, "user")])
+            # 记录用户画像聚合调用的 token 用量
+            log_response_safe(
+                response,
+                model=str(getattr(self.llm, "model", "") or ""),
+                call_site="profile_aggregate",
+            )
             response_text = (
                 response.content if hasattr(response, "content") else str(response)
             )

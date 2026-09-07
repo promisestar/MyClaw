@@ -17,6 +17,7 @@ from hello_agents.context.history import HistoryManager
 from hello_agents.context.token_counter import TokenCounter
 
 from .tokenizer import count_tokens, count_messages
+from ..logging.llm_usage_logger import log_response_safe
 
 if TYPE_CHECKING:
     from hello_agents.core.llm import HelloAgentsLLM
@@ -428,6 +429,12 @@ class ContextManager:
                 temperature=self.config.summary_temperature,
                 max_tokens=self.config.summary_max_tokens,
             )
+            # 记录上下文压缩调用的 token 用量
+            log_response_safe(
+                summary,
+                model=str(getattr(summary_llm, "model", "") or ""),
+                call_site="context_compress",
+            )
             return f"""## 历史摘要（{len(to_compress)} 条消息）
 {summary}
 
@@ -541,6 +548,11 @@ class ContextManager:
                     ],
                     temperature=self.config.summary_temperature,
                     max_tokens=self.config.summary_max_tokens,
+                )
+                log_response_safe(
+                    resp,
+                    model=str(getattr(self.llm, "model", "") or ""),
+                    call_site="context_compress",
                 )
                 return resp if isinstance(resp, str) else str(resp)
             except Exception:

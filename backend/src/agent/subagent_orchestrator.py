@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Union
 from hello_agents.tools import ToolRegistry
 
 from .enhanced_simple_agent import EnhancedSimpleAgent
+from ..logging.llm_usage_logger import log_response_safe
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +386,13 @@ class SubAgentOrchestrator:
                     temperature=0.1,
                     max_tokens=400,
                 ),
+            )
+            # 记录子代理摘要调用的 token 用量（此前是完全的统计盲区）
+            log_response_safe(
+                resp,
+                model=str(getattr(self._summary_llm, "model", "") or ""),
+                call_site="subagent_summary",
+                agent_name="subagent",
             )
             result = resp.content if hasattr(resp, "content") else str(resp)
             return result.strip()

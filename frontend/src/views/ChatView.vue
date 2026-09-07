@@ -9,9 +9,11 @@ import {
   UploadOutlined,
   EditOutlined,
   ReloadOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { sessionApi, type ContextUsage } from '@/api/session'
+import type { TokenUsage } from '@/api/usage'
 import { chatApi, type ChatAttachment } from '@/api/chat'
 import { configApi } from '@/api/config'
 import { uploadApi, type UploadResponse } from '@/api/upload'
@@ -306,6 +308,33 @@ const applyContextUsage = (usage: ContextUsage | undefined) => {
     contextUsage.value = usage
   }
 }
+
+/** 本轮对话的 LLM 用量（由 SSE done 事件推送） */
+const turnUsage = ref<TokenUsage | null>(null)
+const llmCalls = ref(0)
+
+const formatTokens = (n: number) => {
+  if (!n) return '0'
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
+const turnCachePercent = computed(() => {
+  const u = turnUsage.value
+  if (!u || !u.prompt_tokens) return '0'
+  return ((u.cached_tokens / u.prompt_tokens) * 100).toFixed(0)
+})
+
+const turnUsageTooltip = computed(() => {
+  const u = turnUsage.value
+  if (!u) return ''
+  return [
+    `输入 ${u.prompt_tokens.toLocaleString()}`,
+    `输出 ${u.completion_tokens.toLocaleString()}`,
+    `缓存命中 ${u.cached_tokens.toLocaleString()}`,
+    u.reasoning_tokens ? `推理 ${u.reasoning_tokens.toLocaleString()}` : '',
+  ].filter(Boolean).join(' · ')
+})
 
 /** 多模态附件：聊天框旁上传图片/文档（单文档 ≤10MB），发送时随消息一并提交 */
 const UPLOAD_TOOLTIP =
@@ -1117,6 +1146,9 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
     pendingAttachments.value = []
   }
   loading.value = true
+  // 重置上一轮的用量展示，避免新轮次开始前显示陈旧数据
+  turnUsage.value = null
+  llmCalls.value = 0
 
   abortController.value = new AbortController()
 
@@ -1227,6 +1259,9 @@ const runChatRequest = async (userMessage: string, options: ChatRequestOptions =
             currentSessionId.value = event.session_id
           }
           applyContextUsage(event.context_usage)
+          // 记录本轮 LLM 用量（供输入框下方展示）
+          turnUsage.value = event.usage ?? null
+          llmCalls.value = event.llm_calls ?? 0
           // 对话结束后重新获取助手名字（可能在对话中更新了 IDENTITY.md）
           configApi.getAgentInfo().then(agentInfo => {
             if (agentInfo.name) {
@@ -1686,7 +1721,17 @@ const createNewSession = async () => {
           </button>
         </div>
       </div>
-      <div class="input-hint">Enter 发送 · Shift+Enter 换行 · 支持拖拽文件到输入框</div>
+      <div class="input-hint">
+        <span v-if="turnUsage" class="turn-usage" :title="turnUsageTooltip">
+          <ThunderboltOutlined />
+          本轮 {{ formatTokens(turnUsage.total_tokens) }} tokens
+          <template v-if="turnUsage.cached_tokens > 0">
+            · 缓存命中 {{ turnCachePercent }}%
+          </template>
+          <template v-if="llmCalls > 1"> · {{ llmCalls }} 次调用</template>
+        </span>
+        <span>Enter 发送 · Shift+Enter 换行 · 支持拖拽文件到输入框</span>
+      </div>
     </div>
 
     <Modal
@@ -2444,6 +2489,14 @@ const createNewSession = async () => {
   text-align: center;
   font-size: 11px;
   color: var(--color-text-tertiary);
+}
+
+.input-hint .turn-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 10px;
+  color: var(--color-text-secondary, #8c8c8c);
 }
 
 .chat-file-input {

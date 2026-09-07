@@ -1,5 +1,6 @@
 import api from './index'
 import type { ContextUsage } from './session'
+import type { TokenUsage } from './usage'
 
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
@@ -45,6 +46,10 @@ export interface StreamEvent {
   max_steps?: number
   /** 对话完成后由服务端推送的上下文窗口用量 */
   context_usage?: ContextUsage
+  /** 本轮对话累计的 LLM token 用量（含缓存命中） */
+  usage?: TokenUsage
+  /** 本轮对话发生的 LLM 调用次数 */
+  llm_calls?: number
   /** plan_generated 事件：结构化 TODO 列表 */
   plan?: PlanTodoItem[]
 }
@@ -198,6 +203,8 @@ export const chatApi = {
                     content: parsed.content,
                     session_id: parsed.session_id,
                     context_usage: parsed.context_usage,
+                    usage: parsed.usage,
+                    llm_calls: parsed.llm_calls,
                   })
                 } else if (currentEvent === 'cancelled') {
                   onChunk({ type: 'cancelled', error: parsed.reason || 'cancelled' })

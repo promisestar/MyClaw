@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from ..logging.tool_logger import set_trace_id, generate_trace_id
+from ..logging.llm_usage_logger import set_session_id
 from ..agent.cancel_token import CancellationToken
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -191,6 +192,8 @@ async def send_message_stream(request: ChatRequest, http_request: Request):
                     if event_type == "agent_start":
                         # 发送会话信息
                         session_id = getattr(agent, '_current_session_id', None)
+                        # 把 session 写进上下文，供 LLM 用量日志关联会话
+                        set_session_id(session_id)
                         yield {
                             "event": "session",
                             "data": json.dumps({"session_id": session_id}, ensure_ascii=False)
@@ -259,12 +262,16 @@ async def send_message_stream(request: ChatRequest, http_request: Request):
                         final_content = event_data.get("result", "")
                         context_usage = agent.get_context_usage(session_id)
 
+                        # 本轮对话的 token 用量（主循环累计，含缓存命中）
+                        turn_usage = event_data.get("usage") or None
                         yield {
                             "event": "done",
                             "data": json.dumps({
                                 "content": final_content,
                                 "session_id": session_id,
                                 "context_usage": context_usage,
+                                "usage": turn_usage,
+                                "llm_calls": event_data.get("llm_calls", 0),
                             }, ensure_ascii=False)
                         }
 

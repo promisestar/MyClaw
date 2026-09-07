@@ -34,6 +34,11 @@ const router = createRouter({
       component: () => import('../views/ToolLogsView.vue'),
     },
     {
+      path: '/usage',
+      name: 'usage',
+      component: () => import('../views/UsageView.vue'),
+    },
+    {
       path: '/automation',
       name: 'automation',
       component: () => import('../views/AutomationView.vue'),

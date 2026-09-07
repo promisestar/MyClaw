@@ -27,6 +27,12 @@ from .retry_executor import RetryExecutor, RetryResult, classify_error, compute_
 from .cancel_token import CancellationToken
 
 from ..logging.tool_logger import ToolCallLogger, get_trace_id
+from ..logging.llm_usage_logger import (
+    LLMUsageLogger,
+    empty_usage,
+    merge_usage,
+    normalize_usage,
+)
 
 if TYPE_CHECKING:
     from hello_agents.tools.registry import ToolRegistry
@@ -915,6 +921,39 @@ class EnhancedSimpleAgent(SimpleAgent):
             ):
                 yield event
 
+    # ==================== LLM 用量记录 ====================
+
+    def _model_name(self) -> str:
+        """当前 LLM 的模型 ID（用于用量日志分组）。"""
+        return str(getattr(self.llm, "model", "") or "")
+
+    def _log_llm_usage(
+        self,
+        usage: Optional[Dict[str, int]],
+        *,
+        call_site: str,
+        duration_ms: float = 0.0,
+        stream: bool = True,
+        iteration: Optional[int] = None,
+    ) -> None:
+        """把一次 LLM 调用的 token 用量写入 JSONL。
+
+        遥测绝不能影响主流程，因此整体吞掉异常。
+        usage 为 None 时也会写一条 status="no_usage" 的记录，用于暴露统计盲区。
+        """
+        try:
+            LLMUsageLogger.log(
+                model=self._model_name(),
+                call_site=call_site,
+                usage=usage,
+                duration_ms=duration_ms,
+                stream=stream,
+                iteration=iteration,
+                agent_name=self.name,
+            )
+        except Exception:
+            pass
+
     def run(
         self,
         input_text: str,
@@ -1026,6 +1065,15 @@ class EnhancedSimpleAgent(SimpleAgent):
                 break
 
             response_message = response.choices[0].message
+
+            # 记录本轮 token 用量（同步链路，usage 由非流式响应直接返回）
+            _sync_usage = normalize_usage(getattr(response, "usage", None))
+            self._log_llm_usage(
+                _sync_usage,
+                call_site="main_loop",
+                stream=False,
+                iteration=current_iteration,
+            )
 
             if trace_logger:
                 usage = response.usage
@@ -1235,6 +1283,9 @@ class EnhancedSimpleAgent(SimpleAgent):
             final_response = ""
             # 收集工具调用记录（用于存入会话）
             tool_call_records: List[Dict[str, Any]] = []
+            # 本轮对话累计的 LLM token 用量（跨所有迭代轮次）
+            turn_usage: Dict[str, int] = empty_usage()
+            turn_llm_calls = 0
 
             while current_iteration < self.max_tool_iterations:
                 if cancel_token and cancel_token.is_cancelled:
@@ -1507,6 +1558,17 @@ class EnhancedSimpleAgent(SimpleAgent):
                 if result is None:
                     break
 
+                # 记录本轮 LLM 调用的 token 用量（含缓存命中）
+                turn_llm_calls += 1
+                merge_usage(turn_usage, result.usage)
+                self._log_llm_usage(
+                    result.usage,
+                    call_site="main_loop",
+                    duration_ms=getattr(result, "duration_ms", 0.0),
+                    stream=True,
+                    iteration=current_iteration,
+                )
+
                 complete_tool_calls = result.get_complete_tool_calls()
 
                 # 无论是否有工具调用，都保存本轮的文本内容
@@ -1670,12 +1732,21 @@ class EnhancedSimpleAgent(SimpleAgent):
 
             duration = (datetime.now() - session_start_time).total_seconds()
             print(f"\n✅ 完成，耗时 {duration:.2f}s，共 {current_iteration} 轮")
+            if turn_usage["total_tokens"]:
+                print(
+                    f"   📊 tokens {turn_usage['total_tokens']} "
+                    f"(prompt {turn_usage['prompt_tokens']} / "
+                    f"completion {turn_usage['completion_tokens']} / "
+                    f"cached {turn_usage['cached_tokens']})"
+                )
 
-            # 发送完成事件
+            # 发送完成事件（带上本轮累计用量，供前端展示）
             yield StreamEvent.create(
                 StreamEventType.AGENT_FINISH,
                 self.name,
-                result=final_response
+                result=final_response,
+                usage=turn_usage,
+                llm_calls=turn_llm_calls,
             )
 
         except Exception as e:
@@ -1691,7 +1762,9 @@ class EnhancedSimpleAgent(SimpleAgent):
             yield StreamEvent.create(
                 StreamEventType.AGENT_FINISH,
                 self.name,
-                result=""  # 空结果表示失败
+                result="",  # 空结果表示失败
+                usage=turn_usage,
+                llm_calls=turn_llm_calls,
             )
         finally:
             deleted_count, failed = self._cleanup_tracked_temp_files(tracked_temp_files)
@@ -1716,17 +1789,51 @@ class EnhancedSimpleAgent(SimpleAgent):
         """
         print("📝 纯对话模式（无工具调用）")
 
-        full_response = ""
-        async for chunk in self.llm.astream_invoke(messages, **kwargs):
-            full_response += chunk
-            yield StreamEvent.create(
-                StreamEventType.LLM_CHUNK,
-                self.name,
-                chunk=chunk
-            )
-            print(chunk, end="", flush=True)
+        stream_kwargs = dict(kwargs)
+        # 纯对话链路同样请求 usage；厂商不支持时自动降级（见下方 except）
+        if getattr(self.llm, "_stream_usage_enabled", False):
+            stream_kwargs["stream_options"] = {"include_usage": True}
 
+        collected: List[str] = []
+
+        async def _consume() -> AsyncGenerator[StreamEvent, None]:
+            async for chunk in self.llm.astream_invoke(messages, **stream_kwargs):
+                collected.append(chunk)
+                yield StreamEvent.create(
+                    StreamEventType.LLM_CHUNK,
+                    self.name,
+                    chunk=chunk
+                )
+                print(chunk, end="", flush=True)
+
+        try:
+            async for event in _consume():
+                yield event
+        except Exception as stream_err:
+            if "stream_options" not in stream_kwargs:
+                raise
+            from .enhanced_llm import _is_stream_options_unsupported
+            if not _is_stream_options_unsupported(stream_err):
+                raise
+            stream_kwargs.pop("stream_options", None)
+            if hasattr(self.llm, "_stream_usage_enabled"):
+                self.llm._stream_usage_enabled = False
+            collected.clear()  # 400 发生在首块之前，不会产生重复输出
+            async for event in _consume():
+                yield event
+
+        full_response = "".join(collected)
         print()
+
+        # 记录用量：hello_agents 会把 usage 暂存在 last_call_stats
+        stats = getattr(self.llm, "last_call_stats", None)
+        stats_usage = getattr(stats, "usage", None) if stats else None
+        self._log_llm_usage(
+            normalize_usage(stats_usage),
+            call_site="chat_no_tools",
+            duration_ms=float(getattr(stats, "latency_ms", 0) or 0),
+            stream=True,
+        )
 
         # 保存历史（用原始 input_text，不用 messages 末条，压缩后末条可能不是用户原文）
         self.add_message(Message(input_text, "user"))

@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health, workspace, automation, session_search
+from .api import chat, session, config, memory, upload, knowledge_base, tool_logs, skills, agent, health, workspace, automation, session_search, usage
 from .workspace.manager import WorkspaceManager
 from .agent.myclaw_agent import MyClawAgent
 from .channels.external_software_receiver import ExternalSoftwareReceiver
@@ -255,6 +255,7 @@ app.include_router(health.router, prefix="/api")
 app.include_router(workspace.router, prefix="/api")
 app.include_router(automation.router, prefix="/api")
 app.include_router(session_search.router, prefix="/api")
+app.include_router(usage.router, prefix="/api")
 
 
 # 多模态：当 MULTIMODAL_IMAGE_MODE=url 时注册 /files 动态路由，从当前工作区 uploads 读取
