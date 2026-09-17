@@ -15,6 +15,7 @@ import {
   MenuUnfoldOutlined,
   ScheduleOutlined,
   BarChartOutlined,
+  ApartmentOutlined,
 } from '@ant-design/icons-vue'
 import LobsterIcon from '@/assets/lobster.svg'
 import WorkspaceSwitcher from '@/components/WorkspaceSwitcher.vue'
@@ -150,6 +151,12 @@ onBeforeUnmount(() => {
               <RouterLink to="/usage">
                 <BarChartOutlined />
                 <span>用量统计</span>
+              </RouterLink>
+            </Menu.Item>
+            <Menu.Item key="trace">
+              <RouterLink to="/trace">
+                <ApartmentOutlined />
+                <span>轨迹</span>
               </RouterLink>
             </Menu.Item>
             <Menu.Item key="automation">

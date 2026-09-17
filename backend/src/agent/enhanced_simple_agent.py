@@ -436,6 +436,7 @@ class EnhancedSimpleAgent(SimpleAgent):
             tool_call_id=tool_call_id,
             arguments=arguments,
             session_id=getattr(self, "_current_session_id", None),
+            iteration=step or None,
         )
 
         if result.retry_count:
@@ -513,8 +514,13 @@ class EnhancedSimpleAgent(SimpleAgent):
         tracked_temp_files: Set[Path],
         tool_call_records: List[Dict[str, Any]],
         tool_results_by_id: Dict[str, str],
+        step: int = 0,
     ) -> AsyncGenerator[StreamEvent, None]:
-        """执行单个工具调用并 yield 流式事件（含智能重试）。"""
+        """执行单个工具调用并 yield 流式事件（含智能重试）。
+
+        Args:
+            step: 当前主循环轮次（1-based），用于把工具日志挂到对应的模型调用 span
+        """
         print(f"🎬 调用工具: {tool_name}({arguments})")
         preexisting_file = False
         raw_path = arguments.get("path")
@@ -541,6 +547,7 @@ class EnhancedSimpleAgent(SimpleAgent):
             tool_call_id=tool_call_id,
             arguments=arguments,
             session_id=getattr(self, "_current_session_id", None),
+            iteration=step or None,
         )
 
         exec_result = retry_result.result
@@ -594,6 +601,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         tool_call_records: List[Dict[str, Any]],
         tool_results_by_id: Dict[str, str],
         executed_ids: Set[str],
+        step: int = 0,
     ) -> AsyncGenerator[StreamEvent, None]:
         """若工具参数 JSON 已完整，立即执行该工具。
 
@@ -766,6 +774,7 @@ class EnhancedSimpleAgent(SimpleAgent):
             tracked_temp_files=tracked_temp_files,
             tool_call_records=tool_call_records,
             tool_results_by_id=tool_results_by_id,
+            step=step,
         ):
             yield event
 
@@ -820,6 +829,7 @@ class EnhancedSimpleAgent(SimpleAgent):
         tool_results_by_id: Dict[str, str],
         executed_ids: Set[str],
         cancel_token: Optional[CancellationToken] = None,
+        step: int = 0,
     ) -> AsyncGenerator[StreamEvent, None]:
         """批量执行工具调用，无副作用工具并行，有副作用工具串行。
 
@@ -834,6 +844,7 @@ class EnhancedSimpleAgent(SimpleAgent):
             tool_call_records: 工具调用记录列表（会被追加）
             tool_results_by_id: 工具结果映射（会被追加）
             cancel_token: 取消令牌
+            step: 当前主循环轮次（1-based），用于把工具日志挂到对应的模型调用 span
         """
         if not tool_calls:
             return
@@ -874,6 +885,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                 tracked_temp_files=tracked_temp_files,
                 tool_call_records=tool_call_records,
                 tool_results_by_id=tool_results_by_id,
+                step=step,
             ):
                 yield event
         elif len(parallel_calls) > 1:
@@ -890,6 +902,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                         tracked_temp_files=tracked_temp_files,
                         tool_call_records=tool_call_records,
                         tool_results_by_id=tool_results_by_id,
+                        step=step,
                     ):
                         await queue.put(event)
                 except Exception as exc:
@@ -918,6 +931,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                 tracked_temp_files=tracked_temp_files,
                 tool_call_records=tool_call_records,
                 tool_results_by_id=tool_results_by_id,
+                step=step,
             ):
                 yield event
 
@@ -927,6 +941,65 @@ class EnhancedSimpleAgent(SimpleAgent):
         """当前 LLM 的模型 ID（用于用量日志分组）。"""
         return str(getattr(self.llm, "model", "") or "")
 
+    @staticmethod
+    def _build_request_meta(
+        messages: Optional[List[Dict[str, Any]]],
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """构造请求侧元数据，供轨迹 span 树渲染 REQUEST 卡片。
+
+        展示口径与常见 trace 面板一致：``System 1 · 消息 3 · 工具定义 32``，
+        其中「消息」不含 system；system 数通常为 1。
+        """
+        try:
+            system_count = sum(
+                1 for m in (messages or [])
+                if isinstance(m, dict) and m.get("role") == "system"
+            )
+            return {
+                "system_count": system_count,
+                "message_count": len(messages or []) - system_count,
+                "tool_count": len(tool_schemas or []),
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _build_response_meta(
+        content: Optional[str],
+        *,
+        tool_call_count: int = 0,
+        finish_reason: Optional[str] = None,
+        usage: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, Any]:
+        """构造响应侧元数据，供轨迹 span 树渲染 RESPONSE 卡片。"""
+        try:
+            raw = content or ""
+            meta: Dict[str, Any] = {
+                "content_preview": raw.strip()[:200],
+                "content_len": len(raw),
+                "tool_call_count": int(tool_call_count or 0),
+            }
+            if finish_reason:
+                meta["finish_reason"] = str(finish_reason)
+            if usage:
+                meta["reasoning_tokens"] = int(usage.get("reasoning_tokens") or 0)
+            return meta
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _preview_text(text: str, limit: int = 120) -> str:
+        """安全截断文本作为预览；多模态编码串降级为友好提示，避免落库 base64。"""
+        try:
+            from .multimodal_bridge import is_encoded_multimodal
+            if is_encoded_multimodal(text):
+                return "[多模态输入]"
+        except Exception:
+            pass
+        flat = (text or "").replace("\n", " ").strip()
+        return flat[:limit]
+
     def _log_llm_usage(
         self,
         usage: Optional[Dict[str, int]],
@@ -935,11 +1008,15 @@ class EnhancedSimpleAgent(SimpleAgent):
         duration_ms: float = 0.0,
         stream: bool = True,
         iteration: Optional[int] = None,
+        request_meta: Optional[Dict[str, Any]] = None,
+        response_meta: Optional[Dict[str, Any]] = None,
+        prompt_preview: Optional[str] = None,
     ) -> None:
         """把一次 LLM 调用的 token 用量写入 JSONL。
 
         遥测绝不能影响主流程，因此整体吞掉异常。
         usage 为 None 时也会写一条 status="no_usage" 的记录，用于暴露统计盲区。
+        request_meta / response_meta / prompt_preview 为轨迹 span 树展示所需的附加字段。
         """
         try:
             LLMUsageLogger.log(
@@ -950,6 +1027,9 @@ class EnhancedSimpleAgent(SimpleAgent):
                 stream=stream,
                 iteration=iteration,
                 agent_name=self.name,
+                request_meta=request_meta,
+                response_meta=response_meta,
+                prompt_preview=prompt_preview,
             )
         except Exception:
             pass
@@ -1073,6 +1153,14 @@ class EnhancedSimpleAgent(SimpleAgent):
                 call_site="main_loop",
                 stream=False,
                 iteration=current_iteration,
+                request_meta=self._build_request_meta(messages, tool_schemas),
+                response_meta=self._build_response_meta(
+                    response_message.content,
+                    tool_call_count=len(response_message.tool_calls or []),
+                    finish_reason=getattr(response.choices[0], "finish_reason", None),
+                    usage=_sync_usage,
+                ),
+                prompt_preview=self._preview_text(input_text),
             )
 
             if trace_logger:
@@ -1374,6 +1462,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                                         iteration_tool_records,
                                         tool_results_by_id,
                                         executed_ids,
+                                        step=current_iteration,
                                     ):
                                         yield tool_event
 
@@ -1395,6 +1484,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                                     iteration_tool_records,
                                     tool_results_by_id,
                                     executed_ids,
+                                    step=current_iteration,
                                 ):
                                     yield tool_event
 
@@ -1507,6 +1597,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                                         tool_results_by_id=tool_results_by_id,
                                         executed_ids=executed_ids,
                                         cancel_token=cancel_token,
+                                        step=current_iteration,
                                     ):
                                         yield tool_event
 
@@ -1561,15 +1652,22 @@ class EnhancedSimpleAgent(SimpleAgent):
                 # 记录本轮 LLM 调用的 token 用量（含缓存命中）
                 turn_llm_calls += 1
                 merge_usage(turn_usage, result.usage)
+                complete_tool_calls = result.get_complete_tool_calls()
                 self._log_llm_usage(
                     result.usage,
                     call_site="main_loop",
                     duration_ms=getattr(result, "duration_ms", 0.0),
                     stream=True,
                     iteration=current_iteration,
+                    request_meta=self._build_request_meta(messages, tool_schemas),
+                    response_meta=self._build_response_meta(
+                        result.content,
+                        tool_call_count=len(complete_tool_calls),
+                        finish_reason=result.finish_reason,
+                        usage=result.usage,
+                    ),
+                    prompt_preview=self._preview_text(input_text),
                 )
-
-                complete_tool_calls = result.get_complete_tool_calls()
 
                 # 无论是否有工具调用，都保存本轮的文本内容
                 if result.content:
@@ -1652,6 +1750,7 @@ class EnhancedSimpleAgent(SimpleAgent):
                         tool_results_by_id=tool_results_by_id,
                         executed_ids=executed_ids,
                         cancel_token=cancel_token,
+                        step=current_iteration,
                     ):
                         yield tool_event
 
@@ -1828,11 +1927,19 @@ class EnhancedSimpleAgent(SimpleAgent):
         # 记录用量：hello_agents 会把 usage 暂存在 last_call_stats
         stats = getattr(self.llm, "last_call_stats", None)
         stats_usage = getattr(stats, "usage", None) if stats else None
+        _no_tools_usage = normalize_usage(stats_usage)
         self._log_llm_usage(
-            normalize_usage(stats_usage),
+            _no_tools_usage,
             call_site="chat_no_tools",
             duration_ms=float(getattr(stats, "latency_ms", 0) or 0),
             stream=True,
+            request_meta=self._build_request_meta(messages, None),
+            response_meta=self._build_response_meta(
+                full_response,
+                tool_call_count=0,
+                usage=_no_tools_usage,
+            ),
+            prompt_preview=self._preview_text(input_text),
         )
 
         # 保存历史（用原始 input_text，不用 messages 末条，压缩后末条可能不是用户原文）

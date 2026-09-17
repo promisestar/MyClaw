@@ -181,6 +181,9 @@ class LLMUsageLogger:
         session_id: Optional[str] = None,
         trace_id: Optional[str] = None,
         agent_name: Optional[str] = None,
+        request_meta: Optional[Dict[str, Any]] = None,
+        response_meta: Optional[Dict[str, Any]] = None,
+        prompt_preview: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """写入一条 LLM 调用用量记录。
 
@@ -193,6 +196,9 @@ class LLMUsageLogger:
             iteration: 主循环轮次（仅 main_loop 有）
             status: ok / error / no_usage
             error: 错误信息
+            request_meta: 请求侧元数据（消息数 / system 数 / 工具定义数），供轨迹 span 树展示
+            response_meta: 响应侧元数据（内容预览 / 工具调用数 / finish_reason / 推理 token），同上
+            prompt_preview: 本轮用户提问预览（截断），供轨迹页左侧轮次列表作标题
         """
         u = usage or empty_usage()
         has_usage = bool(usage)
@@ -215,6 +221,13 @@ class LLMUsageLogger:
         }
         if error:
             entry["error"] = str(error)[:500]
+        # 以下为可选结构字段：旧日志缺失，消费方（轨迹 span 树）需能降级展示
+        if request_meta:
+            entry["request"] = request_meta
+        if response_meta:
+            entry["response"] = response_meta
+        if prompt_preview:
+            entry["prompt_preview"] = prompt_preview
 
         try:
             line = json.dumps(entry, ensure_ascii=False) + "\n"

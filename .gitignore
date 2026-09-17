@@ -54,3 +54,6 @@ backend/tool-output/
 # Offline retrieval eval reports (keep .gitkeep)
 backend/evals/reports/*.json
 backend/evals/reports/*.md
+
+MyClaw_简历描述_润色版.md
+MyClaw_简历描述_实况版.md

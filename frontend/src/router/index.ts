@@ -39,6 +39,11 @@ const router = createRouter({
       component: () => import('../views/UsageView.vue'),
     },
     {
+      path: '/trace',
+      name: 'trace',
+      component: () => import('../views/TraceView.vue'),
+    },
+    {
       path: '/automation',
       name: 'automation',
       component: () => import('../views/AutomationView.vue'),

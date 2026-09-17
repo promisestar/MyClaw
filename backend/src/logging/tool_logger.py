@@ -84,6 +84,7 @@ class ToolCallLogger:
         retry_count: Optional[int] = None,
         agent_name: Optional[str] = None,
         error_type: Optional[str] = None,
+        iteration: Optional[int] = None,
     ) -> None:
         """写入一条工具调用日志。
 
@@ -100,6 +101,8 @@ class ToolCallLogger:
             retry_count: 最终记录的总重试次数（仅在最终成功/失败记录时传入）
             agent_name: Agent 名称（主代理 vs 子代理，用于审计区分）
             error_type: 错误类型标签（如 "timeout", "rate_limit"，用于结构化审计）
+            iteration: 主循环轮次（1-based）。与 llm-usage 日志的 ``iteration`` 对齐，
+                用于把工具调用精确挂到其所属的「模型调用」span 上（旧日志可能缺失该字段）
         """
         trace = trace_id or get_trace_id()
         sid = session_id
@@ -129,6 +132,8 @@ class ToolCallLogger:
             entry["retry_attempt"] = retry_attempt
         if retry_count is not None:
             entry["retry_count"] = retry_count
+        if iteration is not None:
+            entry["iteration"] = iteration
 
         try:
             line = json.dumps(entry, ensure_ascii=False) + "\n"
@@ -177,6 +182,36 @@ class ToolCallLogger:
                 "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
             })
         return files
+
+    @classmethod
+    def read_day(cls, date_str: Optional[str] = None) -> list[dict]:
+        """读取某日工具日志的全部条目（跳过非法 JSON 行）。
+
+        与 ``LLMUsageLogger._read_day`` 对称，供轨迹 span 树聚合使用。
+        ``date_str`` 为 None 时读取当天文件。
+        """
+        if date_str:
+            log_path = cls._ensure_log_dir() / f"{date_str}.jsonl"
+        else:
+            log_path = cls._log_file_path()
+
+        if not log_path.exists():
+            return []
+
+        entries: list[dict] = []
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            logger.warning("读取工具日志失败: %s", log_path, exc_info=True)
+        return entries
 
     @classmethod
     def query(

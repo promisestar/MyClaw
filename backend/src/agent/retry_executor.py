@@ -225,6 +225,7 @@ class RetryExecutor:
         tool_call_id: str,
         arguments: Dict[str, Any],
         session_id: Optional[str] = None,
+        iteration: Optional[int] = None,
     ) -> RetryResult:
         """同步执行工具调用（含智能重试）。
 
@@ -234,6 +235,7 @@ class RetryExecutor:
             tool_call_id: 工具调用 ID
             arguments: 调用参数
             session_id: 会话 ID（用于日志）
+            iteration: 主循环轮次（1-based），写入日志用于关联所属的模型调用 span
 
         Returns:
             RetryResult: 重试执行结果
@@ -280,6 +282,7 @@ class RetryExecutor:
                     retry_attempt=retry_count,
                     agent_name=self.agent_name,
                     error_type=error_type,
+                    iteration=iteration,
                 )
 
                 time.sleep(delay)
@@ -302,6 +305,7 @@ class RetryExecutor:
             retry_count=retry_count,
             agent_name=self.agent_name,
             error_type=error_type if final_status == "error" else None,
+            iteration=iteration,
         )
 
         return RetryResult(
@@ -319,6 +323,7 @@ class RetryExecutor:
         tool_call_id: str,
         arguments: Dict[str, Any],
         session_id: Optional[str] = None,
+        iteration: Optional[int] = None,
     ) -> RetryResult:
         """异步执行工具调用（含智能重试）。
 
@@ -330,6 +335,7 @@ class RetryExecutor:
             tool_call_id: 工具调用 ID
             arguments: 调用参数
             session_id: 会话 ID（用于日志）
+            iteration: 主循环轮次（1-based），写入日志用于关联所属的模型调用 span
 
         Returns:
             RetryResult: 重试执行结果
@@ -380,6 +386,7 @@ class RetryExecutor:
                     retry_attempt=retry_count,
                     agent_name=self.agent_name,
                     error_type=error_type,
+                    iteration=iteration,
                 )
 
                 await asyncio.sleep(delay)
@@ -402,6 +409,7 @@ class RetryExecutor:
             retry_count=retry_count,
             agent_name=self.agent_name,
             error_type=error_type if final_status == "error" else None,
+            iteration=iteration,
         )
 
         return RetryResult(
